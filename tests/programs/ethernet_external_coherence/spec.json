@@ -1,0 +1,20 @@
+{
+  "weight": 90,
+  "sources": [
+    "main.c"
+  ],
+  "cflags": [],
+  "rts": true,
+  "entry": "_c_int00",
+  "max_cycles": 4000000,
+  "expected_source": "SPRU862B section 2.4 restricts the snoop protocol to L1D and L2 SRAM, and Table 2-2 gives the operations a program must issue for external memory, so with MAR224's PC bit set the DDR2 buffer behaves the opposite way to an L2 SRAM one: the frame the EMAC wrote is invisible until an L1D range invalidate without writeback, and a buffer written only into L1D goes out as whatever memory holds until an L1D range writeback. The checksum is folded in Python over the priming reads, the received length, the eight sentinel bytes read before the invalidate, the eight frame bytes read after it, and the transmit descriptor's length; the expected frame is the injected one with its addresses swapped and every byte from the ethertype on replaced, which only reaches the wire because of the writeback",
+  "cache_rerun": false,
+  "cache_rerun_source": "The program configures L1D as cache and maintains coherence for the DDR2 buffers with L1D range operations alone, which is what SPRU862B Table 2-2 asks of it on a device whose L2 is all SRAM. With L2 configured as a cache as well, the L1D writeback lands in L2 rather than in memory and the EMAC reads what memory still holds, so the answer is different and the hardware would agree: the expectation is tied to this program's own cache configuration, not to the emulator.",
+  "rx_frames": [
+    "020000112233020000445566080021262b30353a3f44494e53585d62676c71767b80858a8f94999ea3a8adb2b7bcc1c6cbd0d5dadfe4e9eef3f8fd02070c1116"
+  ],
+  "tx_frames": [
+    "0200004455660200001122334c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f"
+  ],
+  "cio_output": "external coherence checksum 681127784\n"
+}

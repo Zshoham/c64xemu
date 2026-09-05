@@ -1,0 +1,8 @@
+{
+  "weight": 80,
+  "sources": ["main.c", "vectors.asm"],
+  "cflags": [],
+  "max_cycles": 400000,
+  "expect": {"A4": 515},
+  "expected_source": "515 is 0x0203: the service routine ran exactly three times and the only pending bit it ever saw was RCFP, bit 1 of EIPR. Both halves are hand-derived from SPRUE48 Table 10 - nothing drives the transmit section, so only the receive clock can fail - and from the interrupt rule in SPRU871K 7.4.2, which is why clearing the pending bit in the routine is what allows the next failure to be announced"
+}

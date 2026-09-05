@@ -1,0 +1,15 @@
+{
+  "weight": 60,
+  "sources": [
+    "main.asm"
+  ],
+  "cflags": [],
+  "max_cycles": 200000,
+  "opt_levels": [
+    "-O2"
+  ],
+  "expect": {
+    "A4": 2087218026
+  },
+  "expected_source": "hand-written assembly; the constant comes from an independent C model on the host of the documented memory-protection behaviour - SPRU871K chapter 8 for the per-page attribute registers (LOCAL in bit 8, SR SW SX UR UW UX in bits 5 to 0), for a refused access being discarded with its address latched in MPFAR and the permission it asked for in MPFSR, and for the fault raising the unit's system event; the register offsets and those event numbers are the ones a working port uses, from linux-c6x arch/c6x/platforms/cache.c (L2 fault registers at 0x0184A000 and attributes at 0x0184A200, L1P at 0x0184A400 and 0x0184A600, L1D at 0x0184AC00 and 0x0184AE00) and arch/c6x/kernel/traps.c (external-exception table entries 120, 122 and 124 for the L1P, L1D and L2 CPU protection faults); SPRU732J 6.1.2 and Table 6-3 for the exception the combiner then delivers"
+}

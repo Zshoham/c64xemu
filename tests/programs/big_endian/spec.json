@@ -1,0 +1,21 @@
+{
+  "weight": 70,
+  "sources": [
+    "tests/programs/sum_loop/main.c"
+  ],
+  "cflags": [
+    "--big_endian"
+  ],
+  "link_flags": [
+    "--big_endian"
+  ],
+  "opt_levels": [
+    "-O0",
+    "-O2"
+  ],
+  "max_cycles": 20000,
+  "expect": {
+    "A4": 55
+  },
+  "expected_source": "value 55 is the hand-derived sum of integers 1 through 10; the TI compiler and linker produce a big-endian ELF32 C6000 image"
+}

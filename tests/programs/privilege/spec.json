@@ -1,0 +1,15 @@
+{
+  "weight": 70,
+  "sources": [
+    "main.asm"
+  ],
+  "cflags": [],
+  "max_cycles": 200000,
+  "opt_levels": [
+    "-O2"
+  ],
+  "expect": {
+    "A4": 310437596
+  },
+  "expected_source": "hand-written assembly; the constant comes from an independent C model on the host of the documented privilege rules - SPRU732J 8.1 for entering User mode by returning from a context whose CXM is set and for the mode taking effect at the branch target, 8.2.4.1 for the fully restricted control registers raising an exception that reports IERR.RAX together with IERR.PRX (the union of that list and Table 3-22, which also names ISR and DIER), 8.2.4.2 for CSR and TSR being partially writable so that a User write of all ones to TSR reaches GIE and SGIE alone, 8.2.4.3 for B IRP, B NRP and IDLE raising IERR.OPX with IERR.PRX, 8.4 for SWENR entering at REP, and Table 6-3 for the context each exception saves"
+}

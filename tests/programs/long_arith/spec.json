@@ -1,0 +1,12 @@
+{
+  "weight": 70,
+  "sources": [
+    "main.c"
+  ],
+  "cflags": [],
+  "rts": true,
+  "entry": "_c_int00",
+  "max_cycles": 4000000,
+  "expected_source": "the printed value comes from building the identical C source with an independent host C compiler (cc -std=c99, identical at -O0 and -O2); there the shim holds every 40-bit value in an int64_t truncated back to 40 bits after each operation, so the host exercises the same arithmetic without the register pairs; the RTS exit path ends in abort(), which takes no argument, so only the CIO text is checked. The LSSUB corner where the subtrahend is exactly INT40_MIN is excluded: TI's compiled form (saturating NEG then SADD) differs from plain C semantics there by one ulp regardless of emulator behaviour",
+  "cio_output": "long_arith=12f39025\n"
+}

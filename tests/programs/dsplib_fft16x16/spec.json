@@ -1,0 +1,17 @@
+{
+  "weight": 60,
+  "sources": [
+    "main.c",
+    "tests/build/dsplib-c64plus/packages/ti/dsplib/src/DSP_fft16x16/c64P/DSP_fft16x16_cn.c",
+    "tests/build/dsplib-c64plus/packages/ti/dsplib/src/DSP_ifft16x16/c64P/DSP_ifft16x16_cn.c"
+  ],
+  "includes": [
+    "tests/programs/common"
+  ],
+  "cflags": [],
+  "rts": true,
+  "entry": "_c_int00",
+  "max_cycles": 8000000,
+  "expected_source": "the printed value comes from building the identical C sources with an independent host C compiler (cc -std=gnu99, identical at -O0/-O1/-O2/-Os); the RTS exit path ends in abort(), which takes no argument, so the final A4 is unspecified and only the CIO text is checked; the host build defines _LITTLE_ENDIAN, which the TI compiler defines for this target and which the FFT kernels use to select their twiddle-factor convention",
+  "cio_output": "dsplib_fft16x16=2329875620\n"
+}

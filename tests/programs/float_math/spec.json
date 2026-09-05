@@ -1,0 +1,14 @@
+{
+  "weight": 70,
+  "sources": [
+    "main.c"
+  ],
+  "cflags": [
+    "-O2"
+  ],
+  "rts": true,
+  "entry": "_c_int00",
+  "max_cycles": 4000000,
+  "expected_source": "the printed value comes from building the identical C source with an independent host C compiler (cc -std=gnu99, identical at -O0/-O2/-Os); the RTS exit path ends in abort(), which takes no argument, so the final A4 is unspecified and only the CIO text is checked",
+  "cio_output": "float_math=-20305638\n"
+}

@@ -1,0 +1,15 @@
+{
+  "weight": 70,
+  "sources": [
+    "main.asm"
+  ],
+  "cflags": [],
+  "max_cycles": 200000,
+  "opt_levels": [
+    "-O2"
+  ],
+  "expect": {
+    "A4": 205451527
+  },
+  "expected_source": "hand-written assembly; 0xc3ef107 is the documented fold computed on the host from SPRUFE8B alone. Section 2.7 gives the cross path sharing rules and their two worked counterexamples: up to two units per data path per execute packet may read the opposite register file provided every unit reads the same operand, so two different B registers on 1X is invalid and so is a third unit reading even the same operand. The binutils opcode table settles which unit the long ADDA runs on - adda_long encodes ENC(s, fu) where load_store_long encodes ENC(s, data_fu) - so ADDAW.D1X reads its B15 base across 1X and adds a word-scaled 15-bit constant, which is 128 bytes for the constant 32; TI's dis6x confirms each hand-assembled word, and the legal packet is TI's own, from ti_sysbios_family_c64p_Hwi_dispatchAlways. Chapter 6 and Table 6-3 give the exception observations folded for each illegal packet: EFR.IXF for an internal exception, IERR.RCX for a resource conflict, NTSR holding the interrupted TSR with HWE set for a hardware exception, and a TSR restored from NTSR without HWE once the handler returns"
+}

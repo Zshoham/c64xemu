@@ -1,0 +1,18 @@
+{
+  "weight": 90,
+  "sources": [
+    "main.c"
+  ],
+  "cflags": [],
+  "rts": true,
+  "entry": "_c_int00",
+  "link_cmd": "link.cmd",
+  "opt_levels": [
+    "-O2"
+  ],
+  "max_cycles": 200000,
+  "cio_output": "all sram: 64 of 64\ncache configured: 0 of 64\ncache configured after a store: 0 of 64\ncache released: 0 of 64\ncache released after a store: 64 of 64\n",
+  "expected_source": "SPRU862B section 2.3 and its Figure 2-1: a 4-way 256K byte L2 cache in a 2048K byte L2 is taken from the high memory addresses, at 009C 0000h, and the Note beside the figure says that memory \"is not valid for the linker to place code or data in\". The array is linked at 009C 0000h anyway, so all 64 words answer while L2 is all SRAM (SPRU871K section 1.2.4), none of them answer once the cache has taken those addresses - not what was written before, which SPRU871K section 2.4.3 calls data loss and SPRU862B Table 2-6 gives the copy-out procedure to avoid, and not a fresh store either, because the addresses are no longer memory - and all 64 answer again once the cache is released.",
+  "cache_rerun": false,
+  "cache_rerun_source": "The program observes the transition from all-SRAM to 256 KB of L2 cache, so it has to start from the reset configuration. Under --cache the caches are already at their maximum before the image runs, which means the array's own section never reaches memory: its first phase would be asserting the end state rather than the change. The expectation is tied to this program's own cache configuration, not to the emulator."
+}

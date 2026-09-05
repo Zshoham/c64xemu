@@ -1,0 +1,15 @@
+{
+  "weight": 60,
+  "sources": [
+    "main.asm"
+  ],
+  "cflags": [],
+  "max_cycles": 200000,
+  "opt_levels": [
+    "-O2"
+  ],
+  "expect": {
+    "A4": 33554755
+  },
+  "expected_source": "hand-written assembly; the constant comes from an independent C model on the host of the documented behaviour of the megamodule exception combiner and the maskable external exception - SPRU871K 7.2.4 for EXPMASK selecting which latched events reach the single EXCEP input with a set bit masking the event out, and MEXPFLAG giving the masked view, and SPRU732J 6.1.2 and Table 6-3 for EXCEP needing TSR.XEN, TSR.GEE and IER.NMIE, setting EFR.EXF, saving TSR into NTSR with HWE set, clearing XEN with the rest of the context, and being ignored while EFR.EXF is still set. The program programs all four mask registers itself, so the reset value of EXPMASK is not part of the expectation"
+}

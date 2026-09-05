@@ -1,0 +1,15 @@
+{
+  "weight": 60,
+  "sources": [
+    "main.asm"
+  ],
+  "cflags": [],
+  "max_cycles": 200000,
+  "opt_levels": [
+    "-O2"
+  ],
+  "expect": {
+    "A4": 224
+  },
+  "expected_source": "hand-written assembly; 224 is the fold of the two documented observations, 7 then 0, computed by hand. SPRUFE8B's description of `B .S2 src2` gives the pipeline table that reads src2 in E1, so the branch target is the value the register held when the branch issued and a write in the branch's delay slots cannot redirect it; the same table's five delay slots put the target's first execute packet after those writes have committed, so the register reads back as the redirected value the branch did not use. TI's ti_sysbios_family_c62_TaskSupport_swap relies on both halves: it branches through b4 and reloads b3, a14 and a15 in the delay slots"
+}

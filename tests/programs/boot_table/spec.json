@@ -1,0 +1,10 @@
+{
+  "weight": 70,
+  "sources": ["tests/programs/sum_loop/main.c"],
+  "cflags": [],
+  "opt_levels": ["-O0", "-O2"],
+  "max_cycles": 20000,
+  "boot_table": "0x00900000",
+  "expect": {"A4": 55},
+  "expected_source": "value 55 is the hand-derived sum of integers 1 through 10; nothing of the ELF is loaded here - the checked-in TI hex conversion utility builds the ROM boot table (hex6x -boot -memwidth 32 -romwidth 32) and the emulator's bootloader copies every section out of it and branches to the entry point the table names, so the table format itself is the toolchain's rather than this harness's"
+}

@@ -1,0 +1,15 @@
+{
+  "weight": 60,
+  "sources": [
+    "main.c",
+    "tests/build/dsplib-c64plus/packages/ti/dsplib/src/DSP_vecsumsq/c64P/DSP_vecsumsq_cn.c"
+  ],
+  "cflags": [
+    "-O2"
+  ],
+  "max_cycles": 200000,
+  "expect": {
+    "A4": 75930843
+  },
+  "expected_source": "value produced by building the identical C sources with an independent host C compiler (cc -std=gnu99 -O2, 32-bit int / 16-bit short / 64-bit long long match the C6000 EABI); the emulator was not involved"
+}

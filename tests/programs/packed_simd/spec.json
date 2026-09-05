@@ -1,0 +1,15 @@
+{
+  "weight": 90,
+  "sources": [
+    "main.c"
+  ],
+  "includes": [
+    "tests/programs/packed_simd"
+  ],
+  "cflags": [],
+  "rts": true,
+  "entry": "_c_int00",
+  "max_cycles": 8000000,
+  "expected_source": "the host builds the same source against plain C equivalents of each packed intrinsic, written from the instruction descriptions in SPRUFE8B, so the constant only matches if the emulator implements ADD2/SUB2/SADD2/SSUB2/MAX2/MIN2/AVG2/AVGU4/ADD4/SUB4/MAXU4/MINU4/SUBABS4/PACK2/PACKH2/PACKLH2/PACKH4/PACKL4/SPACK2/SPACKU4/DOTP2/DOTPN2/DOTPU4/DOTPSU4/MPY2/SHR2/SHRU2/SHLMB/SHRMB/SWAP4/ROTL/BITR/BITC4/DEAL/SHFL/XPND2/XPND4/ABS2/SSHVL/SSHVR/GMPY4/XORMPY/CMPEQ2/CMPGT2/CMPEQ4/CMPGTU4/NORM/SADD/SSUB/ABS/LMBD the way the manual defines them",
+  "cio_output": "packed_simd=2143168967\n"
+}

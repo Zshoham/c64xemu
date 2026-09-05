@@ -1,0 +1,8 @@
+{
+  "weight": 90,
+  "sources": ["main.c", "vectors.asm"],
+  "cflags": [],
+  "max_cycles": 400000,
+  "expect": {"A4": 2290649225},
+  "expected_source": "2290649225 is 0x88888888 + 1, computed by hand: 0x88888888 is the sum of the sixteen source words 0x01010101*(i+1) for i = 1..16 (0x01010101 * 136), and the 1 is the single interrupt the completion raises. The CPU never writes the destination buffer and only the service routine increments the counter, so the sum can only appear if timer 0's event reaches EDMA3 channel 1, the transfer runs, its completion code raises system event 24, the interrupt selector routes that to CPU interrupt 5 and the routine vectors through the interrupt service table and returns; a second interrupt would change the sum because the null link leaves the set empty"
+}

@@ -1,0 +1,12 @@
+{
+  "weight": 90,
+  "sources": [
+    "main.c"
+  ],
+  "cflags": [],
+  "rts": true,
+  "entry": "_c_int00",
+  "max_cycles": 16000000,
+  "expected_source": "the sequence and the register semantics are SPRU975E section 4 (MDIO control, ALIVE, LINK and the USERACCESS GO/ACK handshake) and IEEE 802.3 clause 22 (BMCR, BMSR, the PHY identifier, the auto-negotiation advertisement registers and the 1000BASE-T status): the module reports no PHY until it is enabled, a read of an unpopulated address does not acknowledge, ANAR round trips while BMSR does not, and the negotiated gigabit full duplex turns into MACCONTROL bits GIG, FULLDUPLEX and GMIIEN",
+  "cio_output": "ethernet_mdio alive=0->1 id=1 link=1 status=1 partner=481 gig=3072\nmaccontrol=161 missing=1 anar=97 polls=1 linkint=0\n"
+}

@@ -1,0 +1,12 @@
+{
+  "weight": 70,
+  "sources": [
+    "main.c"
+  ],
+  "cflags": [],
+  "rts": true,
+  "entry": "_c_int00",
+  "max_cycles": 8000000,
+  "expected_source": "the printed text comes from building the identical C source with an independent host C compiler (cc -std=gnu99, identical at -O0/-O1/-O2/-Os); the RTS exit path ends in abort(), which takes no argument, so the final A4 is unspecified and only the CIO text is checked",
+  "cio_output": "varargs_calls=1100256844\n"
+}

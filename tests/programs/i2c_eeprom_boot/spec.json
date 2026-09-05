@@ -1,0 +1,20 @@
+{
+  "weight": 80,
+  "sources": [
+    "tests/programs/sum_loop/main.c"
+  ],
+  "cflags": [],
+  "opt_levels": [
+    "-O0",
+    "-O2"
+  ],
+  "max_cycles": 4000000,
+  "boot_table": "0x00900000",
+  "i2c_boot": true,
+  "cache_rerun": false,
+  "cache_rerun_source": "The boot runs before the image exists, and --cache programs the caches before the run: the boot's own EEPROM reads and its writes into L2 would go through a cold cache with nothing yet to be coherent about. What the rerun would exercise is the boot rather than the program, and the program is what carries the answer.",
+  "expect": {
+    "A4": 55
+  },
+  "expected_source": "value 55 is the hand-derived sum of integers 1 through 10, and every byte of memory reaches the device through the ROM's I2C EEPROM boot rather than from the ELF. The boot table is the checked-in TI hex conversion utility's (hex6x -boot -memwidth 32 -romwidth 32), so its format is the toolchain's; the EEPROM around it is this harness's, built to SPRUEC6G section 2.3.4.1 and Table 5 - 128-byte blocks with a 16-bit size covering the 4-byte header and a 16-bit ones-complement checksum over the whole block, valid at 0 and -0 - with the Table 6 boot parameter block at address 0 naming options 1 for a boot table and the table's own address behind it. The emulator has to write two internal address bytes, take a repeated START, read the block, verify a checksum this harness computed independently, and repeat until the table's zero count, so the answer only comes out if the whole read sequence and the block format agree."
+}

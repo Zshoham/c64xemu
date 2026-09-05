@@ -1,0 +1,14 @@
+{
+  "weight": 60,
+  "sources": [
+    "main.c",
+    "tests/build/dsplib-c64plus/packages/ti/dsplib/src/DSP_q15tofl/c64P/DSP_q15tofl_cn.c",
+    "tests/build/dsplib-c64plus/packages/ti/dsplib/src/DSP_fltoq15/c64P/DSP_fltoq15_cn.c"
+  ],
+  "cflags": [],
+  "max_cycles": 8000000,
+  "expected_source": "the printed text comes from building the identical C source with an independent host C compiler (cc -std=gnu99, identical at -O0/-O1/-O2/-Os); the RTS exit path ends in abort(), so only the CIO text is checked",
+  "rts": true,
+  "entry": "_c_int00",
+  "cio_output": "dsplib_q15_float=-1999954\n"
+}

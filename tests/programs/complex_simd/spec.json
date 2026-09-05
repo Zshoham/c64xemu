@@ -1,0 +1,15 @@
+{
+  "weight": 90,
+  "sources": [
+    "main.c"
+  ],
+  "includes": [
+    "tests/programs/complex_simd"
+  ],
+  "cflags": [],
+  "rts": true,
+  "entry": "_c_int00",
+  "max_cycles": 4000000,
+  "expected_source": "the host builds the same source against plain C equivalents of CMPY, CMPYR, CMPYR1, DDOTP4, DDOTPH2, DDOTPH2R, DDOTPL2, DDOTPL2R, MPY2IR, SMPY32, MPYHIR and MPYLIR written from SPRUFE8B, each of which reproduces that instruction's worked examples",
+  "cio_output": "complex_simd=4130362100\n"
+}

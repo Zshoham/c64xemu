@@ -1,0 +1,39 @@
+{
+  "weight": 100,
+  "sources": [
+    "main.c",
+    "tests/build/dsplib-c64plus/packages/ti/dsplib/src/DSP_fft16x16/c64P/DSP_fft16x16_cn.c",
+    "tests/build/dsplib-c64plus/packages/ti/dsplib/src/DSP_ifft16x16/c64P/DSP_ifft16x16_cn.c",
+    "tests/build/dsplib-c64plus/packages/ti/dsplib/src/DSP_fft16x16_imre/c64P/DSP_fft16x16_imre_cn.c",
+    "tests/build/dsplib-c64plus/packages/ti/dsplib/src/DSP_ifft16x16_imre/c64P/DSP_ifft16x16_imre_cn.c",
+    "tests/build/dsplib-c64plus/packages/ti/dsplib/src/DSP_fft16x16r/c64P/DSP_fft16x16r_cn.c",
+    "tests/build/dsplib-c64plus/packages/ti/dsplib/src/DSP_fft16x32/c64P/DSP_fft16x32_cn.c",
+    "tests/build/dsplib-c64plus/packages/ti/dsplib/src/DSP_ifft16x32/c64P/DSP_ifft16x32_cn.c",
+    "tests/build/dsplib-c64plus/packages/ti/dsplib/src/DSP_fft32x32/c64P/DSP_fft32x32_cn.c",
+    "tests/build/dsplib-c64plus/packages/ti/dsplib/src/DSP_ifft32x32/c64P/DSP_ifft32x32_cn.c",
+    "tests/build/dsplib-c64plus/packages/ti/dsplib/src/DSP_fft32x32s/c64P/DSP_fft32x32s_cn.c",
+    "tests/build/dsplib-c64plus/packages/ti/dsplib/src/DSP_fft16x16/c64P/DSP_fft16x16_i.c",
+    "tests/build/dsplib-c64plus/packages/ti/dsplib/src/DSP_ifft16x16/c64P/DSP_ifft16x16_i.c",
+    "tests/build/dsplib-c64plus/packages/ti/dsplib/src/DSP_fft16x16_imre/c64P/DSP_fft16x16_imre_i.c",
+    "tests/build/dsplib-c64plus/packages/ti/dsplib/src/DSP_ifft16x16_imre/c64P/DSP_ifft16x16_imre_i.c",
+    "tests/build/dsplib-c64plus/packages/ti/dsplib/src/DSP_fft16x16r/c64P/DSP_fft16x16r_i.c",
+    "tests/build/dsplib-c64plus/packages/ti/dsplib/src/DSP_fft16x32/c64P/DSP_fft16x32_i.c",
+    "tests/build/dsplib-c64plus/packages/ti/dsplib/src/DSP_ifft16x32/c64P/DSP_ifft16x32_i.c",
+    "tests/build/dsplib-c64plus/packages/ti/dsplib/src/DSP_fft32x32/c64P/DSP_fft32x32_i.c",
+    "tests/build/dsplib-c64plus/packages/ti/dsplib/src/DSP_ifft32x32/c64P/DSP_ifft32x32_i.c",
+    "tests/build/dsplib-c64plus/packages/ti/dsplib/src/DSP_fft32x32s/c64P/DSP_fft32x32s_i.c"
+  ],
+  "includes": [
+    "tests/programs/common"
+  ],
+  "cflags": [],
+  "rts": true,
+  "entry": "_c_int00",
+  "max_cycles": 8000000,
+  "expected_source": "the checksum comes from building the identical main.c and the ten natural-C reference kernels with an independent host C compiler, which gives 1066493920 at -O0, -O1, -O2 and -Os alike, over sixteen points; on the host each intrinsic call is the reference call, so the host supplies one value both target implementations have to produce. The match count of ten is the target agreeing with itself: every one of DSPLIB's intrinsic-C FFT kernels - forward and inverse, 16x16, 16x32 and 32x32, the imaginary-real ordered variants, the real-input transform and the scaled 32x32 one - produced exactly what its reference produced from the same input. The suite builds this program at -O0 and -O1 only, because software-pipelining ten intrinsic FFT kernels costs cl6x about two minutes per build and would dominate the run; the same value was verified by hand at -O2, -O3 and -Os, and at sixty-four points as well as sixteen",
+  "cio_output": "dsplib_fft_intrinsics=1066493920 matched=10\n",
+  "opt_levels": [
+    "-O0",
+    "-O1"
+  ]
+}

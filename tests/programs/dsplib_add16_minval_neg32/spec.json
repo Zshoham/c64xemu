@@ -1,0 +1,15 @@
+{
+  "weight": 60,
+  "sources": [
+    "main.c",
+    "tests/build/dsplib-c64plus/packages/ti/dsplib/src/DSP_add16/c64P/DSP_add16_cn.c",
+    "tests/build/dsplib-c64plus/packages/ti/dsplib/src/DSP_minval/c64P/DSP_minval_cn.c",
+    "tests/build/dsplib-c64plus/packages/ti/dsplib/src/DSP_neg32/c64P/DSP_neg32_cn.c"
+  ],
+  "cflags": [],
+  "max_cycles": 800000,
+  "expected_source": "value produced by building the identical C sources with an independent host C compiler (cc -std=gnu99, identical at -O0/-O1/-O2/-Os; 32-bit int / 16-bit short / 64-bit long long match the C6000 EABI); the emulator was not involved",
+  "expect": {
+    "A4": 3624438290
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "weight": 90,
+  "sources": [
+    "main.c"
+  ],
+  "cflags": [],
+  "rts": true,
+  "entry": "_c_int00",
+  "max_cycles": 16000000,
+  "expected_source": "which frames are accepted follows the filtering rules in SPRU975E section 2.10: the unicast frame matching the address RAM slot, the broadcast frame with RXBROADEN set and the multicast frame whose six-bit hash bucket is set in MACHASH1 are transferred, while the unicast frame for another address and the multicast frame with a clear hash bucket are filtered by address matching; the address-matching frame longer than RXMAXLEN is a long frame, so section 2.10.7 makes it oversized and RXCEFEN keeps it out of memory while section 5.49.11 keeps it out of RXFILTERED; the counters and the teardown marker FFFF FFFCh come from the same document, and the checksum was computed in Python",
+  "rx_frames": [
+    "020000112233020000aabbcc0800070a0d101316191c1f2225282b2e3134373a3d404346494c4f5255585b5e6164676a6d707376797c7f8285888b8e",
+    "ffffffffffff020000aabbcc0800070c11161b20252a2f34393e43484d52575c61666b70757a7f84898e93989da2a7acb1b6bbc0c5cacfd4d9dee3e8",
+    "020000998877020000aabbcc0800070e151c232a31383f464d545b626970777e858c939aa1a8afb6bdc4cbd2d9e0e7eef5fc030a11181f262d343b42",
+    "01005e445566020000aabbcc080007121d28333e49545f6a75808b96a1acb7c2cdd8e3eef9040f1a25303b46515c67727d88939ea9b4bfcad5e0ebf6",
+    "01005e112233020000aabbcc08000714212e3b4855626f7c8996a3b0bdcad7e4f1fe0b1825323f4c596673808d9aa7b4c1cedbe8f5020f1c29364350",
+    "020000112233020000aabbcc08000718293a4b5c6d7e8fa0b1c2d3e4f5061728394a5b6c7d8e9fb0c1d2e3f405162738495a6b7c8d9eafc0d1e2f30415263748596a7b8c9daebfd0e1f2031425364758697a8b9cadbecfe0f102132435465768798a9bacbdcedff00112233445566778899aabbccddeef00112233445566778899aabbccddee"
+  ],
+  "tx_frames": [
+    "020000aabbcc0200001122330800070a0d101316191c1f2225282b2e3134373a3d404346494c4f5255585b5e6164676a6d707376797c7f8285888b8e",
+    "020000aabbccffffffffffff0800070c11161b20252a2f34393e43484d52575c61666b70757a7f84898e93989da2a7acb1b6bbc0c5cacfd4d9dee3e8",
+    "020000aabbcc01005e11223308000714212e3b4855626f7c8996a3b0bdcad7e4f1fe0b1825323f4c596673808d9aa7b4c1cedbe8f5020f1c29364350"
+  ],
+  "cio_output": "ethernet_filtering=-308200167 served=3 good=3 bcast=1 mcast=1 filtered=2 oversized=1 tx=3\nteardown cp=1 marked=1 hdp=0\n"
+}

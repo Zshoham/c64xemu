@@ -1,0 +1,17 @@
+{
+  "weight": 70,
+  "sources": ["main.c"],
+  "cflags": [],
+  "opt_levels": ["-O0", "-O2"],
+  "max_cycles": 20000,
+  "boot_table": "0x00900000",
+  "boot_config": {
+    "address": "0x00908000",
+    "entries": [
+      ["0x00980000", "0x12340000", "0x000000FF"],
+      ["0x00980000", "0x00005678", "0x00005678"]
+    ]
+  },
+  "expect": {"A4": 305419896},
+  "expected_source": "305419896 is 0x12345678, derived by hand from the documented boot-configuration rules in SPRUEC6G section 6.2.3 applied to a word that starts at zero: the first entry sets the bits of its set mask and clears the bits of its clear mask, giving 0x12340000, and the second entry has 0x5678 in both masks, which toggles those bits; the boot table itself is built by the checked-in hex6x, so nothing in the memory image comes from the emulator"
+}

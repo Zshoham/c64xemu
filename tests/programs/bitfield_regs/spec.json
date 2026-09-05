@@ -1,0 +1,16 @@
+{
+  "weight": 80,
+  "sources": [
+    "main.c",
+    "helpers.asm"
+  ],
+  "includes": [
+    "tests/programs/bitfield_regs"
+  ],
+  "cflags": [],
+  "rts": true,
+  "entry": "_c_int00",
+  "max_cycles": 4000000,
+  "expected_source": "the printed value comes from building the identical C driver with an independent host C compiler (cc -std=gnu99, identical at -O0/-O1/-O2/-Os) against plain C models of EXT, EXTU, SET and CLR written from SPRU732J - the field specifier is src1 bits 9-5 (csta) and 4-0 (cstb) with the rest ignored, EXT and EXTU shift left by csta then right by cstb arithmetically and logically, SET and CLR act on the bits from csta up to cstb - while the target reaches the register form, the cross-path form and the predicated form through hand-written assembly, which is the only way to reach them because cl6x lowers _ext and _extu with run-time specifiers to a SHL/SHR pair; the RTS exit path ends in abort(), which takes no argument, so the final A4 is unspecified and only the CIO text is checked",
+  "cio_output": "bitfield_regs=3070817104\n"
+}

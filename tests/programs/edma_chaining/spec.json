@@ -1,0 +1,12 @@
+{
+  "weight": 85,
+  "sources": [
+    "main.c"
+  ],
+  "cflags": [],
+  "rts": true,
+  "entry": "_c_int00",
+  "max_cycles": 2000000,
+  "expected_source": "SPRU966C section 2.4 defines chaining: a transfer whose OPT has TCCHEN set sets the CER bit its TCC field names on final completion, and the channel controller treats that bit as a trigger for the channel of that number, consuming it when the channel is served. So one manual trigger of channel 1 moves the block three times - each stage's sum is the same 0x88888888 sum of 0x01010101*(i+1) for sixteen words - only the last link has TCINTEN so IPR reads 1<<3 alone, and CER reads zero afterwards because both chained events were consumed. The checksum is those five observations folded in Python; the spin count is deliberately not among them, since it depends on the optimisation level",
+  "cio_output": "edma chaining checksum 4008636398\n"
+}

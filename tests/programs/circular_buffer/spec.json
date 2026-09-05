@@ -1,0 +1,15 @@
+{
+  "weight": 60,
+  "sources": [
+    "main.asm"
+  ],
+  "cflags": [],
+  "max_cycles": 200000,
+  "opt_levels": [
+    "-O2"
+  ],
+  "expect": {
+    "A4": 1327654062
+  },
+  "expected_source": "hand-written assembly; the constant comes from an independent C model on the host of the documented wrap rule (only bits N..0 of an address update change, block size 2^(N+1) bytes, SPRUFE8B 2.8.3 and 3.9.2) plus the GMPY/XORMPY pseudocode from the instruction pages"
+}

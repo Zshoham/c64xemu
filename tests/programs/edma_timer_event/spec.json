@@ -1,0 +1,8 @@
+{
+  "weight": 80,
+  "sources": ["main.c"],
+  "cflags": [],
+  "max_cycles": 400000,
+  "expect": {"A4": 2290649224},
+  "expected_source": "2290649224 is 0x88888888, the sum of the sixteen source words 0x01010101*(i+1) for i = 1..16: 0x01010101 * 136 = 0x88888888, computed by hand and independent of the emulator. The CPU never writes the destination buffer, so the only way the sum can appear there is for timer 0's lower-half event (EDMA3 synchronisation event 1, SPRS276M Table 7-10) to reach channel 1 and for the channel controller to run the A-synchronised transfer its PaRAM set describes; the completion code the program waits for and clears is the one OPT names (SPRU966C Table 2-4)"
+}

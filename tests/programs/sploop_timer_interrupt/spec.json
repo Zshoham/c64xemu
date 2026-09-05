@@ -1,0 +1,8 @@
+{
+  "weight": 90,
+  "sources": ["main.c", "vectors.asm"],
+  "cflags": [],
+  "max_cycles": 400000,
+  "expect": {"A4": 5625216},
+  "expected_source": "5625216 is the sum of the squares of 1 to 256, n(n+1)(2n+1)/6 with n = 256, computed by hand and independent of the emulator. The point of the program is that the loop, which cl6x compiles into an SPLOOP kernel at -O2 and -O3 (confirmed with the checked-in dis6x), is interrupted many times by TINTLO0 while it runs, so the value only comes out right if every drain and pipe-up preserves exactly one pass per iteration; the program also requires that at least one interrupt was serviced"
+}

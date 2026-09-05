@@ -1,0 +1,15 @@
+{
+  "weight": 60,
+  "sources": [
+    "main.asm"
+  ],
+  "cflags": [],
+  "max_cycles": 20000,
+  "opt_levels": [
+    "-O2"
+  ],
+  "expect": {
+    "A4": 25297444
+  },
+  "expected_source": "hand-written assembly; the constant is the documented behaviour of CSR.SAT and SSR (SPRUFE8B Table 2-9 and Table 2-22: a saturating unit sets its SSR bit and the SAT bit, only MVC clears SAT and writing one to it has no effect) folded nibble by nibble in the same order the program folds it"
+}

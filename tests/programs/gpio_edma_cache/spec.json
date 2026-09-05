@@ -1,0 +1,8 @@
+{
+  "weight": 90,
+  "sources": ["main.c"],
+  "cflags": [],
+  "max_cycles": 400000,
+  "expect": {"A4": 286331152},
+  "expected_source": "286331152 is 0x11111110, the low 32 bits of the sum of the sixteen second-pass source words 0x02020202*(i+1) for i = 1..16 (0x02020202 * 136), computed by hand; the first pass sums to 0x88888888, which the program also checks. Every step is load-bearing: dropping the L1D writeback makes the transfer copy the stale first pass and the program return 0x88888888, and dropping the L1D invalidate makes the CPU read its cached zeros and return 0. The value can therefore only appear if the software GPIO edge raises GPINT0, EDMA3 channel 48 runs the transfer out of memory, and both cache operations behave as SPRU871K chapter 4 describes"
+}

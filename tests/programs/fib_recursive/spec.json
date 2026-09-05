@@ -1,0 +1,14 @@
+{
+  "weight": 60,
+  "sources": [
+    "main.c"
+  ],
+  "cflags": [
+    "-O2"
+  ],
+  "max_cycles": 400000,
+  "expect": {
+    "A4": 610
+  },
+  "expected_source": "value derived by hand from the C source semantics"
+}

@@ -1,0 +1,14 @@
+{
+  "weight": 60,
+  "sources": [
+    "main.c"
+  ],
+  "cflags": [
+    "-O2"
+  ],
+  "max_cycles": 100000,
+  "expect": {
+    "A4": 1853792731
+  },
+  "expected_source": "value produced by building the identical C sources with an independent host C compiler (cc -std=gnu99 -O2, 32-bit int / 16-bit short / 64-bit long long match the C6000 EABI); the emulator was not involved"
+}

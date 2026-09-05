@@ -1,0 +1,8 @@
+{
+  "weight": 80,
+  "sources": ["main.c", "vectors.asm"],
+  "cflags": [],
+  "max_cycles": 400000,
+  "expect": {"A4": 2291697818},
+  "expected_source": "2291697818 is 0x8898889A, computed by hand: 0x88888888 is the sum of the sixteen copied source words 0x01010101*(i+1) for i = 1..16 (0x01010101 * 136), 0x00100010 is sixteen copies of the fill value 0x00010001, and the final 2 is the number of completion interrupts, one per transfer. The CPU never writes either destination, and the service routine also checks that IDMA1_STAT reads idle by the time it runs"
+}

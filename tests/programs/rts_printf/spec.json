@@ -1,0 +1,14 @@
+{
+  "weight": 80,
+  "sources": [
+    "main.c"
+  ],
+  "cflags": [
+    "-O0"
+  ],
+  "rts": true,
+  "entry": "_c_int00",
+  "max_cycles": 4000000,
+  "cio_output": "hello from c64x+ sum=30\n",
+  "expected_source": "the CIO text follows from the C source; the RTS exit path ends in abort(), which takes no argument (compiler/lib/src/exit.c), so the final A4 is unspecified"
+}

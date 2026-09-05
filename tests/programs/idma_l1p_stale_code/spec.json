@@ -1,0 +1,13 @@
+{
+  "weight": 80,
+  "sources": [
+    "main.c",
+    "routines.asm"
+  ],
+  "cflags": [],
+  "rts": true,
+  "entry": "_c_int00",
+  "max_cycles": 2000000,
+  "expected_source": "SPRU862B section 2.4 states that the C64x+ snoop protocol does not maintain coherence between L1P cache and L2 SRAM and that this is the programmer's responsibility, and section 2.6 gives the self-modifying-code procedure: invalidate L1P over the range that changed. So a routine already cached in L1P keeps running after IDMA1 overwrites it in L2 SRAM - 273 both times - and only a range invalidate through L1PIBAR and L1PIWC makes the replacement visible, giving 546. The checksum is those three results folded in Python",
+  "cio_output": "l1p stale code 273 273 546 checksum 287746\n"
+}

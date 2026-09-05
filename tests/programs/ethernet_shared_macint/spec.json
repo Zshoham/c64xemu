@@ -1,0 +1,24 @@
+{
+  "weight": 90,
+  "sources": [
+    "main.c",
+    "tests/programs/ethernet_interrupt/vectors.asm"
+  ],
+  "cflags": [],
+  "rts": true,
+  "entry": "_c_int00",
+  "opt_levels": [
+    "-O2"
+  ],
+  "max_cycles": 8000000,
+  "expected_source": "SPRU975E section 2.16 gives the EMAC one interrupt for the whole module, which the C6455 routes as system event 17 (SPRS276M Table 7-9), and SPRU871K Figure 7-9 feeds the interrupt selector from the raw event line, so what reaches IFR is the line's rising edge and section 7.4.2 says a directly selected event needs no EVTFLAG access. With both channel-zero masks set, a completed transmit descriptor left unacknowledged holds the line high, so the second frame's receive completion produces no edge: first=1 and suppressed=1 with both raw status bits set. Acknowledging both queues drops the line, and the third frame raises it from low, so woken=2. Every number is a count of interrupt entries or a documented status bit, not a value this emulator chose.",
+  "rx_frames": [
+    "020000112233020000aabbcc030a11181f262d343b424950575e656c737a81888f969da4abb2b9c0c7ced5dce3eaf1f8ff060d141b222930373e454c535a6168",
+    "020000112233020000ddeeff282f363d444b525960676e757c838a91989fa6adb4bbc2c9d0d7dee5ecf3fa01080f161d242b323940474e555c636a71787f868d",
+    "0200001122330200004455664d545b626970777e858c939aa1a8afb6bdc4cbd2d9e0e7eef5fc030a11181f262d343b424950575e656c737a81888f969da4abb2"
+  ],
+  "tx_frames": [
+    "020000aabbcc020000112233030a11181f262d343b424950575e656c737a81888f969da4abb2b9c0c7ced5dce3eaf1f8ff060d141b222930373e454c535a6168"
+  ],
+  "cio_output": "shared macint: first=1 suppressed=1 rx=1 tx=1 woken=2 errors=0\n"
+}

@@ -1,0 +1,22 @@
+{
+  "weight": 90,
+  "sources": [
+    "main.c"
+  ],
+  "cflags": [],
+  "rts": true,
+  "entry": "_c_int00",
+  "max_cycles": 8000000,
+  "expected_source": "the echoed frames are the injected frames with their address fields swapped and the checksum is the same rolling hash of the received bytes computed in Python from the injected frames; both raw interrupt status words read back as zero because writing the completion pointer of the last processed descriptor acknowledges the queue, which is what the CPPI protocol in SPRU975E requires",
+  "rx_frames": [
+    "020000112233020000aabbcc0800030a11181f262d343b424950575e656c737a81888f969da4abb2b9c0c7ced5dce3eaf1f8ff060d141b222930373e",
+    "ffffffffffff020000445566080605121f2c394653606d7a8794a1aebbc8d5e2effc091623303d4a5764717e",
+    "02000011223302000077889986dd090c0f1215181b1e2124272a2d303336393c3f4245484b4e5154575a5d606366696c6f7275787b7e8184878a8d909396999c9fa2a5a8abaeb1b4b7ba"
+  ],
+  "tx_frames": [
+    "020000aabbcc0200001122330800030a11181f262d343b424950575e656c737a81888f969da4abb2b9c0c7ced5dce3eaf1f8ff060d141b222930373e",
+    "020000445566ffffffffffff080605121f2c394653606d7a8794a1aebbc8d5e2effc091623303d4a5764717e",
+    "02000077889902000011223386dd090c0f1215181b1e2124272a2d303336393c3f4245484b4e5154575a5d606366696c6f7275787b7e8184878a8d909396999c9fa2a5a8abaeb1b4b7ba"
+  ],
+  "cio_output": "ethernet_echo=384448146 rx=0 tx=0\n"
+}

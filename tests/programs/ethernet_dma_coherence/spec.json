@@ -1,0 +1,18 @@
+{
+  "weight": 90,
+  "sources": [
+    "main.c"
+  ],
+  "cflags": [],
+  "rts": true,
+  "entry": "_c_int00",
+  "max_cycles": 4000000,
+  "expected_source": "SPRU862B chapter 2 gives the only coherence hardware maintains: a DMA master's accesses to L2 SRAM are snooped against L1D, so a DMA write updates a line the CPU is holding and a DMA read is served from a line the CPU holds dirty. Both directions are derived from that alone - the checksum is folded in Python over the priming reads, the received length, the sixteen frame bytes the CPU must see without any cache operation, and the transmit descriptor's length; the expected frame is the injected one with its address fields swapped and every byte from the ethertype on replaced by a pattern written only into L1D, so a model that reads memory instead sends 0xA5 padding. L1DMODE 111b is the whole 32K as cache (SPRU871K chapter 4)",
+  "rx_frames": [
+    "02000011223302000044556608001114171a1d202326292c2f3235383b3e4144474a4d505356595c5f6265686b6e7174777a7d808386898c8f9295989b9ea1a4"
+  ],
+  "tx_frames": [
+    "0200004455660200001122334c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f"
+  ],
+  "cio_output": "dma coherence checksum 3171566077\n"
+}

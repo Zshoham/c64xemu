@@ -1,0 +1,12 @@
+{
+  "weight": 60,
+  "sources": [
+    "main.c"
+  ],
+  "cflags": [],
+  "rts": true,
+  "entry": "_c_int00",
+  "max_cycles": 4000000,
+  "expected_source": "the host builds the same source with plain byte-wise equivalents of the 64-bit memory intrinsics, so the constant only matches if aligned and non-aligned double-word loads and stores move the same bytes on the target",
+  "cio_output": "memory_intrinsics=3414718461\n"
+}

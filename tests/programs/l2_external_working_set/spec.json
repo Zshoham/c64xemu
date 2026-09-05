@@ -1,0 +1,16 @@
+{
+  "weight": 90,
+  "sources": [
+    "main.c"
+  ],
+  "cflags": [],
+  "rts": true,
+  "entry": "_c_int00",
+  "opt_levels": [
+    "-O2",
+    "-O3"
+  ],
+  "max_cycles": 7000000,
+  "cio_output": "external working set checksum 902724403\n",
+  "expected_source": "value produced by building the identical C source with an independent host C compiler (cc -std=gnu99, identical at -O0 and -O2; the arithmetic is unsigned throughout and 32-bit unsigned int matches the C6000 EABI, so the fold is defined), with the host branch of the __TI_COMPILER_VERSION__ split putting the same working set in a static array instead of DDR2; the emulator was not involved. The two optimisation levels are the two access orderings the compiler produces for volatile loops - straight-line at -O2 and software-pipelined at -O3 - because what this program varies is the cache configuration rather than the code generation, and the answer is the same at every level."
+}

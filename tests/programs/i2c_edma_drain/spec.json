@@ -1,0 +1,8 @@
+{
+  "weight": 80,
+  "sources": ["main.c"],
+  "cflags": [],
+  "max_cycles": 400000,
+  "expect": {"A4": 287454020},
+  "expected_source": "287454020 is 0x11223344, the four bytes the CPU wrote to ICDXR packed in order; the CPU never copies them, so they can only reach the buffer if the I2C loopback path raises its receive event and the EDMA3 channel reads ICDRR through the peripheral's slave port"
+}

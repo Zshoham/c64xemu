@@ -1,0 +1,15 @@
+{
+  "weight": 70,
+  "sources": [
+    "main.asm"
+  ],
+  "cflags": [],
+  "max_cycles": 200000,
+  "opt_levels": [
+    "-O2"
+  ],
+  "expect": {
+    "A4": 2282750939
+  },
+  "expected_source": "hand-written assembly; the constant comes from an independent C model on the host of the documented exception transitions - SPRU732J chapter 6 and Table 6-3 for the context switch (EFR.SXF for SWE and SWENR, EFR.IXF plus IERR.OPX for an illegal opcode, NTSR = TSR with SPLX cleared and HWE set only for a hardware exception, TSR = GEE alone plus EXC), section 8.4 for SWENR entering at REP rather than the vector, and linux-c6x for the two facts the manual states only indirectly: NRP names the packet after a completed SWE but the offending packet itself for an internal exception (arch/c6x/kernel/traps.c reads the faulting word back through it), and IERR is a plain read/write register that a handler writes back with the causes it has not handled"
+}

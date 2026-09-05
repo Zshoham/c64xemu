@@ -1,0 +1,21 @@
+{
+  "weight": 80,
+  "sources": [
+    "tests/programs/rts_printf/main.c"
+  ],
+  "cflags": [
+    "--big_endian",
+    "-O0"
+  ],
+  "link_flags": [
+    "--big_endian"
+  ],
+  "opt_levels": [
+    "-O0"
+  ],
+  "rts": true,
+  "entry": "_c_int00",
+  "max_cycles": 4000000,
+  "cio_output": "hello from c64x+ sum=30\n",
+  "expected_source": "the CIO text follows from the C source; the big-endian target length word follows TI trgcio.h while CIO parameters remain protocol-little-endian"
+}

@@ -1,0 +1,14 @@
+{
+  "weight": 90,
+  "sources": [
+    "main.c",
+    "kernel.c",
+    "vectors.asm"
+  ],
+  "cflags": [],
+  "rts": true,
+  "entry": "_c_int00",
+  "max_cycles": 40000000,
+  "expected_source": "the kernel value comes from building kernel.c with an independent host C compiler and is identical at every optimisation level, which is the point: interrupts taken inside a software-pipelined loop must not change the result. served and witness follow from the service routine re-arming its own event exactly 300 times, folded in Python",
+  "cio_output": "interrupt_sploop=1101228873 served=300 witness=3975451830 flag=0\n"
+}

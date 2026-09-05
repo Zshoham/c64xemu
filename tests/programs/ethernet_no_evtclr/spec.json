@@ -1,0 +1,18 @@
+{
+  "weight": 90,
+  "sources": [
+    "main.c",
+    "vectors.asm"
+  ],
+  "cflags": [],
+  "max_cycles": 4000000,
+  "expect": {
+    "A4": 1321438973
+  },
+  "expected_source": "the rolling hash h = h * 31 + byte over every byte of the three injected frames, in order, computed independently in Python; the driver never writes EVTCLR0, so each frame has to interrupt through a fresh assertion of MACINT after the previous one was acknowledged with the receive completion pointer, which is what SPRU871K 7.4.2 promises for a directly selected event",
+  "rx_frames": [
+    "020000112233020000aabbcc0800030a11181f262d343b424950575e656c737a81888f969da4abb2b9c0c7ced5dce3eaf1f8ff060d141b222930373e",
+    "ffffffffffff020000445566080605121f2c394653606d7a8794a1aebbc8d5e2effc091623303d4a5764717e",
+    "02000011223302000077889986dd090c0f1215181b1e2124272a2d303336393c3f4245484b4e5154575a5d606366696c6f7275787b7e8184878a8d909396999c9fa2a5a8abaeb1b4b7ba"
+  ]
+}

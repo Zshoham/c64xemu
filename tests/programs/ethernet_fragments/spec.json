@@ -1,0 +1,18 @@
+{
+  "weight": 90,
+  "sources": [
+    "main.c"
+  ],
+  "cflags": [],
+  "rts": true,
+  "entry": "_c_int00",
+  "max_cycles": 16000000,
+  "expected_source": "a packet spans one descriptor per fragment (SPRU975E section 2.5.5), so a 168-byte frame fills six 32-byte buffers: the first carries SOP and the packet length, the last carries EOP and, because the ring ends there, EOQ, and the head descriptor pointer is left at zero; the checksum was computed in Python over the injected frame",
+  "rx_frames": [
+    "020000112233020000aabbcc08000b10151a1f24292e33383d42474c51565b60656a6f74797e83888d92979ca1a6abb0b5babfc4c9ced3d8dde2e7ecf1f6fb00050a0f14191e23282d32373c41464b50555a5f64696e73787d82878c91969ba0a5aaafb4b9bec3c8cdd2d7dce1e6ebf0f5faff04090e13181d22272c31363b40454a4f54595e63686d72777c81868b90959a9fa4a9aeb3b8bdc2c7ccd1d6dbe0e5eaeff4f9fe0308"
+  ],
+  "tx_frames": [
+    "020000aabbcc02000011223308000b10151a1f24292e33383d42474c51565b60656a6f74797e83888d92979ca1a6abb0b5babfc4c9ced3d8dde2e7ecf1f6fb00050a0f14191e23282d32373c41464b50555a5f64696e73787d82878c91969ba0a5aaafb4b9bec3c8cdd2d7dce1e6ebf0f5faff04090e13181d22272c31363b40454a4f54595e63686d72777c81868b90959a9fa4a9aeb3b8bdc2c7ccd1d6dbe0e5eaeff4f9fe0308"
+  ],
+  "cio_output": "ethernet_fragments=-243494638 length=168 total=168 fragments=6 eoq=1 hdp=0\n"
+}

@@ -1,0 +1,16 @@
+{
+  "weight": 60,
+  "sources": [
+    "main.c",
+    "tests/build/dsplib-c64plus/packages/ti/dsplib/src/DSP_autocor/c64P/DSP_autocor_cn.c"
+  ],
+  "includes": [
+    "tests/programs/common"
+  ],
+  "cflags": [],
+  "rts": true,
+  "entry": "_c_int00",
+  "max_cycles": 8000000,
+  "expected_source": "the printed value comes from building the identical C sources with an independent host C compiler (cc -std=gnu99, identical at -O0/-O1/-O2/-Os); the RTS exit path ends in abort(), which takes no argument, so the final A4 is unspecified and only the CIO text is checked",
+  "cio_output": "dsplib_autocor=2955081534\n"
+}
