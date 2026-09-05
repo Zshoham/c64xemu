@@ -1,0 +1,15 @@
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = ["--strict-config", "--strict-markers", "-ra"]
+xfail_strict = true
+markers = [
+  "programs: TI-compiled target program cases",
+  "network: NDK firmware and host TCP peer cases",
+  "rtos: TI-RTOS firmware cases",
+  "host: HPI host-to-firmware integration cases",
+  "differential: binutils and TI disassembler differential cases",
+  "slow: cases that compile target programs or execute full firmware",
+  "high_bandwidth: paced TCP cases at 1024 kbps and above, deselected in CI",
+]

@@ -1,0 +1,23 @@
+/target/
+/*.obj
+__pycache__/
+.pytest_cache/
+
+# Devenv
+.devenv*
+devenv.local.nix
+devenv.local.yaml
+
+# direnv
+.direnv
+
+# pre-commit
+.pre-commit-config.yaml
+
+# What the tests provision rather than carry: the TI toolsets, TI's DSPLIB and binutils' tic6x
+# vectors, and everything built out of them.
+/tests/build/
+
+# Firmware build output; the firmware images are build products too, rebuilt by the test
+# suite (tests/conftest.py) from tests/build/ when missing.
+tests/firmware/*/build/

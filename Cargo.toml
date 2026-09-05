@@ -1,0 +1,26 @@
+[package]
+name = "c64xemu"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+
+[dependencies]
+# `derive` for the subcommand tables; colour and suggestion support are left out so the
+# dependency tree stays at the parser itself.
+clap = { version = "4.5.61", default-features = false, features = [
+    "std",
+    "derive",
+    "help",
+    "usage",
+    "error-context",
+] }
+serde = { version = "1.0.225", features = ["derive"] }
+serde_json = "1.0.145"
+# The batch runner's SIGTERM capture: `flag::register` installs an async-signal-safe
+# flag-setter, which is the standard way to notice termination without unsafe signal code.
+signal-hook = "0.4"
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
+panic = "abort"
