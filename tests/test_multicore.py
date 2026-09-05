@@ -1,0 +1,532 @@
+"""The six-core device, driven the way a user drives it.
+
+The C6472 is six C64x+ megamodules around one set of peripherals (SPRS612G section 2.3), so the
+claims worth making end to end are the ones a single-core device cannot make: that every core out
+of reset executes, that the 768 KB shared L2 at 0020 0000h is one memory every core sees at that
+address, that each core's own L2 at 0080 0000h is six separate memories, and that a core's memory
+also carries the global address (1n80 0000h) another core or an Ethernet MAC has to use. The unit
+tests in `src/device.rs` and `src/system.rs` pin the register-level behaviour - boot release, the
+inter-processor interrupt, the DMA snoop against a peer's L1D, the per-core Ethernet interrupt;
+this file pins what the command line does with it.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import select
+import socket
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import pytest
+
+from common import ROOT
+from target_programs import Program, build_target_program, load_programs
+
+FIRMWARE = ROOT / "tests/firmware/c6472_multicore"
+NETECHO_FIRMWARE = ROOT / "tests/firmware/c6472_netecho"
+NETECHO_PEER = ROOT / "tests/tools/multicore_echo.py"
+
+# Payload rate per core for the paced echo case, in kilobits a second of wall clock: the same
+# powers of two the single-core paced cases use, so the top rate is 4096 kbps on each of six
+# cores, 24.6 Mbps through one MAC. The exchange stops completing between 6144 and 7168 kbps a
+# core, and at the top rate here the emulator is the thing that is busy - 89% of the run's wall
+# clock against the host peer's 34% - so what the case measures is the device model and not the
+# harness.
+NETECHO_RATES = (16, 32, 64, 128, 256, 512, 1024, 2048, 4096)
+# Rates at or above this per core carry the `high_bandwidth` mark, which CI deselects: this is
+# where the measured headroom to the boundary above drops below four times, and a shared runner
+# cannot be relied on to sustain a pace that close. Everything below it passes with three
+# competing CPU hogs on this machine, and so does the top rate - but not with four times less
+# host to run on.
+HIGH_BANDWIDTH_PER_CORE = 2048
+# Half a second of sending per rate. The rate is the claim; the duration only decides how much
+# of it is sent, and six cores of emulation is expensive enough that the suite should not spend
+# a second on each of nine rates.
+NETECHO_DURATION = "0.5"
+
+
+# A small deterministic program with no peripheral dependencies: it ends at C$$EXIT with a known
+# value, which is all these cases need from the code the cores run.
+PROGRAM = "sum_loop"
+EXPECTED_EXIT_CODE = 55
+CORES = 6
+
+
+@pytest.fixture(scope="module")
+def image(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    workdir = tmp_path_factory.mktemp("multicore")
+    program = next(
+        (program for program in load_programs() if program.name == PROGRAM), None
+    )
+    if program is None:
+        pytest.skip(f"no {PROGRAM} target program")
+    built = build_target_program(program, workdir)
+    if built is None:
+        pytest.skip(f"could not build the {PROGRAM} target program")
+    return built
+
+
+def run_device(candidate: Path, image: Path, device: str) -> dict:
+    state = image.parent / f"state-{device}.json"
+    completed = subprocess.run(
+        [
+            str(candidate),
+            "run",
+            str(image),
+            "--device",
+            device,
+            "--max-cycles",
+            "2000000",
+            "--state-out",
+            str(state),
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    assert state.is_file(), f"no state dump: {completed.stderr}"
+    return json.loads(state.read_text())
+
+
+def debug_session(candidate: Path, image: Path, script: str) -> str:
+    completed = subprocess.run(
+        [str(candidate), "debug", str(image), "--device", "c6472"],
+        cwd=ROOT,
+        input=script,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    assert completed.returncode == 0, completed.stderr
+    return completed.stdout
+
+
+def dumped_words(output: str, address: int) -> list[str]:
+    """The bytes a `mem` command printed for `address`, as lower-case hex pairs."""
+    pattern = re.compile(rf"{address:08x} ((?:[0-9a-f]{{2}} )+)")
+    match = pattern.search(output)
+    assert match is not None, f"no dump of {address:#010x} in:\n{output}"
+    return match.group(1).split()
+
+
+def test_c6472_runs_every_core(candidate_binary: Path, image: Path) -> None:
+    """Immediate boot releases all six cores, and each runs the image on its own.
+
+    SPRS612G section 2.4.1: in boot mode 0 every megamodule starts at its DSP_BOOT_ADDR without
+    waiting to be released. One image, six cores, six independent cycle counts.
+    """
+    state = run_device(candidate_binary, image, "c6472")
+    assert state["device"] == "c6472"
+    cores = state["cores"]
+    assert len(cores) == CORES
+    for core in cores:
+        assert core["held_in_reset"] is False
+        assert core["fault"] is None
+        assert core["cycles"] > 0, f"core {core['core']} never ran"
+    # Every core ran the same program to the same place, so they agree on where they stopped.
+    assert len({core["pc"] for core in cores}) == 1
+    assert state["exit_code"] == EXPECTED_EXIT_CODE
+
+    # The single-core device reports exactly one core and the same result.
+    single = run_device(candidate_binary, image, "c6455")
+    assert single["device"] == "c6455"
+    assert len(single["cores"]) == 1
+    assert single["exit_code"] == EXPECTED_EXIT_CODE
+
+
+def test_c6472_shared_memory_is_shared_and_local_memory_is_not(
+    candidate_binary: Path, image: Path
+) -> None:
+    """One shared L2, six local L2s, and a global alias that reaches another core's.
+
+    Table 2-2: shared RAM at 0020 0000h in every core's local map, local L2 at 0080 0000h per
+    megamodule, and core *n*'s L2 also at 1n80 0000h. The debugger's memory commands act through
+    the focused core, which is what makes the difference observable from outside.
+    """
+    output = debug_session(
+        candidate_binary,
+        image,
+        "\n".join(
+            [
+                # Core 0 publishes a word in the shared RAM.
+                "write 0x00200040 deadbeef",
+                "core 3",
+                # Core 3 sees it at the same local address, and writes its own L2.
+                "mem 0x00200040 4",
+                "write 0x00800080 11223344",
+                "core 0",
+                # Core 0's own L2 at that address is a different memory ...
+                "mem 0x00800080 4",
+                # ... but core 3's L2 is reachable at its global alias.
+                "mem 0x13800080 4",
+                "quit",
+            ]
+        )
+        + "\n",
+    )
+    assert dumped_words(output, 0x0020_0040)[:4] == ["de", "ad", "be", "ef"]
+    assert dumped_words(output, 0x1380_0080)[:4] == ["11", "22", "33", "44"]
+    assert dumped_words(output, 0x0080_0080)[:4] != ["11", "22", "33", "44"]
+
+
+def test_c6472_debugger_lists_and_switches_cores(
+    candidate_binary: Path, image: Path
+) -> None:
+    """`core` names every core of the device, and `core N` moves what the session drives."""
+    output = debug_session(candidate_binary, image, "core\nstepc 8\ncore 4\ncore\nquit\n")
+    listed = [
+        line.strip()
+        for line in output.splitlines()
+        if re.search(r"(\*|\s)\s*core \d ", line)
+    ]
+    assert len(listed) >= 2 * CORES, output
+    first, last = listed[:CORES], listed[-CORES:]
+    assert first[0].lstrip("(c64xemu) ").startswith("* core 0"), first
+    assert last[4].startswith("* core 4"), last
+    # Stepping advanced every core, not just the focused one, and they stay in lockstep: the
+    # cores run one cycle each per device cycle (SPRS612G section 2.3 - one clock, six cores).
+    counts = set(re.findall(r"running, (\d+) cycles", output))
+    assert counts == {"0", "8"}, output
+    stepped = [line for line in listed if "running, 8 cycles" in line]
+    assert len(stepped) == 2 * CORES, output
+    addresses = {re.search(r"pc (0x[0-9a-f]+)", line).group(1) for line in stepped}
+    assert len(addresses) == 1, addresses
+
+
+def gdb_packet(body: str) -> bytes:
+    checksum = sum(body.encode()) & 0xFF
+    return f"${body}#{checksum:02x}".encode()
+
+
+def gdb_exchange(candidate: Path, image: Path, requests: list[str]) -> list[str]:
+    """Send packets to the GDB stub and collect one reply each, acknowledgements aside."""
+    process = subprocess.Popen(
+        [str(candidate), "debug", "--gdb", "127.0.0.1:0", str(image), "--device", "c6472"],
+        cwd=ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    try:
+        port = None
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline and port is None:
+            line = process.stdout.readline() if process.stdout else ""
+            match = re.search(r"127\.0\.0\.1:(\d+)", line)
+            if match:
+                port = int(match.group(1))
+        assert port is not None, "the stub never reported its port"
+        replies: list[str] = []
+        with socket.create_connection(("127.0.0.1", port), timeout=30) as link:
+            for request in requests:
+                link.sendall(gdb_packet(request))
+                buffer = ""
+                while "#" not in buffer:
+                    ready, _, _ = select.select([link], [], [], 30)
+                    assert ready, f"no reply to {request}"
+                    chunk = link.recv(4096).decode()
+                    assert chunk, f"stub closed while answering {request}"
+                    buffer += chunk.replace("+", "", 1) if buffer == "" else chunk
+                replies.append(buffer.split("$", 1)[-1].split("#", 1)[0])
+                link.sendall(b"+")
+        return replies
+    finally:
+        process.kill()
+        process.wait(timeout=30)
+
+
+def test_c6472_gdb_stub_reports_a_thread_per_core(
+    candidate_binary: Path, image: Path
+) -> None:
+    """`info threads` in gdb lists the device's cores, and selecting one moves the session.
+
+    The stub numbers threads from one and cores from zero, so thread 5 is core 4; a register
+    read after `Hg5` is core 4's, which is what makes a six-core device debuggable at all.
+    """
+    replies = gdb_exchange(
+        candidate_binary,
+        image,
+        ["qfThreadInfo", "qsThreadInfo", "qC", "Hg5", "qC", "qThreadExtraInfo,5", "T6", "Hg9"],
+    )
+    threads, more, first_focus, selected, second_focus, extra, alive, missing = replies
+    assert threads == "m1,2,3,4,5,6", threads
+    assert more == "l"
+    assert first_focus == "QC1"
+    assert selected == "OK"
+    assert second_focus == "QC5", "the focused core followed Hg"
+    assert bytes.fromhex(extra).decode() == "core 4"
+    assert alive == "OK", "thread 6 is core 5, the last one"
+    assert missing == "E01", "there is no core 8"
+
+
+@pytest.fixture(scope="module")
+def multicore_firmware(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """The C6472 rendezvous firmware, built with the checked-in TI toolchain.
+
+    It needs its own linker command file: 608 KB of local L2 rather than the C6455's 2 MB, a
+    1 KB-aligned window for the entry the released cores are given, and the shared L2 for the
+    rendezvous buffer.
+    """
+    program = Program(
+        name="c6472_multicore",
+        weight=0,
+        sources=(str(FIRMWARE / "main.c"),),
+        includes=(),
+        cflags=("-O1",),
+        link_flags=(),
+        entry="_c_int00",
+        max_cycles=5_000_000,
+        opt_levels=("-O1",),
+        rts=True,
+        expect={},
+        cio_output=None,
+        rx_frames=(),
+        tx_frames=None,
+        boot_table=None,
+        boot_config=None,
+        link_cmd=str(FIRMWARE / "link.cmd"),
+    )
+    workdir = tmp_path_factory.mktemp("c6472-firmware")
+    image = build_target_program(program, workdir)
+    if image is None:
+        pytest.skip("could not build the C6472 multicore firmware")
+    return image
+
+
+def dumped(stderr: str, address: int) -> list[int]:
+    """The words a `--dump` printed for one address."""
+    words: list[int] = []
+    collecting = False
+    for line in stderr.splitlines():
+        if line.startswith("dump "):
+            collecting = line.startswith(f"dump {address:#010x}")
+            continue
+        if collecting and line.strip():
+            words.extend(int(word, 16) for word in line.split()[1:])
+    return words
+
+
+def test_c6472_firmware_releases_the_other_cores_and_meets_them(
+    candidate_binary: Path, multicore_firmware: Path
+) -> None:
+    """The real multicore boot flow, run as firmware on the emulated device.
+
+    In a ROM boot mode only core 0 leaves reset (SPRS612G section 2.4.1). It gives cores 1-5 a
+    start address in DSP_BOOT_ADDRn, releases them through BOOT_COMPLETE_STAT and announces
+    itself to each with an inter-processor interrupt; every released core writes its signature
+    into the shared L2 and reads the source flag out of its own IPCGR. Core 0 waits for all six
+    and tallies the result: 0+1+2+3+4+5 = 15, plus 0x100 for each of the five cores that saw
+    the interrupt source, is 0x50F.
+    """
+    completed = subprocess.run(
+        [
+            str(candidate_binary),
+            "run",
+            str(multicore_firmware),
+            "--device",
+            "c6472",
+            # Master I2C boot: a ROM mode, so cores 1-5 start held in reset.
+            "--boot-mode",
+            "2",
+            "--max-cycles",
+            "5000000",
+            "--dump",
+            "0x008004ec:8",
+            "--dump",
+            "0x00200000:24",
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    # The firmware returns its tally from main, so the process exit status is the program's;
+    # the values it left in memory are the result.
+    answered, total = dumped(completed.stderr, 0x0080_04EC)
+    assert answered == CORES, "every core reported in"
+    assert total == 0x50F, f"tally {total:#x}"
+    signatures = dumped(completed.stderr, 0x0020_0000)
+    assert signatures == [0xC0DE0000 | core for core in range(CORES)]
+
+
+def test_c6472_firmware_leaves_cores_held_without_a_release(
+    candidate_binary: Path, multicore_firmware: Path
+) -> None:
+    """Nothing but BOOT_COMPLETE_STAT starts the other cores.
+
+    Run the same firmware on a single-core C6455, where the boot controller does not exist and
+    the writes go nowhere: only one core runs, so the rendezvous never completes and the tally
+    counts one core. That is the control for the case above - the six-core result comes from
+    the boot controller doing its job, not from the cores having been running all along.
+    """
+    completed = subprocess.run(
+        [
+            str(candidate_binary),
+            "run",
+            str(multicore_firmware),
+            "--device",
+            "c6455",
+            "--max-cycles",
+            "20000000",
+            "--dump",
+            "0x008004ec:8",
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    answered, total = dumped(completed.stderr, 0x0080_04EC)
+    assert answered == 1, "only core 0 ever reported"
+    assert total == 0, "no other core's index was added"
+
+
+@pytest.fixture(scope="module")
+def netecho_firmware(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """The six-core Ethernet echo firmware, built with the checked-in TI toolchain.
+
+    Its linker command file puts code, data and stack in each core's own 608 KB L2 and the
+    descriptor rings and frame buffers in the shared L2 window, which is the only memory both
+    every core and the MAC's DMA can reach.
+    """
+    program = Program(
+        name="c6472_netecho",
+        weight=0,
+        sources=(str(NETECHO_FIRMWARE / "main.c"),),
+        includes=(),
+        cflags=("-O2",),
+        link_flags=(),
+        entry="_c_int00",
+        max_cycles=5_000_000,
+        opt_levels=("-O2",),
+        rts=True,
+        expect={},
+        cio_output=None,
+        rx_frames=(),
+        tx_frames=None,
+        boot_table=None,
+        boot_config=None,
+        link_cmd=str(NETECHO_FIRMWARE / "link.cmd"),
+    )
+    workdir = tmp_path_factory.mktemp("c6472-netecho")
+    image = build_target_program(program, workdir)
+    if image is None:
+        pytest.skip("could not build the C6472 echo firmware")
+    return image
+
+
+@pytest.mark.parametrize(
+    "kbps",
+    [
+        pytest.param(
+            rate,
+            marks=(pytest.mark.high_bandwidth,) if rate >= HIGH_BANDWIDTH_PER_CORE else (),
+            id=f"{rate}k",
+        )
+        for rate in NETECHO_RATES
+    ],
+)
+def test_c6472_echoes_paced_traffic_on_all_six_cores_at_once(
+    candidate_binary: Path, netecho_firmware: Path, kbps: int
+) -> None:
+    """Six cores, one MAC, one paced stream per core, every byte back from the right core.
+
+    The device gives all six megamodules one Ethernet MAC (SPRS612G Table 7-105), so the claim
+    worth making is the one a single core cannot: that six cores each own a receive channel of
+    the same MAC, each answer their own unicast address out of the shared address RAM, and each
+    keep up with a rate paced against wall clock at the same time. The peer sends a deterministic
+    stream to 02:00:00:64:72:0N for every N and requires it echoed by the core that owns that
+    address, in order, with the whole exchange inside one and a half times the sending time -
+    the same deadline the single-core bandwidth cases use.
+
+    The ladder runs to 4096 kbps a core, which is 24.6 Mbps of payload through one MAC and
+    within one and a half times the rate at which the exchange stops completing at all, so the
+    top rates are a real measurement of how fast six cores can move frames rather than a
+    formality.
+
+    A core that never started, a core polling the wrong channel, an address slot bound to the
+    wrong channel, or a descriptor given to the MAC at a local rather than a global address all
+    show up the same way: that core's bytes never come back.
+    """
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(NETECHO_PEER),
+            "--emulator",
+            str(candidate_binary),
+            "--image",
+            str(netecho_firmware),
+            "--cores",
+            str(CORES),
+            "--bandwidth-kbps",
+            str(kbps),
+            "--duration",
+            NETECHO_DURATION,
+            "--report",
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    lines = [line for line in completed.stdout.splitlines() if line.startswith("{")]
+    assert lines, f"the peer printed no report: {completed.stdout}{completed.stderr}"
+    report = json.loads(lines[-1])
+    expected_per_core = int(kbps * 125.0 * float(NETECHO_DURATION))
+    assert report["state"] == "closed", f"{report}"
+    assert len(report["cores"]) == CORES
+    for core in report["cores"]:
+        assert core["matched"], f"core {core['core']}: {core['mismatch']}"
+        assert core["echoed"] == expected_per_core, f"core {core['core']} echoed {core['echoed']}"
+    assert report["echoed"] == expected_per_core * CORES
+
+
+def test_c6472_echo_needs_every_core_out_of_reset(
+    candidate_binary: Path, netecho_firmware: Path
+) -> None:
+    """The control for the case above: in a ROM boot mode only core 0 runs.
+
+    Nothing in this firmware writes BOOT_COMPLETE_STAT, so cores 1-5 stay held (SPRS612G
+    section 2.4.1) and never arm a channel. Core 0 still brings the MAC up and announces
+    itself, which is what makes the difference legible: the six-core result comes from six
+    cores each answering their own address, not from one core answering all six.
+    """
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(NETECHO_PEER),
+            "--emulator",
+            str(candidate_binary),
+            "--image",
+            str(netecho_firmware),
+            "--cores",
+            str(CORES),
+            "--bandwidth-kbps",
+            "64",
+            "--duration",
+            "0.2",
+            # A ROM mode: core 0 leaves reset and the rest wait for a release that never comes.
+            "--boot-mode",
+            "2",
+            # Core 0 announces itself in a few hundred thousand cycles; a wait an order of
+            # magnitude longer than that is enough to call the other five held.
+            "--ready-timeout",
+            "2",
+            "--report",
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    lines = [line for line in completed.stdout.splitlines() if line.startswith("{")]
+    assert lines, f"the peer printed no report: {completed.stdout}{completed.stderr}"
+    report = json.loads(lines[-1])
+    assert report["state"] == "cores-never-ready", f"{report}"
+    ready = [core["ready"] for core in report["cores"]]
+    assert ready == [True] + [False] * (CORES - 1), f"{ready}"

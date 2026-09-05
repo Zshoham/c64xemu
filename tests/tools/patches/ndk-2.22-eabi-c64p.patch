@@ -1,0 +1,37 @@
+Add the EABI C64x+ target to TI's NDK 2.22 build files.
+
+TI's ndk.mak predates the ti.targets.elf.C64P target: it neither declares the
+variable nor forwards it through XDCARGS, and ndk.bld's ccOpts map has no entry
+for it. Without this patch the XDC build configures zero targets and builds
+nothing. Applies to a fresh ndk_2_22_02_16 tree with -p1.
+
+diff --git a/ndk.mak b/ndk.mak
+--- a/ndk.mak
++++ b/ndk.mak
+@@ -24,6 +24,7 @@
+ #
+ # USER STEP: user must define below paths to compilers
+ ti.targets.C64P ?=
++ti.targets.elf.C64P ?=
+ ti.targets.C64P_big_endian ?=
+ ti.targets.C674 ?=
+ 
+@@ -57,6 +58,7 @@
+ #
+ XDCARGS= \
+     ti.targets.C64P=\"$(ti.targets.C64P)\" \
++    ti.targets.elf.C64P=\"$(ti.targets.elf.C64P)\" \
+     ti.targets.C64P_big_endian=\"$(ti.targets.C64P_big_endian)\" \
+     ti.targets.C674=\"$(ti.targets.C674)\" \
+     ti.targets.arm.elf.Arm9=\"$(ti.targets.arm.elf.Arm9)\" \
+diff --git a/ndk.bld b/ndk.bld
+--- a/ndk.bld
++++ b/ndk.bld
+@@ -74,6 +74,7 @@
+ 
+ var ccOpts = {
+     "ti.targets.C64P"               : c6xOpts,
++    "ti.targets.elf.C64P"           : c6xOpts,
+     "ti.targets.C64P_big_endian"    : c6xOpts,
+     "ti.targets.C674"               : c6xOpts,
+ 
