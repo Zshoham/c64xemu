@@ -1,0 +1,1335 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>c64xemu - C64x+ core dashboard</title>
+<style>
+:root {
+  --bg: #090d12;
+  --chrome: #0d141d;
+  --panel: #111a25;
+  --panel2: #162231;
+  --panel3: #0c121a;
+  --edge: #26364a;
+  --edge-soft: #1b2939;
+  --fg: #dce7f3;
+  --dim: #8394a8;
+  --accent: #56b8ff;
+  --accent-soft: #122d43;
+  --cyan: #43d1c5;
+  --good: #48c781;
+  --warn: #e0ae55;
+  --bad: #ff6b72;
+  --changed: #f0bd63;
+  --mono: ui-monospace, "JetBrains Mono", "Cascadia Code", Menlo, monospace;
+}
+* { box-sizing: border-box; }
+html { color-scheme: dark; }
+body {
+  margin: 0;
+  min-width: 720px;
+  background:
+    radial-gradient(circle at 12% -10%, rgba(34, 92, 133, .14), transparent 30rem),
+    var(--bg);
+  color: var(--fg);
+  font: 13px/1.45 Inter, ui-sans-serif, system-ui, sans-serif;
+}
+button, input, select { font: inherit; }
+button {
+  min-height: 32px;
+  padding: 5px 11px;
+  border: 1px solid var(--edge);
+  border-radius: 6px;
+  background: var(--panel2);
+  color: var(--fg);
+  cursor: pointer;
+  transition: border-color .12s ease, background .12s ease, color .12s ease;
+}
+button:hover { border-color: #477397; background: #1a2a3c; }
+button:focus-visible, input:focus-visible, select:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+button.primary { border-color: #328ac6; background: #123653; color: #e8f6ff; }
+button.primary:hover { background: #174667; }
+button.danger { color: #ffb2b5; }
+input, select {
+  min-height: 32px;
+  padding: 5px 9px;
+  border: 1px solid var(--edge);
+  border-radius: 6px;
+  background: var(--panel3);
+  color: var(--fg);
+  font-family: var(--mono);
+  font-size: 12px;
+}
+input[type="checkbox"] { min-height: 0; accent-color: var(--accent); }
+.app-chrome {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  border-bottom: 1px solid var(--edge);
+  background: rgba(13, 20, 29, .97);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, .22);
+  backdrop-filter: blur(12px);
+}
+.app-header {
+  display: grid;
+  grid-template-columns: minmax(185px, auto) minmax(330px, 1fr) auto;
+  align-items: center;
+  gap: 20px;
+  min-height: 68px;
+  padding: 10px 18px;
+}
+.brand { display: flex; align-items: center; gap: 10px; }
+.brand-mark {
+  display: grid;
+  place-items: center;
+  width: 38px;
+  height: 38px;
+  border: 1px solid #3279a7;
+  border-radius: 9px;
+  background: linear-gradient(145deg, #173d58, #102335);
+  color: var(--accent);
+  font: 700 11px/1 var(--mono);
+  letter-spacing: .06em;
+}
+.brand h1 { margin: 0; font-size: 16px; letter-spacing: .01em; }
+.brand small, .eyebrow {
+  color: var(--dim);
+  font-size: 10px;
+  font-weight: 650;
+  letter-spacing: .11em;
+  text-transform: uppercase;
+}
+.target-readout {
+  min-width: 0;
+  padding-left: 16px;
+  border-left: 1px solid var(--edge);
+}
+.pc-readout {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  min-width: 0;
+  margin-top: 2px;
+  font-family: var(--mono);
+}
+#pc { color: var(--accent); font-size: 15px; }
+#pcwhere { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.transport { display: flex; align-items: center; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
+.button-group { display: flex; gap: 4px; padding-right: 8px; border-right: 1px solid var(--edge); }
+.button-group:last-child { padding-right: 0; border-right: 0; }
+.rate-control { display: flex; align-items: center; gap: 5px; color: var(--dim); font-size: 11px; }
+.rate-control input { width: 58px; }
+.rate-control select { background: var(--panel); color: inherit; border: 1px solid var(--edge); font: inherit; padding: 1px 4px; }
+.status-strip {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  min-height: 42px;
+  padding: 0 18px;
+  border-top: 1px solid var(--edge-soft);
+}
+.workspace-nav { display: flex; align-self: stretch; gap: 2px; }
+.workspace-tab {
+  position: relative;
+  min-height: 41px;
+  padding: 0 14px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--dim);
+  font-size: 12px;
+  font-weight: 650;
+}
+.workspace-tab:hover { border: 0; background: rgba(86, 184, 255, .06); color: var(--fg); }
+.workspace-tab.active { color: var(--accent); }
+.workspace-tab.active::after {
+  content: "";
+  position: absolute;
+  right: 12px;
+  bottom: 0;
+  left: 12px;
+  height: 2px;
+  border-radius: 2px 2px 0 0;
+  background: var(--accent);
+}
+.live-metrics { display: flex; align-items: center; gap: 7px; margin-left: auto; }
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-height: 24px;
+  padding: 2px 8px;
+  border: 1px solid var(--edge);
+  border-radius: 999px;
+  background: var(--panel2);
+  color: var(--dim);
+  font: 11px/1.2 var(--mono);
+  white-space: nowrap;
+}
+.pill b { color: var(--accent); font-weight: 650; }
+.pill.bad { border-color: rgba(255, 107, 114, .55); background: #321a21; color: var(--bad); }
+.pill.good { border-color: rgba(72, 199, 129, .5); background: #10291e; color: var(--good); }
+#faultbanner {
+  display: none;
+  max-width: 520px;
+  overflow: hidden;
+  padding: 3px 9px;
+  border: 1px solid var(--bad);
+  border-radius: 5px;
+  background: #35171d;
+  color: var(--bad);
+  font-family: var(--mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.workspace-root { max-width: 1900px; margin: 0 auto; padding: 16px 18px 32px; }
+.workspace { display: none; }
+.workspace.active { display: block; }
+.core-layout {
+  display: grid;
+  grid-template-columns: minmax(620px, 1fr) minmax(460px, 520px);
+  gap: 16px;
+  align-items: start;
+}
+.primary-column, .inspector-column, .stack { display: grid; gap: 16px; min-width: 0; }
+.lower-grid, .memory-layout { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; align-items: start; }
+.memory-layout { grid-template-columns: minmax(620px, 1fr) minmax(360px, 480px); }
+.memory-layout .mar-panel { grid-column: 1 / -1; }
+.panel {
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid var(--edge);
+  border-radius: 9px;
+  background: linear-gradient(180deg, rgba(22, 34, 49, .65), rgba(17, 26, 37, .92));
+  box-shadow: 0 8px 20px rgba(0, 0, 0, .12);
+}
+.panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 43px;
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--edge-soft);
+}
+.panel-header h2, .panel > h2 {
+  margin: 0;
+  color: #afbdcb;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+}
+.panel-header p { margin: 1px 0 0; color: var(--dim); font-size: 11px; }
+.panel-body { padding: 11px 12px; }
+.toolbar { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
+.toolbar.push { margin-left: auto; }
+.toolbar .spacer { flex: 1; }
+.rowline { display: flex; align-items: center; gap: 7px; margin: 0; flex-wrap: wrap; }
+.dimtext { color: var(--dim); }
+table { width: 100%; border-collapse: collapse; font: 11.5px/1.4 var(--mono); }
+td, th { padding: 3px 6px; text-align: left; white-space: nowrap; }
+th { color: var(--dim); font-weight: 500; }
+tbody tr + tr { border-top: 1px solid rgba(38, 54, 74, .38); }
+td.changed { color: var(--changed); font-weight: 700; }
+td.name { color: var(--dim); }
+.register-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.register-bank { min-width: 0; overflow: hidden; border: 1px solid var(--edge-soft); border-radius: 6px; background: var(--panel3); }
+.register-bank h3 {
+  margin: 0;
+  padding: 5px 8px;
+  border-bottom: 1px solid var(--edge-soft);
+  color: var(--cyan);
+  font: 650 10px/1.4 var(--mono);
+  letter-spacing: .1em;
+  text-transform: uppercase;
+}
+.register-bank table td { padding: 2px 5px; }
+.scroll-region { max-height: 310px; overflow: auto; }
+.fugrid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
+.fu {
+  min-height: 70px;
+  padding: 7px 8px;
+  border: 1px solid var(--edge-soft);
+  border-radius: 6px;
+  background: var(--panel3);
+}
+.fu h3 { margin: 0 0 5px; color: var(--dim); font: 650 10px/1 var(--mono); }
+.fu.active { border-color: rgba(72, 199, 129, .55); background: #10251c; }
+.fu .insn { overflow-wrap: anywhere; font: 11px/1.4 var(--mono); }
+.badge { display: inline-block; margin-left: 4px; padding: 1px 4px; border-radius: 4px; font: 9px/1.3 var(--mono); }
+.badge.x { background: #3b2e00; color: var(--warn); }
+.badge.t { background: #102d45; color: var(--accent); }
+.badge.r { background: #3d2816; color: #f09a55; }
+.dis {
+  max-height: 570px;
+  overflow: auto;
+  padding: 8px;
+  background: var(--panel3);
+  font: 11.5px/1.48 var(--mono);
+}
+.dis .row { padding: 5px 7px; border-left: 2px solid transparent; white-space: pre-wrap; }
+.dis .row + .row { border-top: 1px solid rgba(38, 54, 74, .32); }
+.dis .row.current { border-left-color: var(--accent); background: var(--accent-soft); }
+.dis .addr { display: inline-block; width: 82px; color: #71879d; }
+.dis .sym { color: var(--cyan); }
+.dis .bp { color: var(--bad); font-weight: 700; }
+.sploop .entry { padding: 3px 0; font: 11px/1.4 var(--mono); }
+.sploop .off { display: inline-block; width: 46px; color: var(--dim); }
+.bits { display: flex; flex-wrap: wrap; gap: 3px; font: 9.5px/1.4 var(--mono); }
+.bits span { padding: 1px 4px; border: 1px solid var(--edge-soft); border-radius: 3px; color: #66788d; background: var(--panel3); }
+.bits span.on { border-color: rgba(72, 199, 129, .48); color: var(--good); background: #10231b; }
+.interrupt-group + .interrupt-group { margin-top: 9px; }
+.interrupt-label { margin-bottom: 4px; color: var(--dim); font-size: 10px; font-weight: 650; letter-spacing: .07em; text-transform: uppercase; }
+.mem {
+  min-height: 280px;
+  max-height: 680px;
+  overflow: auto;
+  padding: 10px;
+  background: var(--panel3);
+  color: #c9d6e3;
+  font: 11.5px/1.55 var(--mono);
+  white-space: pre;
+}
+.cache table td { padding: 2px 6px 2px 0; }
+.cache-workspace { display: grid; gap: 16px; }
+.cache-cards { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+.cache-card {
+  display: block;
+  min-height: 152px;
+  padding: 12px;
+  text-align: left;
+  background: var(--panel3);
+}
+.cache-card:hover { background: #122234; }
+.cache-card.active { border-color: var(--accent); background: #10263a; box-shadow: inset 0 0 0 1px rgba(86, 184, 255, .22); }
+.cache-card.disabled { opacity: .68; }
+.cache-card-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.cache-card-name { color: var(--cyan); font: 700 12px/1 var(--mono); letter-spacing: .08em; }
+.cache-capacity { display: block; margin-top: 12px; color: var(--fg); font: 650 18px/1.2 var(--mono); }
+.cache-subtitle { display: block; margin-top: 3px; color: var(--dim); font-size: 10.5px; }
+.cache-meter { display: block; height: 5px; margin: 11px 0 9px; overflow: hidden; border-radius: 5px; background: #1b2938; }
+.cache-meter > span { display: block; height: 100%; border-radius: inherit; background: linear-gradient(90deg, #2a8ac5, var(--cyan)); }
+.cache-card-metrics { display: grid; grid-template-columns: 1fr 1fr; gap: 5px 12px; color: var(--dim); font: 10.5px/1.35 var(--mono); }
+.cache-card-metrics b { color: #c8d7e5; font-weight: 600; }
+.cache-detail-grid { display: grid; grid-template-columns: minmax(640px, 1.35fr) minmax(390px, .65fr); gap: 16px; align-items: start; }
+.cache-toolbar { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
+.cache-toolbar input[type="search"] { min-width: 220px; }
+.cache-table-wrap { min-height: 380px; max-height: 570px; overflow: auto; background: var(--panel3); }
+.cache-line-table thead { position: sticky; top: 0; z-index: 1; background: #121d29; }
+.cache-line-table tbody tr { cursor: pointer; }
+.cache-line-table tbody tr:hover { background: #162638; }
+.cache-line-table tbody tr.selected { background: #173752; box-shadow: inset 2px 0 var(--accent); }
+.cache-line-table td:first-child { color: var(--accent); }
+.cache-stat-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 7px; }
+.cache-stat {
+  min-width: 0;
+  padding: 8px;
+  border: 1px solid var(--edge-soft);
+  border-radius: 6px;
+  background: var(--panel3);
+}
+.cache-stat span { display: block; overflow: hidden; color: var(--dim); font-size: 9.5px; text-overflow: ellipsis; text-transform: uppercase; white-space: nowrap; }
+.cache-stat b { display: block; margin-top: 4px; color: #d7e4f0; font: 650 13px/1.2 var(--mono); }
+.cache-line-meta { min-height: 38px; margin-top: 10px; color: var(--dim); font: 10.5px/1.45 var(--mono); }
+.cache-line-data { min-height: 150px; max-height: 320px; margin: 7px 0 0; overflow: auto; padding: 10px; border: 1px solid var(--edge-soft); border-radius: 6px; background: #080c11; color: #cbd7e3; font: 11px/1.5 var(--mono); }
+.memory-support-grid { display: grid; grid-template-columns: minmax(620px, 1fr) minmax(360px, 480px); gap: 16px; align-items: start; }
+.cache-empty { padding: 28px 12px; color: var(--dim); text-align: center; }
+.mar { display: grid; grid-template-columns: repeat(32, minmax(0, 1fr)); gap: 2px; }
+.mar div { aspect-ratio: 1; border-radius: 2px; background: #1a2634; cursor: default; }
+.mar div.on { background: linear-gradient(145deg, #2f9b69, #46c781); box-shadow: 0 0 5px rgba(72, 199, 129, .25); }
+.packet-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+.packet-pane { min-width: 0; overflow: hidden; border: 1px solid var(--edge-soft); border-radius: 7px; background: var(--panel3); }
+.packet-heading { display: flex; align-items: center; gap: 8px; min-height: 40px; padding: 7px 9px; border-bottom: 1px solid var(--edge-soft); }
+.packet-heading b { color: var(--cyan); }
+.packet-list { max-height: 250px; overflow: auto; }
+.packet-list thead { position: sticky; top: 0; z-index: 1; background: #121d29; }
+.packet-table tbody tr { cursor: pointer; }
+.packet-table tbody tr:hover { background: #162638; }
+.packet-table tbody tr.selected { background: #173752; box-shadow: inset 2px 0 var(--accent); }
+.packet-table td:nth-child(3) { min-width: 190px; white-space: normal; }
+.packet-summary { min-height: 44px; padding: 8px 10px; border-top: 1px solid var(--edge-soft); color: var(--dim); font: 10.5px/1.45 var(--mono); }
+.packet-detail { min-height: 240px; max-height: 420px; margin: 0; overflow: auto; padding: 9px 10px; border-top: 1px solid var(--edge-soft); background: #080c11; color: #cbd7e3; font: 11px/1.45 var(--mono); }
+.console-panel { max-width: 1500px; margin: 0 auto; }
+.console-output {
+  min-height: calc(100vh - 220px);
+  max-height: calc(100vh - 165px);
+  margin: 0;
+  overflow: auto;
+  padding: 18px 20px;
+  background:
+    linear-gradient(rgba(86, 184, 255, .025) 1px, transparent 1px),
+    #070b10;
+  background-size: 100% 24px;
+  color: #d5e1ec;
+  font: 12px/1.65 var(--mono);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  tab-size: 4;
+}
+.console-output.empty { color: var(--dim); font-style: italic; }
+#hot td:first-child { color: var(--accent); }
+#bplist { overflow-wrap: anywhere; font-family: var(--mono); font-size: 11px; }
+@media (max-width: 1180px) {
+  .app-header { grid-template-columns: auto 1fr; }
+  .transport { grid-column: 1 / -1; justify-content: flex-start; }
+  .core-layout, .memory-layout { grid-template-columns: 1fr; }
+  .cache-detail-grid, .memory-support-grid { grid-template-columns: 1fr; }
+  .memory-layout .mar-panel { grid-column: 1; }
+  .packet-grid { grid-template-columns: 1fr; }
+}
+@media (max-width: 820px) {
+  .app-chrome { position: static; }
+  .app-header { grid-template-columns: 1fr; gap: 10px; }
+  .target-readout { padding-left: 0; border-left: 0; }
+  .status-strip { align-items: flex-start; flex-direction: column; padding: 0 12px 9px; }
+  .workspace-nav { width: 100%; overflow-x: auto; }
+  .live-metrics { width: 100%; margin-left: 0; flex-wrap: wrap; }
+  .workspace-root { padding: 12px; }
+  .lower-grid, .register-grid { grid-template-columns: 1fr; }
+  .fugrid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .mar { grid-template-columns: repeat(16, minmax(0, 1fr)); }
+  .cache-cards { grid-template-columns: 1fr; }
+}
+</style>
+</head>
+<body>
+<div class="app-chrome">
+  <header class="app-header">
+    <div class="brand">
+      <div class="brand-mark">C64</div>
+      <div><h1>c64xemu</h1><small>Debug workspace</small></div>
+    </div>
+    <div class="target-readout">
+      <div class="eyebrow">Program counter</div>
+      <div class="pc-readout"><b id="pc">-</b><span id="pcwhere" class="dimtext"></span></div>
+    </div>
+    <div class="transport" aria-label="Execution controls">
+      <div class="button-group">
+        <button class="primary" id="run">Run</button>
+        <button id="stop" title="Stop a running target">Stop</button>
+        <button id="paced" title="Run at a fixed instruction rate">Paced</button>
+        <label class="rate-control"><input id="ips" value="20" title="Retired instructions per second while pacing"><span>instr/s</span></label>
+      </div>
+      <div class="button-group">
+        <button id="stepc1" title="Step one cycle">+1 cycle</button>
+        <button id="stepc10" title="Step ten cycles">+10</button>
+        <button id="stepc100" title="Step one hundred cycles">+100</button>
+        <button id="stepp" title="Step one execute packet">+1 packet</button>
+      </div>
+      <div class="button-group" id="coregroup" hidden>
+        <label class="rate-control"><span>core</span><select id="core" title="Which core every view shows"></select></label>
+      </div>
+      <div class="button-group">
+        <button class="danger" id="reset">Reset</button>
+      </div>
+    </div>
+  </header>
+  <div class="status-strip">
+    <nav class="workspace-nav" aria-label="Debugger views">
+      <button class="workspace-tab active" data-workspace="core" aria-selected="true">Core</button>
+      <button class="workspace-tab" data-workspace="memory" aria-selected="false">Memory &amp; cache</button>
+      <button class="workspace-tab" data-workspace="network" aria-selected="false">Ethernet</button>
+      <button class="workspace-tab" data-workspace="console" aria-selected="false">CIO output</button>
+    </nav>
+    <div class="live-metrics">
+      <span class="pill" id="halt">idle</span>
+      <span class="pill">cycle <b id="cycle">0</b></span>
+      <span class="pill">packets <b id="packets">0</b></span>
+      <span class="pill">retired <b id="retired">0</b></span>
+      <span class="pill">replays <b id="replays">0</b></span>
+    </div>
+    <span id="faultbanner"></span>
+  </div>
+</div>
+<main class="workspace-root">
+  <section class="workspace active" data-workspace-panel="core">
+    <div class="core-layout">
+      <div class="primary-column">
+        <section class="panel">
+          <div class="panel-header">
+            <div><h2>Disassembly</h2><p>Execution context and packet boundaries</p></div>
+            <label class="dimtext"><input type="checkbox" id="disfollow" checked> Follow PC</label>
+          </div>
+          <div class="panel-body">
+            <div class="toolbar">
+              <input id="disaddr" placeholder="Address or symbol" size="16" spellcheck="false">
+              <button id="disgo">Go</button>
+              <select id="dissyms" style="max-width:190px"><option value="">Jump to symbol...</option></select>
+              <span class="spacer"></span>
+              <button id="disprev">Previous</button>
+              <button id="disnext">Next</button>
+              <button id="dissmaller">&minus;</button>
+              <span class="pill" id="discount">8 packets</span>
+              <button id="disbigger">+</button>
+              <button id="dispc" title="Centre on the current PC">Current PC</button>
+              <span class="dimtext" id="disbase"></span>
+            </div>
+          </div>
+          <div class="dis" id="dis"></div>
+        </section>
+        <section class="panel">
+          <div class="panel-header"><div><h2>Functional units</h2><p>Instructions issued in the latest active cycle</p></div></div>
+          <div class="panel-body"><div class="fugrid" id="fugrid"></div></div>
+        </section>
+        <div class="lower-grid">
+          <section class="panel">
+            <div class="panel-header"><div><h2>SPLOOP buffer</h2><p>Software-pipelined loop state</p></div></div>
+            <div class="panel-body"><div class="sploop" id="sploop"><span class="dimtext">inactive</span></div></div>
+          </section>
+          <section class="panel">
+            <div class="panel-header"><div><h2>Hotspots</h2><p>Top execute-packet addresses</p></div></div>
+            <div class="panel-body"><table id="hot"></table></div>
+          </section>
+        </div>
+      </div>
+      <aside class="inspector-column">
+        <section class="panel">
+          <div class="panel-header"><div><h2>Register files</h2><p>Changed values use amber</p></div></div>
+          <div class="panel-body register-grid">
+            <div class="register-bank"><h3>File A</h3><table id="regsa"></table></div>
+            <div class="register-bank"><h3>File B</h3><table id="regsb"></table></div>
+          </div>
+        </section>
+        <section class="panel">
+          <div class="panel-header"><div><h2>Control registers</h2><p>Architectural control state</p></div></div>
+          <div class="scroll-region"><table id="control"></table></div>
+        </section>
+        <section class="panel">
+          <div class="panel-header"><div><h2>Interrupts</h2><p>CPU routing and pending events</p></div></div>
+          <div class="panel-body">
+            <div class="interrupt-group"><div class="interrupt-label">IFR</div><div class="bits" id="ifr"></div></div>
+            <div class="interrupt-group"><div class="interrupt-label">IER</div><div class="bits" id="ier"></div></div>
+            <div class="interrupt-group"><div class="interrupt-label">INTMUX / INT4-15</div><div class="bits" id="intmux"></div></div>
+            <div class="interrupt-group"><div class="interrupt-label">Event flags</div><div class="bits" id="evtflags"></div></div>
+          </div>
+        </section>
+        <section class="panel">
+          <div class="panel-header"><div><h2>Breakpoints</h2><p>Fetch-boundary stop addresses</p></div></div>
+          <div class="panel-body">
+            <div class="toolbar">
+              <input id="bpinput" placeholder="Address or symbol" size="20" spellcheck="false">
+              <button id="bpadd">Add</button>
+              <button id="bpclear">Clear all</button>
+            </div>
+            <div class="dimtext" id="bplist" style="margin-top:9px"></div>
+          </div>
+        </section>
+      </aside>
+    </div>
+  </section>
+  <section class="workspace" data-workspace-panel="memory">
+    <div class="cache-workspace">
+      <section class="panel">
+        <div class="panel-header">
+          <div><h2>Cache hierarchy</h2><p>Capacity, occupancy and cumulative byte-access counters</p></div>
+          <span class="pill">L1P &rarr; L2 / L1D &rarr; L2</span>
+        </div>
+        <div class="panel-body cache-cards" id="cachecards"></div>
+      </section>
+      <div class="cache-detail-grid">
+        <section class="panel">
+          <div class="panel-header">
+            <div><h2 id="cachelinetitle">Resident lines</h2><p>Click a line to inspect the bytes held by that cache</p></div>
+            <span class="pill" id="cachelinecount">0 lines</span>
+          </div>
+          <div class="panel-body">
+            <div class="cache-toolbar">
+              <input type="search" id="cachefilter" placeholder="Filter address or set">
+              <label class="dimtext"><input type="checkbox" id="cachedirty"> Dirty only</label>
+              <span style="flex:1"></span>
+              <button id="cacheprev">Previous</button>
+              <span class="pill" id="cachepage">0 / 0</span>
+              <button id="cachenext">Next</button>
+            </div>
+          </div>
+          <div class="cache-table-wrap">
+            <table class="cache-line-table">
+              <thead><tr><th>address</th><th>set</th><th>state</th><th>replacement clock</th></tr></thead>
+              <tbody id="cachelines"></tbody>
+            </table>
+          </div>
+        </section>
+        <section class="panel">
+          <div class="panel-header">
+            <div><h2>Selected cache</h2><p id="cachegeometry">No cache selected</p></div>
+            <span class="pill" id="cachelinestate">No line</span>
+          </div>
+          <div class="panel-body">
+            <div class="cache-stat-grid" id="cachestats"></div>
+            <div class="cache-line-meta" id="cachelinemeta">Select a resident line to inspect its data.</div>
+            <pre class="cache-line-data" id="cachelinedata">(no line selected)</pre>
+          </div>
+        </section>
+      </div>
+      <div class="memory-support-grid">
+        <section class="panel">
+          <div class="panel-header">
+            <div><h2>Memory inspector</h2><p>Host-view reads do not affect cache state</p></div>
+            <label class="dimtext"><input type="checkbox" id="memfollow"> Follow PC</label>
+          </div>
+          <div class="panel-body">
+            <div class="toolbar">
+              <input id="memaddr" value="0x00800000" size="14" spellcheck="false">
+              <button id="memgo">Go</button>
+              <button id="memback">&minus;128</button>
+              <button id="memfwd">+128</button>
+            </div>
+          </div>
+          <div class="mem" id="mem"></div>
+        </section>
+        <section class="panel mar-panel">
+          <div class="panel-header"><div><h2>Memory attribute registers</h2><p>256 segments, 16 MiB each; green segments are cacheable</p></div></div>
+          <div class="panel-body"><div class="mar" id="mar"></div></div>
+        </section>
+      </div>
+    </div>
+  </section>
+  <section class="workspace" data-workspace-panel="console">
+    <section class="panel console-panel">
+      <div class="panel-header">
+        <div><h2>CIO output</h2><p>Stdout and stderr written through the TI runtime host-I/O channel</p></div>
+        <span class="pill"><b id="ciocount">0</b> bytes</span>
+      </div>
+      <pre class="console-output empty" id="ciooutput">(No CIO output yet.)</pre>
+    </section>
+  </section>
+  <section class="workspace" data-workspace-panel="network">
+    <section class="panel">
+      <div class="panel-header">
+        <div><h2>Ethernet traffic</h2><p>Recent frames captured at the emulated MAC boundary</p></div>
+        <span class="pill">256-frame history</span>
+      </div>
+      <div class="panel-body packet-grid">
+        <div class="packet-pane">
+          <div class="packet-heading"><b>Incoming</b><span class="pill"><b id="rxcount">0</b> frames</span></div>
+          <div class="packet-list">
+            <table class="packet-table">
+              <thead><tr><th>cycle</th><th>bytes</th><th>source &rarr; destination</th><th>protocol</th></tr></thead>
+              <tbody id="rxpackets"></tbody>
+            </table>
+          </div>
+          <div class="packet-summary" id="rxsummary">No incoming packets captured.</div>
+          <pre class="packet-detail" id="rxdetail">(empty)</pre>
+        </div>
+        <div class="packet-pane">
+          <div class="packet-heading"><b>Outgoing</b><span class="pill"><b id="txcount">0</b> frames</span></div>
+          <div class="packet-list">
+            <table class="packet-table">
+              <thead><tr><th>cycle</th><th>bytes</th><th>source &rarr; destination</th><th>protocol</th></tr></thead>
+              <tbody id="txpackets"></tbody>
+            </table>
+          </div>
+          <div class="packet-summary" id="txsummary">No outgoing packets captured.</div>
+          <pre class="packet-detail" id="txdetail">(empty)</pre>
+        </div>
+      </div>
+    </section>
+  </section>
+</main>
+<script>
+let state = null;
+let symbols = [];
+let memAddr = 0x00800000;
+const memLen = 256;
+// Disassembly window: anchor address, packet count, follow-PC mode.
+let disAddr = null;
+let disCount = 8;
+let disFollow = true;
+// One driver at a time: the free run, the paced run, or a step.
+let busy = false;
+let running = false;
+let pacing = false;
+const $ = id => document.getElementById(id);
+const packetSelection = {rx: null, tx: null};
+let selectedCache = 0;
+let selectedCacheLine = null;
+let cachePage = 0;
+let cacheLineRequest = 0;
+const CACHE_PAGE_SIZE = 40;
+const esc = s => String(s).replace(/</g, "&lt;");
+const hex32 = value => "0x" + (value >>> 0).toString(16).padStart(8, "0");
+
+function activateWorkspace(name) {
+  document.querySelectorAll("[data-workspace-panel]").forEach(panel => {
+    panel.classList.toggle("active", panel.dataset.workspacePanel === name);
+  });
+  document.querySelectorAll("[data-workspace]").forEach(tab => {
+    const active = tab.dataset.workspace === name;
+    tab.classList.toggle("active", active);
+    tab.setAttribute("aria-selected", String(active));
+  });
+  if (name === "memory" && state) renderCaches();
+}
+
+for (const tab of document.querySelectorAll("[data-workspace]")) {
+  tab.addEventListener("click", () => activateWorkspace(tab.dataset.workspace));
+}
+
+async function post(path, body) {
+  const query = new URLSearchParams({mem: hex32(memAddr), len: memLen});
+  const response = await fetch(path + "?" + query, {method: "POST", body: JSON.stringify(body || {})});
+  if (!response.ok) throw new Error(path + ": " + response.status);
+  return response.json();
+}
+
+// The device's cores. Every other view is the focused core's, so switching focus is a server
+// action: the fabric follows the focus and the next snapshot is that core's.
+function renderCores() {
+  const cores = state.cores || [];
+  const group = $("coregroup");
+  if (cores.length <= 1) { group.hidden = true; return; }
+  group.hidden = false;
+  const select = $("core");
+  const wanted = cores.map((core) => {
+    const state = core.held ? "held in reset" : (core.halted ? "halted" : core.pc);
+    return `${core.core}: ${state}`;
+  }).join("|");
+  if (select.dataset.shape !== wanted) {
+    select.dataset.shape = wanted;
+    select.innerHTML = cores.map((core) => {
+      const suffix = core.held ? " (reset)" : (core.halted ? " (halted)" : "");
+      return `<option value="${core.core}">core ${core.core}${suffix}</option>`;
+    }).join("");
+  }
+  const focused = cores.find((core) => core.focused);
+  if (focused) select.value = String(focused.core);
+}
+
+async function selectCore(core) {
+  if (busy) return;
+  busy = true;
+  try {
+    state = await post("/api/focus", {core: Number(core)});
+    render();
+  } finally { busy = false; }
+}
+
+async function refresh() {
+  const query = new URLSearchParams({mem: hex32(memAddr), len: memLen});
+  const response = await fetch("/api/state?" + query);
+  state = await response.json();
+  render();
+}
+
+async function step(cycles) {
+  if (busy) return;
+  busy = true;
+  try {
+    followPc();
+    state = await post("/api/step", {cycles});
+    render();
+  } finally { busy = false; }
+}
+
+// A run is a sequence of bounded chunks: the server answers between them, so the page stays
+// responsive and "stop" is honoured.
+async function runUntilStop() {
+  if (busy) return;
+  busy = true; running = true;
+  $("run").textContent = "Running...";
+  try {
+    while (running) {
+      followPc();
+      state = await post("/api/run", {cycles: 200000});
+      render();
+      if (state.fault || state.halted) break;
+    }
+  } finally {
+    busy = false; running = false;
+    $("run").textContent = "Run";
+  }
+}
+
+// Slow motion: run at a target rate of retired instructions per second so a loop can be
+// watched. Each 100 ms tick asks for a cycle budget derived from a cycles-per-instruction
+// average, and gives back any time the tick overshot - very parallel code retires several
+// instructions in one cycle, so the budget alone cannot hold the rate.
+const sleep = ms => new Promise(resume => setTimeout(resume, ms));
+async function pacedRun() {
+  if (pacing) { pacing = false; return; }
+  if (busy || !state) return;
+  const rate = Math.max(0.5, parseFloat($("ips").value) || 20);
+  busy = true; pacing = true;
+  $("paced").textContent = "Stop pacing";
+  $("paced").classList.add("primary");
+  try {
+    const tick = 100;
+    const perTick = rate * tick / 1000;
+    let cyclesPerInstruction = 1;
+    while (pacing && !state.halted && !state.fault) {
+      const budget = Math.min(500000, Math.max(1, Math.round(perTick * cyclesPerInstruction)));
+      const retired = state.stats.retired;
+      const cycle = state.cycle;
+      const started = performance.now();
+      followPc();
+      state = await post("/api/run", {cycles: budget});
+      render();
+      const instructions = state.stats.retired - retired;
+      const cycles = state.cycle - cycle;
+      if (instructions > 0) {
+        cyclesPerInstruction = 0.7 * cyclesPerInstruction + 0.3 * (cycles / instructions);
+      }
+      const due = 1000 * Math.max(instructions, perTick) / rate;
+      const elapsed = performance.now() - started;
+      if (due > elapsed) await sleep(Math.min(2000, due - elapsed));
+    }
+  } finally {
+    pacing = false; busy = false;
+    $("paced").textContent = "Paced";
+    $("paced").classList.remove("primary");
+  }
+}
+
+function followPc() {
+  if ($("memfollow").checked && state) {
+    memAddr = parseInt(state.pc, 16) & ~0xf;
+    $("memaddr").value = hex32(memAddr);
+  }
+}
+
+function resolve(token) {
+  const raw = (token || "").trim();
+  if (!raw) return null;
+  if (raw === "." && state) return parseInt(state.pc, 16);
+  const symbol = symbols.find(entry => entry.name === raw);
+  if (symbol) return parseInt(symbol.address, 16);
+  const value = parseInt(raw, 16);
+  return isNaN(value) ? null : value;
+}
+
+function regTable(element, registers) {
+  let html = "";
+  for (let row = 0; row < 16; row++) {
+    const low = registers[row], high = registers[row + 16];
+    html += `<tr><td class="name">${row}</td><td class="${low.c ? "changed" : ""}">${low.v}</td>` +
+            `<td class="name">${row + 16}</td><td class="${high.c ? "changed" : ""}">${high.v}</td></tr>`;
+  }
+  element.innerHTML = html;
+}
+
+function renderUnits() {
+  const slots = {};
+  for (const issue of (state.units || [])) {
+    const key = issue.unit + (issue.side_a ? "1" : "2");
+    (slots[key] = slots[key] || []).push(issue);
+  }
+  let html = "";
+  for (const side of [1, 2]) {
+    for (const unit of ["L", "M", "S", "D"]) {
+      const list = slots[unit + side] || [];
+      let inner = "";
+      for (const issue of list) {
+        const badges =
+          (issue.cross ? `<span class="badge x">X</span>` : "") +
+          (issue.mem_side_a === null || issue.mem_side_a === undefined ? "" : `<span class="badge t">T${issue.mem_side_a ? 1 : 2}</span>`) +
+          (issue.replayed ? `<span class="badge r">R</span>` : "");
+        inner += `<div class="insn">${esc(issue.text)}${badges}</div>`;
+      }
+      html += `<div class="fu ${list.length ? "active" : ""}"><h3>.${unit}${side}</h3>${inner || '<span class="dimtext">&mdash;</span>'}</div>`;
+    }
+  }
+  // Instructions that claim no unit still occupied the datapath this cycle.
+  const unclaimed = (state.units || []).filter(issue => issue.unit === "?");
+  if (unclaimed.length) {
+    html += `<div class="fu active" style="grid-column:1/3"><h3>no unit</h3>` +
+      unclaimed.map(issue => `<div class="insn">${esc(issue.text)}</div>`).join("") + `</div>`;
+  }
+  $("fugrid").innerHTML = html;
+}
+
+function renderSploop() {
+  const element = $("sploop");
+  const loop = state.sploop;
+  if (!loop) { element.innerHTML = '<span class="dimtext">inactive</span>'; return; }
+  let html = `<div><span class="pill ${loop.filling ? "" : "good"}">${loop.filling ? "filling" : "replaying"}</span>
+    <span class="pill">ii <b>${loop.ii}</b></span>
+    <span class="pill">iterations <b>${loop.started}</b>${loop.total === null || loop.total === undefined ? "" : " / " + loop.total}</span></div>`;
+  for (const entry of loop.entries) {
+    html += `<div class="entry"><span class="off">+${entry.offset}</span>${entry.instructions.map(esc).join(" || ")}</div>`;
+  }
+  element.innerHTML = html;
+}
+
+function cacheHitRate(cache) {
+  const stats = cache.stats;
+  const hits = stats.read_hits + stats.write_hits;
+  const accesses = hits + stats.read_misses + stats.write_misses;
+  return accesses ? 100 * hits / accesses : 0;
+}
+
+function formatCount(value) {
+  return Number(value || 0).toLocaleString("en-US");
+}
+
+async function loadCacheLine(level, address) {
+  const request = ++cacheLineRequest;
+  $("cachelinedata").textContent = "Loading cached bytes...";
+  const query = new URLSearchParams({level: String(level), addr: hex32(address)});
+  const response = await fetch("/api/cache-line?" + query);
+  if (!response.ok) throw new Error("/api/cache-line: " + response.status);
+  const data = await response.json();
+  if (request !== cacheLineRequest || selectedCache !== level || selectedCacheLine !== address) return;
+  $("cachelinedata").textContent = data.found ? hexdump(address, data.hex) : "(line is no longer resident)";
+}
+
+function renderCaches() {
+  const caches = state.caches || [];
+  if (!caches.length) return;
+  selectedCache = Math.min(selectedCache, caches.length - 1);
+  $("cachecards").innerHTML = caches.map((cache, index) => {
+    const capacity = cache.capacity_lines * cache.line_size;
+    const resident = cache.lines.length * cache.line_size;
+    const occupancy = capacity ? 100 * resident / capacity : 0;
+    const dirty = cache.lines.filter(line => line.dirty).length;
+    const status = cache.enabled ? `${formatCount(capacity)} B` : "disabled";
+    return `<button class="cache-card ${index === selectedCache ? "active" : ""} ${cache.enabled ? "" : "disabled"}" data-cache-index="${index}">
+      <span class="cache-card-head"><span class="cache-card-name">${cache.name}</span>
+        <span class="pill ${cache.enabled ? "good" : ""}">${status}</span></span>
+      <span class="cache-capacity">${cache.lines.length} / ${cache.capacity_lines}</span>
+      <span class="cache-subtitle">resident lines &middot; ${occupancy.toFixed(1)}% occupied</span>
+      <span class="cache-meter"><span style="width:${Math.min(100, occupancy)}%"></span></span>
+      <span class="cache-card-metrics">
+        <span>hit rate <b>${cacheHitRate(cache).toFixed(2)}%</b></span>
+        <span>dirty <b>${dirty}</b></span>
+        <span>fills <b>${formatCount(cache.stats.line_fills)}</b></span>
+        <span>evictions <b>${formatCount(cache.stats.evictions)}</b></span>
+      </span>
+    </button>`;
+  }).join("");
+
+  const cache = caches[selectedCache];
+  const capacity = cache.capacity_lines * cache.line_size;
+  const sets = Math.max(1, Math.floor(cache.capacity_lines / cache.ways));
+  $("cachelinetitle").textContent = `${cache.name} resident lines`;
+  $("cachegeometry").textContent = cache.enabled
+    ? `${formatCount(capacity)} B \u00b7 ${sets} sets \u00d7 ${cache.ways} ways \u00d7 ${cache.line_size} B`
+    : "Cache disabled";
+
+  const stats = cache.stats;
+  const statRows = [
+    ["Hit rate", `${cacheHitRate(cache).toFixed(2)}%`],
+    ["Read hits", formatCount(stats.read_hits)],
+    ["Read misses", formatCount(stats.read_misses)],
+    ["Write hits", formatCount(stats.write_hits)],
+    ["Write misses", formatCount(stats.write_misses)],
+    ["Line fills", formatCount(stats.line_fills)],
+    ["Evictions", formatCount(stats.evictions)],
+    ["Dirty evictions", formatCount(stats.dirty_evictions)],
+    ["Writebacks", formatCount(stats.writebacks)],
+    ["Invalidations", formatCount(stats.invalidations)],
+  ];
+  $("cachestats").innerHTML = statRows
+    .map(([label, value]) => `<div class="cache-stat"><span>${label}</span><b>${value}</b></div>`)
+    .join("");
+
+  const term = $("cachefilter").value.trim().toLowerCase();
+  const setTerm = term.match(/^set\s*(\d+)$/);
+  const lines = cache.lines.filter(line => {
+    if ($("cachedirty").checked && !line.dirty) return false;
+    if (!term) return true;
+    if (setTerm) return line.set === Number(setTerm[1]);
+    const address = line.address.toString(16).padStart(8, "0");
+    return address.includes(term.replace(/^0x/, "")) || String(line.set) === term;
+  });
+  const pages = Math.max(1, Math.ceil(lines.length / CACHE_PAGE_SIZE));
+  cachePage = Math.min(cachePage, pages - 1);
+  const first = cachePage * CACHE_PAGE_SIZE;
+  const pageLines = lines.slice(first, first + CACHE_PAGE_SIZE);
+  if (!pageLines.some(line => line.address === selectedCacheLine)) {
+    selectedCacheLine = pageLines[0]?.address ?? null;
+  }
+
+  const setCounts = new Map();
+  const oldest = new Map();
+  for (const line of cache.lines) {
+    setCounts.set(line.set, (setCounts.get(line.set) || 0) + 1);
+    oldest.set(line.set, Math.min(oldest.get(line.set) ?? line.used, line.used));
+  }
+  $("cachelines").innerHTML = pageLines.length ? pageLines.map(line => {
+    const selected = line.address === selectedCacheLine ? "selected" : "";
+    const lru = cache.ways > 1 && setCounts.get(line.set) === cache.ways && oldest.get(line.set) === line.used;
+    const stateBadge = line.dirty
+      ? '<span class="badge x">dirty</span>'
+      : '<span class="dimtext">clean</span>';
+    return `<tr class="${selected}" data-cache-address="${line.address}">
+      <td>${hex32(line.address)}</td><td>${line.set}${lru ? '<span class="badge r">LRU</span>' : ""}</td>
+      <td>${stateBadge}</td><td>${formatCount(line.used)}</td></tr>`;
+  }).join("") : '<tr><td colspan="4" class="cache-empty">No resident lines match this filter.</td></tr>';
+  $("cachelinecount").textContent = term || $("cachedirty").checked
+    ? `${lines.length} / ${cache.lines.length} lines`
+    : `${cache.lines.length} lines`;
+  $("cachepage").textContent = `${cachePage + 1} / ${pages}`;
+  $("cacheprev").disabled = cachePage === 0;
+  $("cachenext").disabled = cachePage + 1 >= pages;
+
+  const selected = cache.lines.find(line => line.address === selectedCacheLine);
+  if (!selected) {
+    cacheLineRequest++;
+    $("cachelinestate").className = "pill";
+    $("cachelinestate").textContent = "No line";
+    $("cachelinemeta").textContent = cache.enabled
+      ? "Select a resident line to inspect its data."
+      : "Enable this cache in target firmware to collect resident lines.";
+    $("cachelinedata").textContent = "(no line selected)";
+    return;
+  }
+  $("cachelinestate").className = `pill ${selected.dirty ? "bad" : "good"}`;
+  $("cachelinestate").textContent = selected.dirty ? "dirty" : "clean";
+  $("cachelinemeta").textContent =
+    `${hex32(selected.address)} \u00b7 set ${selected.set} \u00b7 ${cache.line_size} bytes \u00b7 replacement clock ${formatCount(selected.used)}`;
+  const memoryWorkspace = document.querySelector('[data-workspace-panel="memory"]');
+  if (memoryWorkspace.classList.contains("active")) {
+    loadCacheLine(selectedCache, selected.address);
+  }
+}
+
+function renderBits(element, value, label, count) {
+  let html = "";
+  for (let bit = count - 1; bit >= 0; bit--) {
+    const on = (value >>> bit) & 1;
+    html += `<span class="${on ? "on" : ""}">${label}${bit}=${on}</span>`;
+  }
+  element.innerHTML = html;
+}
+
+function hexdump(address, hex) {
+  const bytes = hex.match(/../g) || [];
+  let out = "";
+  for (let row = 0; row < bytes.length; row += 16) {
+    const slice = bytes.slice(row, row + 16);
+    const ascii = slice.map(byte => {
+      const value = parseInt(byte, 16);
+      return value >= 32 && value < 127 ? String.fromCharCode(value) : ".";
+    }).join("");
+    out += ((address + row) >>> 0).toString(16).padStart(8, "0") + "  " +
+      slice.join(" ").padEnd(47) + "  |" + ascii + "|\n";
+  }
+  return out || "(empty)";
+}
+
+function ethernetInfo(packet) {
+  const bytes = (packet.hex.match(/../g) || []).map(byte => parseInt(byte, 16));
+  const mac = offset => bytes.slice(offset, offset + 6).map(byte => byte.toString(16).padStart(2, "0")).join(":");
+  const ipv4 = offset => bytes.slice(offset, offset + 4).join(".");
+  const ipv6 = offset => {
+    const groups = [];
+    for (let index = 0; index < 16; index += 2) groups.push(((bytes[offset + index] << 8) | bytes[offset + index + 1]).toString(16));
+    return groups.join(":");
+  };
+  const word = offset => (bytes[offset] << 8) | bytes[offset + 1];
+  if (bytes.length < 14) {
+    return {endpoints: "truncated frame", protocol: "Ethernet", detail: "Frame is shorter than the 14-byte Ethernet header."};
+  }
+  const destination = mac(0), source = mac(6);
+  let etherType = word(12), payload = 14;
+  const vlans = [];
+  while ((etherType === 0x8100 || etherType === 0x88a8) && bytes.length >= payload + 4) {
+    vlans.push(word(payload) & 0x0fff);
+    etherType = word(payload + 2);
+    payload += 4;
+  }
+  const typeName = {
+    0x0800: "IPv4",
+    0x0806: "ARP",
+    0x86dd: "IPv6",
+    0x88cc: "LLDP",
+  }[etherType] || "EtherType 0x" + etherType.toString(16).padStart(4, "0");
+  let endpoints = `${source} \u2192 ${destination}`;
+  let protocol = typeName;
+  let detail = `${source} \u2192 ${destination}; ${typeName}`;
+  if (vlans.length) detail += `; VLAN ${vlans.join(", ")}`;
+
+  if (etherType === 0x0800 && bytes.length >= payload + 20) {
+    const headerLength = (bytes[payload] & 0x0f) * 4;
+    const ipSource = ipv4(payload + 12), ipDestination = ipv4(payload + 16);
+    endpoints = `${ipSource} \u2192 ${ipDestination}`;
+    const next = bytes[payload + 9];
+    const name = {1: "ICMP", 6: "TCP", 17: "UDP"}[next] || `IP protocol ${next}`;
+    protocol = `IPv4 / ${name}`;
+    if ((next === 6 || next === 17) && headerLength >= 20 && bytes.length >= payload + headerLength + 4) {
+      const sourcePort = word(payload + headerLength), destinationPort = word(payload + headerLength + 2);
+      protocol += ` ${sourcePort} \u2192 ${destinationPort}`;
+    }
+    detail += `; ${ipSource} \u2192 ${ipDestination}; ${name}`;
+  } else if (etherType === 0x0806 && bytes.length >= payload + 28 && bytes[payload + 4] === 6 && bytes[payload + 5] === 4) {
+    const sender = ipv4(payload + 14), target = ipv4(payload + 24);
+    const operation = word(payload + 6);
+    endpoints = `${sender} \u2192 ${target}`;
+    protocol = operation === 1 ? "ARP request" : operation === 2 ? "ARP reply" : `ARP op ${operation}`;
+    detail += `; ${sender} \u2192 ${target}; ${protocol}`;
+  } else if (etherType === 0x86dd && bytes.length >= payload + 40) {
+    const ipSource = ipv6(payload + 8), ipDestination = ipv6(payload + 24);
+    endpoints = `${ipSource} \u2192 ${ipDestination}`;
+    const next = bytes[payload + 6];
+    const name = {6: "TCP", 17: "UDP", 58: "ICMPv6"}[next] || `next header ${next}`;
+    protocol = `IPv6 / ${name}`;
+    detail += `; ${ipSource} \u2192 ${ipDestination}; ${name}`;
+  }
+  return {endpoints, protocol, detail};
+}
+
+function renderPacketDirection(direction) {
+  const incoming = direction === "rx";
+  const packets = (state.ethernet || []).filter(packet => packet.direction === direction).slice().reverse();
+  const selectedStillVisible = packets.some(packet => packet.sequence === packetSelection[direction]);
+  if (!selectedStillVisible) packetSelection[direction] = packets.length ? packets[0].sequence : null;
+  const body = $(direction + "packets");
+  body.innerHTML = packets.map(packet => {
+    const info = ethernetInfo(packet);
+    const selected = packet.sequence === packetSelection[direction] ? "selected" : "";
+    return `<tr class="${selected}" data-sequence="${packet.sequence}"><td>${packet.cycle}</td><td>${packet.length}</td>` +
+      `<td>${esc(info.endpoints)}</td><td>${esc(info.protocol)}</td></tr>`;
+  }).join("");
+  $(direction + "count").textContent = packets.length;
+  const selected = packets.find(packet => packet.sequence === packetSelection[direction]);
+  if (!selected) {
+    $(direction + "summary").textContent = `No ${incoming ? "incoming" : "outgoing"} packets captured.`;
+    $(direction + "detail").textContent = "(empty)";
+    return;
+  }
+  const info = ethernetInfo(selected);
+  $(direction + "summary").textContent =
+    `cycle ${selected.cycle} \u00b7 ${selected.length} bytes \u00b7 ${info.detail}`;
+  $(direction + "detail").textContent = hexdump(0, selected.hex);
+}
+
+function renderPackets() {
+  renderPacketDirection("rx");
+  renderPacketDirection("tx");
+}
+
+function render() {
+  renderCores();
+  if (!state) return;
+  $("pc").textContent = state.pc;
+  $("pcwhere").textContent = state.pc_where || "";
+  $("cycle").textContent = state.cycle;
+  $("packets").textContent = state.stats.packets;
+  $("retired").textContent = state.stats.retired;
+  $("replays").textContent = state.stats.replay_packets;
+  $("halt").className = "pill " + (state.fault ? "bad" : (state.halted ? "good" : ""));
+  $("halt").textContent = state.fault ? "FAULT" : (state.halted ? (state.at_breakpoint ? "breakpoint" : "halted") : "ready");
+  const banner = $("faultbanner");
+  banner.style.display = state.fault ? "inline" : "none";
+  banner.textContent = state.fault || "";
+  const cio = $("ciooutput");
+  const followCio = cio.scrollHeight - cio.scrollTop - cio.clientHeight < 24;
+  const cioText = state.cio_output || "";
+  cio.textContent = cioText || "(No CIO output yet.)";
+  cio.classList.toggle("empty", !cioText);
+  $("ciocount").textContent = state.cio_output_bytes || 0;
+  if (followCio) cio.scrollTop = cio.scrollHeight;
+
+  regTable($("regsa"), state.reg_a);
+  regTable($("regsb"), state.reg_b);
+  $("control").innerHTML = state.control.map(register =>
+    `<tr><td class="name">${register.name}</td><td>${register.value}</td></tr>`).join("");
+  const ier = state.control.find(register => register.name === "IER");
+  renderBits($("ifr"), parseInt(state.ifr_pending, 16) & 0xffff, "IF", 16);
+  renderBits($("ier"), parseInt(ier ? ier.value : "0x0", 16) & 0xffff, "IE", 16);
+  $("intmux").innerHTML = state.intmux.map((mux, group) => {
+    let out = "";
+    for (let slot = 0; slot < 4; slot++) {
+      const event = (mux >>> (slot * 8)) & 0xff;
+      out += `<span class="${event ? "on" : ""}">INT${4 + group * 4 + slot}&larr;${event}</span>`;
+    }
+    return out;
+  }).join("");
+  $("evtflags").innerHTML = state.evtflags
+    .map((flags, group) => `<span class="${flags ? "on" : ""}">EVTFLAG${group}=${hex32(flags)}</span>`)
+    .join("");
+
+  renderUnits();
+  renderSploop();
+  renderCaches();
+  renderPackets();
+
+  $("mar").innerHTML = state.mar.map((value, index) => {
+    const on = (value & 1) !== 0;
+    return `<div class="${on ? "on" : ""}" title="MAR${index}: 0x${(index * 16).toString(16).padStart(2, "0")}000000 ${on ? "cacheable" : "-"}"></div>`;
+  }).join("");
+
+  $("hot").innerHTML = state.hotspots.map(spot =>
+    `<tr><td>${spot.pc}</td><td class="dimtext">${esc(spot.where || "")}</td><td>${spot.packets}</td></tr>`).join("");
+
+  $("mem").textContent = hexdump(parseInt(state.mem_addr, 16), state.mem_hex);
+  $("bplist").textContent = state.breakpoints.length ? state.breakpoints.join("  ") : "none";
+  loadDisasm();
+}
+
+async function loadDisasm() {
+  if (disFollow && state) disAddr = parseInt(state.pc, 16);
+  if (disAddr === null) { $("dis").innerHTML = '<span class="dimtext">press go or enable follow</span>'; return; }
+  const query = new URLSearchParams({
+    addr: hex32(disAddr),
+    count: disCount,
+    mark: state ? state.pc : "0x0",
+    center: disFollow ? "1" : "0"
+  });
+  const data = await (await fetch("/api/disasm?" + query)).json();
+  let html = "";
+  for (const row of data.rows) {
+    const symbol = row.where ? ` <span class="sym">${esc(row.where)}:</span>` : "";
+    html += `<div class="row ${row.current ? "current" : ""}">` +
+            `<span class="addr">${row.base}</span>${symbol}`;
+    for (const instruction of row.instructions) {
+      const marker = state && state.breakpoints.includes(instruction.addr) ? `<span class="bp">*</span> ` : "";
+      const cursor = instruction.current ? " => " : "    ";
+      html += `\n${cursor}${marker}<span class="addr jump" data-addr="${instruction.addr}" style="cursor:pointer">${instruction.addr}</span> ${esc(instruction.text)}`;
+    }
+    html += `</div>`;
+  }
+  $("dis").innerHTML = html;
+  $("disbase").textContent = "base " + data.base;
+  $("discount").textContent = disCount + " packets";
+}
+
+async function setBreakpoints(addresses) {
+  state = await post("/api/breakpoints", {addresses});
+  render();
+}
+
+$("run").onclick = runUntilStop;
+$("stop").onclick = () => { running = false; };
+$("paced").onclick = pacedRun;
+$("stepc1").onclick = () => step(1);
+$("stepc10").onclick = () => step(10);
+$("stepc100").onclick = () => step(100);
+$("stepp").onclick = async () => {
+  // One dispatched execute packet: cycles can stall without issuing anything.
+  if (busy || !state) return;
+  const before = state.stats.packets + state.stats.replay_packets;
+  for (let guard = 0; guard < 400; guard++) {
+    await step(1);
+    if (!state || state.fault) break;
+    if (state.stats.packets + state.stats.replay_packets > before) break;
+  }
+};
+$("reset").onclick = async () => {
+  running = false;
+  state = await post("/api/reset", {});
+  render();
+};
+$("core").onchange = (event) => selectCore(event.target.value);
+$("bpadd").onclick = () => {
+  const address = resolve($("bpinput").value);
+  if (address === null) { alert("unknown address or symbol"); return; }
+  const current = (state ? state.breakpoints : []).map(entry => parseInt(entry, 16));
+  if (!current.includes(address)) current.push(address);
+  $("bpinput").value = "";
+  setBreakpoints(current);
+};
+$("bpclear").onclick = () => setBreakpoints([]);
+for (const direction of ["rx", "tx"]) {
+  $(direction + "packets").addEventListener("click", event => {
+    const row = event.target.closest("tr[data-sequence]");
+    if (!row) return;
+    packetSelection[direction] = Number(row.dataset.sequence);
+    renderPacketDirection(direction);
+  });
+}
+
+$("cachecards").addEventListener("click", event => {
+  const card = event.target.closest("[data-cache-index]");
+  if (!card) return;
+  selectedCache = Number(card.dataset.cacheIndex);
+  selectedCacheLine = null;
+  cachePage = 0;
+  renderCaches();
+});
+$("cachelines").addEventListener("click", event => {
+  const row = event.target.closest("tr[data-cache-address]");
+  if (!row) return;
+  selectedCacheLine = Number(row.dataset.cacheAddress);
+  renderCaches();
+});
+$("cachefilter").addEventListener("input", () => {
+  cachePage = 0;
+  renderCaches();
+});
+$("cachedirty").addEventListener("change", () => {
+  cachePage = 0;
+  renderCaches();
+});
+$("cacheprev").onclick = () => {
+  cachePage = Math.max(0, cachePage - 1);
+  selectedCacheLine = null;
+  renderCaches();
+};
+$("cachenext").onclick = () => {
+  cachePage++;
+  selectedCacheLine = null;
+  renderCaches();
+};
+
+$("memgo").onclick = () => {
+  const address = resolve($("memaddr").value);
+  if (address === null) { alert("unknown address or symbol"); return; }
+  memAddr = address; refresh();
+};
+$("memback").onclick = () => { memAddr = (memAddr - 128) >>> 0; $("memaddr").value = hex32(memAddr); refresh(); };
+$("memfwd").onclick = () => { memAddr = (memAddr + 128) >>> 0; $("memaddr").value = hex32(memAddr); refresh(); };
+$("memfollow").onchange = () => { followPc(); refresh(); };
+
+$("disgo").onclick = () => {
+  const address = resolve($("disaddr").value);
+  if (address === null) { alert("unknown address or symbol"); return; }
+  disAddr = address; $("disfollow").checked = false; disFollow = false; loadDisasm();
+};
+$("dissyms").onchange = () => {
+  if (!$("dissyms").value) return;
+  disAddr = parseInt($("dissyms").value, 16);
+  $("disfollow").checked = false; disFollow = false;
+  loadDisasm();
+};
+$("disprev").onclick = () => { disAddr = ((disAddr ?? 0) - disCount * 32) >>> 0; $("disfollow").checked = false; disFollow = false; loadDisasm(); };
+$("disnext").onclick = () => { disAddr = ((disAddr ?? 0) + disCount * 32) >>> 0; $("disfollow").checked = false; disFollow = false; loadDisasm(); };
+$("dissmaller").onclick = () => { disCount = Math.max(1, disCount - 2); loadDisasm(); };
+$("disbigger").onclick = () => { disCount = Math.min(64, disCount + 2); loadDisasm(); };
+$("dispc").onclick = () => { disFollow = true; $("disfollow").checked = true; loadDisasm(); };
+$("disfollow").onchange = () => { disFollow = $("disfollow").checked; loadDisasm(); };
+// Click an instruction address to re-centre the window, or double-click to toggle a breakpoint.
+$("dis").addEventListener("click", event => {
+  const target = event.target.closest(".jump");
+  if (!target) return;
+  disAddr = parseInt(target.dataset.addr, 16);
+  $("disfollow").checked = false; disFollow = false;
+  loadDisasm();
+});
+$("dis").addEventListener("dblclick", event => {
+  const target = event.target.closest(".jump");
+  if (!target || !state) return;
+  const address = parseInt(target.dataset.addr, 16);
+  const current = state.breakpoints.map(entry => parseInt(entry, 16));
+  const index = current.indexOf(address);
+  if (index === -1) current.push(address); else current.splice(index, 1);
+  setBreakpoints(current);
+});
+window.addEventListener("unhandledrejection", event => {
+  const banner = $("faultbanner");
+  banner.style.display = "inline";
+  banner.textContent = "! " + event.reason;
+});
+
+async function boot() {
+  symbols = await (await fetch("/api/symbols")).json();
+  const picker = $("dissyms");
+  for (const symbol of symbols.slice().sort((left, right) => parseInt(left.address, 16) - parseInt(right.address, 16))) {
+    const option = document.createElement("option");
+    option.value = symbol.address;
+    option.textContent = `${symbol.name} (${symbol.address})`;
+    picker.appendChild(option);
+  }
+  await refresh();
+  memAddr = parseInt(state.pc, 16) & ~0xf;
+  $("memaddr").value = hex32(memAddr);
+  await refresh();
+}
+boot();
+</script>
+</body>
+</html>
