@@ -1,0 +1,353 @@
+---
+name: c64xplus-interrupts-and-exceptions
+description: "Implement C64x+ CPU interrupts, exceptions, context save and restore, megamodule INTC event routing, combiners, INTMUX, and the C6455 event map."
+---
+
+# C64x+ interrupts and exceptions
+
+*The complete C64x+ interrupt and exception path — CPU-side IFR/IER/GIE/NMIE gating, the interrupt service table, the exact entry and return sequences with TSR/ITSR/NTSR context save, internal exception causes, plus the megamodule interrupt controller (128 events, combiners, INTMUX) and the C6455 event map.*
+
+There are **two layers**. Get them separate in the design:
+
+1. **The megamodule INTC** — 128 system events in, 12 maskable CPU interrupts + 1 exception
+   + NMI + RESET out. Memory-mapped at `0x01800000`.
+2. **The CPU** — IFR/IER/GIE/NMIE gating, vectoring through the IST, context save/restore.
+
+A peripheral like the EMAC raises a *system event*; the INTC routes it to a *CPU interrupt*;
+the CPU decides whether to take it.
+
+---
+
+## Layer 2: the CPU
+
+### Interrupt types and priority
+
+| Priority | Name | Type |
+|---|---|---|
+| highest | RESET | reset |
+| | NMI | non-maskable |
+| | INT4 … INT15 | maskable (INT4 highest, INT15 lowest) |
+
+The C64x+ adds **exceptions** as a fourth type. When exceptions are globally enabled
+(`TSR.GEE = 1`) the NMI input behaves as an exception instead of an interrupt — notably it
+is then **no longer blocked by branch delay slots**.
+
+### Interrupt service table
+
+16 consecutive **interrupt service fetch packets** (ISFPs), 32 bytes (0x20) apart:
+
+| Offset | Vector |
+|---|---|
+| 0x000 | RESET |
+| 0x020 | NMI — **and all exceptions** (external, internal, NMI) |
+| 0x040, 0x060 | reserved |
+| 0x080 | INT4 |
+| 0x0A0 | INT5 |
+| … | … |
+| 0x1E0 | INT15 |
+
+Base address = `ISTP.ISTB` (bits 31:10), so the table is 1 KB aligned. `ISTP.HPEINT`
+(bits 9:5) is maintained by hardware as the number of the highest-priority pending-and-enabled
+interrupt, so **reading ISTP gives the address of the ISFP to branch to**.
+
+Reset restores ISTB to the device default, so a relocated IST never serves RESET.
+
+A typical short ISFP ends `B IRP` + `NOP 5`. Without the NOP 5 the CPU would run the next
+five execute packets — usually the next vector's ISFP. The IST should be assembled with
+`.nocmp` so the compiler does not emit compact instructions into it (an ISFP must be exactly
+8 words).
+
+### Conditions to take a maskable interrupt (SPRU732J §5.5.2)
+
+All must hold on the same cycle:
+
+- `IFR[m]` set
+- no higher-priority bit set in IFR
+- `IER[m] = 1`
+- `CSR.GIE = 1` (== `TSR.GIE`)
+- `IER.NMIE = 1`
+- **the five previous execute packets contain no branch** (taken or not) and are not in a
+  branch's delay slots
+- the two previous execute packets and the current one contain no `SPLOOP`/`SPLOOPD`/`SPLOOPW`
+- if an SPLOOP is active, the extra conditions in `skills/c64xplus-sploop-buffer/SKILL.md` apply
+
+"Any pending interrupt is taken as soon as pending branches complete."
+
+`IFR[m]` is set two CPU cycles after the low-to-high transition of the event at the CPU
+boundary. If software writes ICR to clear the flag in the same cycle the hardware sets it,
+**the hardware write wins**.
+
+### Actions on taking a non-reset interrupt
+
+1. Further non-reset interrupt processing is disabled.
+2. `CSR.PGIE ← CSR.GIE`, then `GIE ← 0`. `TSR` is copied into `ITSR`; `TSR` is set to the
+   default interrupt context. Explicit `MVC` writes to TSR complete before the save.
+3. Following execute packets are **annulled** — they modify no CPU state.
+4. `IRP ← address of the first annulled execute packet`.
+5. A branch to the ISFP address (from ISTP) is forced into E1.
+6. `IFR[m]` is cleared.
+
+Total overhead is 9 cycles (nothing enters E1 for 9 cycles).
+
+`TSR` transitions on interrupt (SPRU732J Table 5-3):
+
+| Bit | Saved to ITSR as | New TSR value |
+|---|---|---|
+| GIE | current (will be 1) | 0 |
+| SGIE | current | 0 |
+| GEE | current | unchanged |
+| XEN | current | 0 |
+| CXM | current | 0 (Supervisor) |
+| INT | current | **1** |
+| EXC | current | 0 |
+| SPLX | current | 0 after the SPLOOP buffer winds down |
+| IB | current (will be 0) | set by CPU control logic |
+
+Return is `B IRP`, which copies ITSR back into TSR in E1 (no delay slots for the register
+effect) and resumes at IRP.
+
+### NMI
+
+Needs `IER.NMIE = 1`. NMIE is cleared at reset and cleared by taking an NMI (preventing
+nesting); software cannot clear it but can set it to allow nested NMIs. **While NMIE is 0,
+all maskable interrupts and all external exceptions are disabled.** As an interrupt (GEE=0),
+NMI is still blocked by branch delay slots; as an exception (GEE=1) it is not.
+
+Return is `B NRP`, restoring TSR from NTSR. `B NRP` also sets NMIE.
+
+---
+
+## Exceptions (C64x+ only, SPRU732J ch.6)
+
+Three sources:
+
+- **EXCEP** — one maskable external exception input. Needs `TSR.XEN = 1`, `TSR.GEE = 1`,
+  `IER.NMIE = 1`. Sets `EFR.EXF`.
+- **NMI as exception** — sets `EFR.NXF`. Needs NMIE and GEE.
+- **Internal exceptions** — generated by the CPU. Sets `EFR.IXF`, with the cause in `IERR`.
+  Enabled **solely** by GEE, and since GEE can never be cleared except by reset, once
+  enabled they cannot be turned off. Unaffected by NMIE and XEN.
+
+`EFR` flags are **not** auto-cleared on service — the handler must write 1s to the matching
+bits of `ECR`. NMI/EXCEP transitions while the flag is still set are ignored. As with IFR, a
+simultaneous hardware set beats a software clear.
+
+### Internal exception causes (`IERR`)
+
+| Bit | Flag | Cause |
+|---|---|---|
+| 8 | MSX | missed stall |
+| 7 | LBX | SPLOOP buffer exception |
+| 6 | PRX | privilege exception |
+| 5 | RAX | resource access exception |
+| 4 | RCX | resource conflict exception |
+| 3 | OPX | opcode exception (illegal opcode, or restricted instruction in User mode) |
+| 2 | EPX | execute packet exception |
+| 1 | FPX | fetch packet exception |
+| 0 | IFX | instruction fetch exception |
+
+This is where a good emulator earns its keep: on an illegal opcode, a duplicated functional
+unit in an execute packet, a cross-path over-use, or a restricted instruction in User mode,
+set the right `IERR` bit and vector — instead of silently doing something arbitrary.
+
+Instructions already in E1 when a context switch begins are allowed to complete, and **any
+internal exceptions they raise are ignored**.
+
+### Actions on taking an external exception
+
+1. `TSR.XEN ← 0` (blocks further EXCEP), `TSR.GIE ← 0` (blocks interrupts).
+2. Subsequent execute packets are annulled.
+3. `NRP ← address of the first annulled execute packet`.
+4. Branch to the **NMI ISFP** (ISTP + 0x20) forced into E1.
+5. `IACK` and `EXC` asserted; `INUM = 1`.
+
+`TSR` → `NTSR` on exception (Table 6-3): GIE→0, SGIE→0, GEE unchanged (is 1), XEN→0,
+CXM→Supervisor, INT→0, **EXC→1**, SPLX→0, IB set by control logic. `NTSR.HWE ← 1`.
+
+### Nested exceptions
+
+If a new exception is recognised while `TSR.EXC` is already set, the CPU vectors to the
+**RESET vector** instead. `NTSR` and `NRP` are left unchanged; `TSR`→`ITSR`, `PC`→`IRP`,
+and `IER.NMIE` is cleared. Boot code can inspect NTSR/ITSR/IRP/NRP to tell a pin reset from
+a nested-exception reset.
+
+### Returning from an exception is not always possible
+
+Check before `B NRP`:
+
+- `NTSR.SPLX = 1` — an SPLOOP was terminated; cannot resume.
+- `NTSR.IB = 1` — exception hit while interrupts were blocked; cannot resume.
+- `NTSR.GIE = 0` — the exception hit code the compiler marked non-interruptible.
+
+TI's canonical check (SPRU732J Example 6-1):
+
+```
+      STNDW B1:B0,*SP--
+||    MVC   NTSR,B0
+      EXTU  B0,16,30,B1      ; B1 = NTSR.IB | NTSR.SPLX
+||    AND   B0,1,B0          ; B0 = NTSR.GIE
+[B1]  MVK   0,B0             ; not resumable
+[B0]  B     NRP
+      LDNDW *SP++,B1:B0
+      NOP   4
+```
+
+---
+
+## Layer 1: the megamodule interrupt controller
+
+Registers at base `0x01800000` (SPRU871K §7.5, Table 7-3):
+
+| Address | Register | Type |
+|---|---|---|
+| 0x0180 0000 - 000C | EVTFLAG0-3 | R — latched event flags |
+| 0x0180 0020 - 002C | EVTSET0-3 | W — set a flag (1 to set) |
+| 0x0180 0040 - 004C | EVTCLR0-3 | W — clear a flag (1 to clear) |
+| 0x0180 0080 - 008C | EVTMASK0-3 | R/W — combiner mask (**1 = masked out**) |
+| 0x0180 00A0 - 00AC | MEVTFLAG0-3 | R — EVTFLAG & ~EVTMASK |
+| 0x0180 00C0 - 00CC | EXPMASK0-3 | R/W — exception combiner mask |
+| 0x0180 00E0 - 00EC | MEXPFLAG0-3 | R — masked exception flags |
+| 0x0180 0104 - 010C | INTMUX1-3 | R/W — which event drives each CPU interrupt |
+| 0x0180 0180 | INTXSTAT | R — dropped-interrupt status |
+| 0x0180 0184 | INTXCLR | W |
+| 0x0180 0188 | INTDMASK | R/W — dropped-interrupt mask |
+| 0x0181 0140 / 0144 | AEGMUX0/1 | R/W — advanced event generator mux |
+
+### Event flags
+
+128 system events → 4 × 32-bit `EVTFLAG`. Events **0-3 are reserved in EVTFLAG0** (bits
+EF0-EF3 always read 0) — those four slots are produced internally by the event combiner.
+So 124 real system event inputs.
+
+Flags are **latched**: once set they stay 1 until software writes 1 to the matching
+`EVTCLR` bit. Direct writes to EVTFLAG are impossible by design — the set/clear register
+pair avoids read-modify-write races. If a new event arrives on the same cycle as a clear,
+**the event wins**.
+
+### Event combiner
+
+ORs groups of events into four synthetic events:
+
+| Group | Events | Produces |
+|---|---|---|
+| 0 | 4-31 | EVT0 |
+| 1 | 32-63 | EVT1 |
+| 2 | 64-95 | EVT2 |
+| 3 | 96-127 | EVT3 |
+
+`EVTMASK`n bit set = that event is **excluded** from the OR. Reset value 0 means everything
+is combined. `MEVTFLAG`n is the masked view — the handler for a combined event reads it to
+find which events actually fired.
+
+### Interrupt selector
+
+`INTMUX1/2/3` route any of the 128 events to CPUINT4-15 (four 8-bit fields per register).
+`INTDMASK` / `INTXSTAT` / `INTXCLR` handle *dropped* interrupts: if an event fires again
+before its previous instance was serviced, the INTC can report it (event 96, `INTERR`, on
+the C6455).
+
+### Exception combiner
+
+`EXPMASK`n select which events feed the single `EXCEP` input; `MEXPFLAG`n gives the masked
+view so the exception handler can identify the source.
+
+---
+
+## C6455 system event map (SPRS276M Table 7-10)
+
+The ones that matter for this project:
+
+| Event | Name | Source |
+|---|---|---|
+| 0-3 | EVT0-EVT3 | event combiner outputs (groups 4-31, 32-63, 64-95, 96-127) |
+| 9 | EMU_DTDMA | emulation |
+| 11, 12 | EMU_RTDXRX / EMU_RTDXTX | emulation RTDX |
+| 13, 14 | IDMA0, IDMA1 | megamodule IDMA channels |
+| 15 | DSPINT | HPI/PCI-to-DSP |
+| 16 | I2CINT | I2C |
+| **17** | **MACINT** | **Ethernet MAC — the only EMAC event** |
+| 18 | AEASYNCERR | EMIFA error |
+| 20, 21, 22 | INTDST0/1/4 | RapidIO |
+| 24 | EDMA3CC_GINT | EDMA3 global completion |
+| 32, 33 | VCP2_INT, TCP2_INT | coprocessor errors |
+| 36 | UINT | UTOPIA |
+| 40-43 | RINT0/XINT0/RINT1/XINT1 | McBSP0/1 |
+| 51-66 | GPINT0-15 | GPIO |
+| **67-70** | **TINTLO0, TINTHI0, TINTLO1, TINTHI1** | **timers 0 and 1** |
+| 71-78 | EDMA3CC_INT0-7 | EDMA3 completion, per mask |
+| 79 | EDMA3CC_ERRINT | EDMA3 error |
+| 81-84 | EDMA3TC0-3_ERRINT | EDMA3 transfer controller errors |
+| 96 | INTERR | INTC dropped a CPU interrupt |
+| 97 | EMC_IDMAERR | invalid IDMA parameters |
+| 100, 101 | EFIINTA, EFIINTB | EFI |
+
+Events 4-8, 10, 19, 23, 25-31, 34-35, 37-39, 44-50, 85-95, 98-99 are unconnected.
+
+**Note there is a single MACINT for the whole EMAC + MDIO**, gated by `EWCTL.INTEN` in the
+EMAC control module. Everything — TX done, RX done, MAC errors, MDIO link change — funnels
+through event 17. See `skills/c6455-emac-ethernet/SKILL.md`.
+
+---
+
+## Implementation sketch
+
+```
+each cycle:
+    intc_step():                     # layer 1
+        evtflag |= newly_raised_events        # latched, level→edge at the source
+        for g in 0..3:
+            evt[g] = (evtflag[g] & ~evtmask[g]) != 0
+        for cpuint in 4..15:
+            src = intmux_lookup(cpuint)
+            cpu.pending_int[cpuint] = event_active(src)
+        excep = any(expflag & ~expmask)
+
+    cpu_check_interrupts():          # layer 2
+        ifr |= pending edges          # 2-cycle delay from CPU boundary
+        if exceptions_pending and gee and nmie: take_exception()
+        elif nmi_pending and nmie:    take_nmi()
+        elif gie and nmie and (ifr & ier) and not in_branch_shadow
+             and not sploop_blocked:  take_interrupt(highest_priority)
+```
+
+Model `in_branch_shadow` as a 5-deep history of "this execute packet contained a branch";
+this is the single most common cause of "my ISR never runs" bugs in a C6000 emulator, and
+it is architecturally required, not an optimisation.
+
+## Files that expand on this
+
+**Documents**
+
+- `docs/reference/spru732j.pdf` (SPRU732J)
+  - ch.5, pp. 533-562 — interrupts. §5.1.2 the IST and ISFP layout, §5.2-5.3 global and
+    individual control, **§5.5 the C64x+ path** with Figures 5-6/5-7 (cycle-accurate entry
+    and return timing) and Table 5-3 (TSR→ITSR), §5.7 programming considerations,
+    §5.8 the C64x vs C64x+ differences
+  - ch.6, pp. 563-576 — exceptions. §6.1 the three sources, §6.2.3 context saving,
+    §6.2.4 and Example 6-1 the resumability test, §6.3 detection and processing with
+    Figures 6-2/6-3, §6.3.4 nested exceptions
+  - §2.8.6-2.8.11, pp. 41-45 — ICR, IER, IFR, IRP, ISR, ISTP bit layouts
+  - §2.9.3-2.9.10, pp. 48-53 — ECR, EFR, IERR, ITSR, NTSR bit layouts
+- `docs/reference/spru871k.pdf` (SPRU871K) ch.7, pp. 155-186 — the megamodule INTC.
+  §7.2.1 event registers, §7.2.2 the event combiner, §7.2.3 the interrupt selector and
+  dropped-interrupt logic, §7.2.4 the exception combiner, §7.3 the event list, §7.4 the
+  CPU interface, §7.5 the full register map with bit tables
+- `docs/reference/sprs276m.pdf` (SPRS276M) §7.5.1, pp. 120-121 — Table 7-10, the
+  complete C6455 system event map
+- `docs/reference/spru423i.pdf` (DSP/BIOS User's Guide) §4.2 "Hardware
+  Interrupts", p. 91 — what an RTOS expects of the INTC and the dispatcher it installs;
+  `docs/reference/spru403s.pdf` has the HWI module API in detail
+- `docs/reference/sprz234r.pdf` — silicon errata; check before treating any interrupt
+  corner case as "the hardware surely does X"
+
+**Source**
+
+- [`arch/c6x/kernel/vectors.S`](https://github.com/torvalds/linux/blob/v5.10/arch/c6x/kernel/vectors.S) — a real interrupt service table:
+  16 aligned ISFPs built with the `IRQVEC` macro
+- [`arch/c6x/kernel/entry.S`](https://github.com/torvalds/linux/blob/v5.10/arch/c6x/kernel/entry.S) — interrupt/exception entry and exit,
+  including the full context save and the `B IRP` return
+- [`arch/c6x/kernel/traps.c`](https://github.com/torvalds/linux/blob/v5.10/arch/c6x/kernel/traps.c) — exception dispatch and `IERR` decoding
+- [`arch/c6x/kernel/irq.c`](https://github.com/torvalds/linux/blob/v5.10/arch/c6x/kernel/irq.c) and [`arch/c6x/include/asm/irqflags.h`](https://github.com/torvalds/linux/blob/v5.10/arch/c6x/include/asm/irqflags.h) — INTC
+  programming and GIE manipulation
+- [`include/opcode/tic6x-control-registers.h`](https://sourceware.org/git/?p=binutils-gdb.git;a=blob;f=include/opcode/tic6x-control-registers.h;hb=refs/tags/binutils-2_44) — MVC numbers for
+  IFR/ISR/ICR/IER/ISTP/IRP/NRP/EFR/ECR/IERR/TSR/ITSR/NTSR
