@@ -3,6 +3,7 @@ name = "c64xemu"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.80"
+license = "MIT"
 
 [dependencies]
 # `derive` for the subcommand tables; colour and suggestion support are left out so the
