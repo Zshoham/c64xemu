@@ -1,0 +1,55 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Format, lint, unit and component tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-nextest
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Lint
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+      - name: Run native tests
+        run: cargo nextest run --all-targets --all-features --locked
+
+  conformance:
+    name: Emulator conformance suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the 32-bit loader for the SYS/BIOS installer
+        run: sudo apt-get update && sudo apt-get install -y libc6-i386
+      - name: Cache TI SDKs and firmware builds
+        uses: actions/cache@v4
+        with:
+          path: |
+            tests/build
+            tests/firmware/*/build
+          key: ti-${{ hashFiles('tests/tools/fetch_deps.sh', 'tests/tools/build_ndk_libs.sh') }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the optimized emulator
+        run: cargo build --release --locked --bin c64xemu
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install pytest
+        run: pip install pytest
+      - name: Run the emulator conformance suites
+        # The paced high-bandwidth TCP cases need a host that can sustain the emulator's
+        # pace; a shared runner cannot be relied on for that, so CI deselects them.
+        run: python3 -m pytest -m "not high_bandwidth"
