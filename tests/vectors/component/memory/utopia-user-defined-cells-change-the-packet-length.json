@@ -1,0 +1,196 @@
+{
+  "domain": "memory",
+  "expected": {
+    "observations": [
+      null,
+      "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f30313233343536373839",
+      true,
+      67305985,
+      134678021,
+      202050057,
+      269422093,
+      336794129,
+      404166165,
+      471538201,
+      538910237,
+      606282273,
+      673654309,
+      741026345,
+      808398381,
+      875770417,
+      943142453,
+      57,
+      0,
+      0,
+      1
+    ]
+  },
+  "request": {
+    "action": "system",
+    "id": "memory:utopia-user-defined-cells-change-the-packet-length",
+    "operations": [
+      {
+        "address": 45350912,
+        "op": "write32",
+        "value": 1114129
+      },
+      {
+        "address": 1006633984,
+        "op": "write32",
+        "value": 67305985
+      },
+      {
+        "address": 1006633984,
+        "op": "write32",
+        "value": 134678021
+      },
+      {
+        "address": 1006633984,
+        "op": "write32",
+        "value": 202050057
+      },
+      {
+        "address": 1006633984,
+        "op": "write32",
+        "value": 269422093
+      },
+      {
+        "address": 1006633984,
+        "op": "write32",
+        "value": 336794129
+      },
+      {
+        "address": 1006633984,
+        "op": "write32",
+        "value": 404166165
+      },
+      {
+        "address": 1006633984,
+        "op": "write32",
+        "value": 471538201
+      },
+      {
+        "address": 1006633984,
+        "op": "write32",
+        "value": 538910237
+      },
+      {
+        "address": 1006633984,
+        "op": "write32",
+        "value": 606282273
+      },
+      {
+        "address": 1006633984,
+        "op": "write32",
+        "value": 673654309
+      },
+      {
+        "address": 1006633984,
+        "op": "write32",
+        "value": 741026345
+      },
+      {
+        "address": 1006633984,
+        "op": "write32",
+        "value": 808398381
+      },
+      {
+        "address": 1006633984,
+        "op": "write32",
+        "value": 875770417
+      },
+      {
+        "address": 1006633984,
+        "op": "write32",
+        "value": 943142453
+      },
+      {
+        "op": "utopia_master_read"
+      },
+      {
+        "address": 1006633984,
+        "op": "write32",
+        "value": 57
+      },
+      {
+        "op": "utopia_master_read"
+      },
+      {
+        "hex": "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f30313233343536373839",
+        "op": "utopia_master_write"
+      },
+      {
+        "address": 1006632960,
+        "op": "read32"
+      },
+      {
+        "address": 1006632960,
+        "op": "read32"
+      },
+      {
+        "address": 1006632960,
+        "op": "read32"
+      },
+      {
+        "address": 1006632960,
+        "op": "read32"
+      },
+      {
+        "address": 1006632960,
+        "op": "read32"
+      },
+      {
+        "address": 1006632960,
+        "op": "read32"
+      },
+      {
+        "address": 1006632960,
+        "op": "read32"
+      },
+      {
+        "address": 1006632960,
+        "op": "read32"
+      },
+      {
+        "address": 1006632960,
+        "op": "read32"
+      },
+      {
+        "address": 1006632960,
+        "op": "read32"
+      },
+      {
+        "address": 1006632960,
+        "op": "read32"
+      },
+      {
+        "address": 1006632960,
+        "op": "read32"
+      },
+      {
+        "address": 1006632960,
+        "op": "read32"
+      },
+      {
+        "address": 1006632960,
+        "op": "read32"
+      },
+      {
+        "address": 1006632960,
+        "op": "read32"
+      },
+      {
+        "address": 45350940,
+        "op": "read32"
+      },
+      {
+        "address": 1006632960,
+        "op": "read32"
+      },
+      {
+        "address": 45350940,
+        "op": "read32"
+      }
+    ]
+  }
+}

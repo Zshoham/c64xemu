@@ -1,0 +1,15 @@
+{
+  "domain": "decoder",
+  "expected": {
+    "mnemonic": "shl",
+    "operands": "b7:b6,1,b7:b6"
+  },
+  "request": {
+    "action": "decode",
+    "address": 0,
+    "endian": "little",
+    "id": "decoder:operands-long-shift-reads-and-writes-a-pair",
+    "width": 32,
+    "word": 1125657635
+  }
+}

@@ -1,0 +1,181 @@
+{
+  "domain": "memory",
+  "expected": {
+    "observations": [
+      1060944,
+      0,
+      0,
+      8413728,
+      2097152,
+      256,
+      8,
+      0,
+      8413728,
+      1060944,
+      0,
+      8414720,
+      256,
+      8413728,
+      2097152,
+      4,
+      8414720
+    ]
+  },
+  "request": {
+    "action": "system",
+    "id": "memory:edma-destination-fifo-keeps-the-last-two-requests",
+    "operations": [
+      {
+        "address": 44040836,
+        "op": "write32",
+        "value": 5
+      },
+      {
+        "address": 44040448,
+        "op": "write32",
+        "value": 192
+      },
+      {
+        "address": 44056768,
+        "op": "write32",
+        "value": 1060876
+      },
+      {
+        "address": 44056772,
+        "op": "write32",
+        "value": 8413184
+      },
+      {
+        "address": 44056776,
+        "op": "write32",
+        "value": 131080
+      },
+      {
+        "address": 44056780,
+        "op": "write32",
+        "value": 8413696
+      },
+      {
+        "address": 44056784,
+        "op": "write32",
+        "value": 2097168
+      },
+      {
+        "address": 44056788,
+        "op": "write32",
+        "value": 65535
+      },
+      {
+        "address": 44056792,
+        "op": "write32",
+        "value": 0
+      },
+      {
+        "address": 44056796,
+        "op": "write32",
+        "value": 1
+      },
+      {
+        "address": 44044304,
+        "op": "write32",
+        "value": 1
+      },
+      {
+        "cycles": 1,
+        "op": "tick"
+      },
+      {
+        "address": 44172032,
+        "op": "read32"
+      },
+      {
+        "address": 44172036,
+        "op": "read32"
+      },
+      {
+        "address": 44172040,
+        "op": "read32"
+      },
+      {
+        "address": 44172044,
+        "op": "read32"
+      },
+      {
+        "address": 44172048,
+        "op": "read32"
+      },
+      {
+        "address": 44172052,
+        "op": "read32"
+      },
+      {
+        "address": 44171904,
+        "op": "read32"
+      },
+      {
+        "address": 44171908,
+        "op": "read32"
+      },
+      {
+        "address": 44171912,
+        "op": "read32"
+      },
+      {
+        "address": 44056772,
+        "op": "write32",
+        "value": 8414208
+      },
+      {
+        "address": 44056776,
+        "op": "write32",
+        "value": 65540
+      },
+      {
+        "address": 44056780,
+        "op": "write32",
+        "value": 8414720
+      },
+      {
+        "address": 44044304,
+        "op": "write32",
+        "value": 1
+      },
+      {
+        "cycles": 1,
+        "op": "tick"
+      },
+      {
+        "address": 44172096,
+        "op": "read32"
+      },
+      {
+        "address": 44172104,
+        "op": "read32"
+      },
+      {
+        "address": 44172108,
+        "op": "read32"
+      },
+      {
+        "address": 44171520,
+        "op": "read32"
+      },
+      {
+        "address": 44172044,
+        "op": "read32"
+      },
+      {
+        "address": 44172048,
+        "op": "read32"
+      },
+      {
+        "address": 44171904,
+        "op": "read32"
+      },
+      {
+        "address": 44171912,
+        "op": "read32"
+      }
+    ]
+  }
+}

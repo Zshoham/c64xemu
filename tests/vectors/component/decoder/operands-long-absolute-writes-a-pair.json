@@ -1,0 +1,15 @@
+{
+  "domain": "decoder",
+  "expected": {
+    "mnemonic": "abs",
+    "operands": "a1:a0,a3:a2"
+  },
+  "request": {
+    "action": "decode",
+    "address": 0,
+    "endian": "little",
+    "id": "decoder:operands-long-absolute-writes-a-pair",
+    "width": 32,
+    "word": 16779032
+  }
+}

@@ -1,0 +1,38 @@
+{
+  "domain": "cpu",
+  "expected": {
+    "registers": {
+      "A0": 4,
+      "A1": 1
+    }
+  },
+  "request": {
+    "action": "execute",
+    "cycles": 20,
+    "endian": "little",
+    "id": "cpu:sploop-spmask-inhibits-replay",
+    "memory": [],
+    "pc": 0,
+    "registers": {
+      "B0": 4
+    },
+    "words": [
+      109052834,
+      24576,
+      229376,
+      0,
+      1245185,
+      8659361,
+      8280,
+      212992,
+      32768,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ]
+  }
+}

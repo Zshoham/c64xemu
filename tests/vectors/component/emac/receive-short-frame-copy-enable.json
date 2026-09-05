@@ -1,0 +1,125 @@
+{
+  "domain": "ethernet",
+  "expected": {
+    "observations": [
+      536870912,
+      1,
+      0,
+      0,
+      "ffffffffffff02000000000108000000000000000000000000000000000000000000000000000000",
+      3493855272,
+      2,
+      0,
+      0
+    ]
+  },
+  "request": {
+    "action": "system",
+    "id": "emac:receive-short-frame-copy-enable",
+    "operations": [
+      {
+        "address": 46669856,
+        "op": "write32",
+        "value": 0
+      },
+      {
+        "address": 46669860,
+        "op": "write32",
+        "value": 8392960
+      },
+      {
+        "address": 46669864,
+        "op": "write32",
+        "value": 128
+      },
+      {
+        "address": 46669868,
+        "op": "write32",
+        "value": 536870912
+      },
+      {
+        "address": 46661952,
+        "op": "write32",
+        "value": 2
+      },
+      {
+        "address": 46661652,
+        "op": "write32",
+        "value": 1
+      },
+      {
+        "address": 46663200,
+        "op": "write32",
+        "value": 46669856
+      },
+      {
+        "address": 46661888,
+        "op": "write32",
+        "value": 8192
+      },
+      {
+        "address": 46661984,
+        "op": "write32",
+        "value": 32
+      },
+      {
+        "hex": "ffffffffffff02000000000108000000000000000000000000000000000000000000000000000000",
+        "op": "inject_frame"
+      },
+      {
+        "cycles": 2,
+        "op": "tick"
+      },
+      {
+        "address": 46669868,
+        "op": "read32"
+      },
+      {
+        "address": 46662176,
+        "op": "read32"
+      },
+      {
+        "address": 46662184,
+        "op": "read32"
+      },
+      {
+        "address": 46662144,
+        "op": "read32"
+      },
+      {
+        "address": 46661888,
+        "op": "write32",
+        "value": 8396800
+      },
+      {
+        "hex": "ffffffffffff02000000000108000000000000000000000000000000000000000000000000000000",
+        "op": "inject_frame"
+      },
+      {
+        "cycles": 2,
+        "op": "tick"
+      },
+      {
+        "address": 8392960,
+        "length": 40,
+        "op": "read_bytes"
+      },
+      {
+        "address": 46669868,
+        "op": "read32"
+      },
+      {
+        "address": 46662176,
+        "op": "read32"
+      },
+      {
+        "address": 46662144,
+        "op": "read32"
+      },
+      {
+        "address": 46662192,
+        "op": "read32"
+      }
+    ]
+  }
+}

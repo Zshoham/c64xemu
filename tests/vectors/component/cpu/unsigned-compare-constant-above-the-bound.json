@@ -1,0 +1,24 @@
+{
+  "domain": "cpu",
+  "expected": {
+    "registers": {
+      "A0": 0,
+      "A1": 1
+    }
+  },
+  "request": {
+    "action": "execute",
+    "cycles": 6,
+    "endian": "little",
+    "id": "cpu:unsigned-compare-constant-above-the-bound",
+    "memory": [],
+    "pc": 0,
+    "registers": {
+      "A3": 25
+    },
+    "words": [
+      920024,
+      9341912
+    ]
+  }
+}

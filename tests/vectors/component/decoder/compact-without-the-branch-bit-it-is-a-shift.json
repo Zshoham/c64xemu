@@ -1,0 +1,15 @@
+{
+  "domain": "decoder",
+  "expected": {
+    "mnemonic": "shr"
+  },
+  "request": {
+    "action": "decode",
+    "address": 0,
+    "endian": "little",
+    "header": 0,
+    "id": "decoder:compact-without-the-branch-bit-it-is-a-shift",
+    "width": 16,
+    "word": 3850
+  }
+}

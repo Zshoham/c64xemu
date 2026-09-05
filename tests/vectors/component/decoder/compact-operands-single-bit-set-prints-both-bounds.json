@@ -1,0 +1,16 @@
+{
+  "domain": "decoder",
+  "expected": {
+    "mnemonic": "set",
+    "operands": "b1,8,8,b1"
+  },
+  "request": {
+    "action": "decode",
+    "address": 0,
+    "endian": "little",
+    "header": 0,
+    "id": "decoder:compact-operands-single-bit-set-prints-both-bounds",
+    "width": 16,
+    "word": 2211
+  }
+}

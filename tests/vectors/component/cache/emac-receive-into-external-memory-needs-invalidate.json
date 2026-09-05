@@ -1,0 +1,126 @@
+{
+  "domain": "cache",
+  "expected": {
+    "observations": [
+      3739147998,
+      3489660992,
+      3739147998,
+      285212674
+    ]
+  },
+  "request": {
+    "action": "system",
+    "id": "cache:emac-receive-into-external-memory-needs-invalidate",
+    "operations": [
+      {
+        "address": 25428032,
+        "op": "write32",
+        "value": 4
+      },
+      {
+        "address": 25461632,
+        "op": "write32",
+        "value": 1
+      },
+      {
+        "address": 3758104576,
+        "hex": "dededededededededededededededededededededededededededededededededededededededededededededededededededededededededededededededede",
+        "op": "write_bytes"
+      },
+      {
+        "address": 3758104576,
+        "op": "read32"
+      },
+      {
+        "address": 46662920,
+        "op": "write32",
+        "value": 0
+      },
+      {
+        "address": 46662916,
+        "op": "write32",
+        "value": 1122867
+      },
+      {
+        "address": 46662912,
+        "op": "write32",
+        "value": 1573376
+      },
+      {
+        "address": 46661892,
+        "op": "write32",
+        "value": 1
+      },
+      {
+        "address": 46661900,
+        "op": "write32",
+        "value": 1518
+      },
+      {
+        "address": 46661888,
+        "op": "write32",
+        "value": 8193
+      },
+      {
+        "address": 46661984,
+        "op": "write32",
+        "value": 32
+      },
+      {
+        "address": 46669872,
+        "op": "write32",
+        "value": 0
+      },
+      {
+        "address": 46669876,
+        "op": "write32",
+        "value": 3758104576
+      },
+      {
+        "address": 46669880,
+        "op": "write32",
+        "value": 256
+      },
+      {
+        "address": 46669884,
+        "op": "write32",
+        "value": 536870912
+      },
+      {
+        "address": 46661652,
+        "op": "write32",
+        "value": 1
+      },
+      {
+        "address": 46663200,
+        "op": "write32",
+        "value": 46669872
+      },
+      {
+        "hex": "02000011223302000044556608005a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+        "op": "inject_frame"
+      },
+      {
+        "cycles": 64,
+        "op": "tick"
+      },
+      {
+        "address": 46669884,
+        "op": "read32"
+      },
+      {
+        "address": 3758104576,
+        "op": "read32"
+      },
+      {
+        "address": 25448520,
+        "op": "write32",
+        "value": 1
+      },
+      {
+        "address": 3758104576,
+        "op": "read32"
+      }
+    ]
+  }
+}

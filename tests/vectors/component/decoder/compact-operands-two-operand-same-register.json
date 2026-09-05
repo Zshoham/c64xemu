@@ -1,0 +1,15 @@
+{
+  "domain": "decoder",
+  "expected": {
+    "operands": "b4,b4,b4"
+  },
+  "request": {
+    "action": "decode",
+    "address": 0,
+    "endian": "little",
+    "header": 0,
+    "id": "decoder:compact-operands-two-operand-same-register",
+    "width": 16,
+    "word": 33335
+  }
+}

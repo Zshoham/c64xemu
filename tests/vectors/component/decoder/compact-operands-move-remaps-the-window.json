@@ -1,0 +1,16 @@
+{
+  "domain": "decoder",
+  "expected": {
+    "mnemonic": "mv",
+    "operands": "a8,b21"
+  },
+  "request": {
+    "action": "decode",
+    "address": 0,
+    "endian": "little",
+    "header": 3758620673,
+    "id": "decoder:compact-operands-move-remaps-the-window",
+    "width": 16,
+    "word": 46087
+  }
+}

@@ -1,0 +1,29 @@
+{
+  "domain": "memory",
+  "expected": {
+    "observations": [
+      "001122334400",
+      1144201745
+    ]
+  },
+  "request": {
+    "action": "system",
+    "id": "memory:little-endian-unaligned",
+    "operations": [
+      {
+        "address": 8392705,
+        "op": "write32",
+        "value": 1144201745
+      },
+      {
+        "address": 8392704,
+        "length": 6,
+        "op": "read_bytes"
+      },
+      {
+        "address": 8392705,
+        "op": "read32"
+      }
+    ]
+  }
+}

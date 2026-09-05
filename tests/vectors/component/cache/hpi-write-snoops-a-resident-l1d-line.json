@@ -1,0 +1,48 @@
+{
+  "domain": "cache",
+  "expected": {
+    "observations": [
+      0,
+      3235823838
+    ]
+  },
+  "request": {
+    "action": "system",
+    "id": "cache:hpi-write-snoops-a-resident-l1d-line",
+    "operations": [
+      {
+        "address": 42467376,
+        "op": "write32",
+        "value": 0
+      },
+      {
+        "op": "hpi_write",
+        "port": "hpic",
+        "value": 0
+      },
+      {
+        "address": 25428032,
+        "op": "write32",
+        "value": 4
+      },
+      {
+        "address": 8395136,
+        "op": "read32"
+      },
+      {
+        "op": "hpi_write",
+        "port": "hpia",
+        "value": 2098784
+      },
+      {
+        "op": "hpi_write",
+        "port": "hpid",
+        "value": 3235823838
+      },
+      {
+        "address": 8395136,
+        "op": "read32"
+      }
+    ]
+  }
+}

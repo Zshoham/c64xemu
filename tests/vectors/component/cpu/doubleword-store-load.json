@@ -1,0 +1,34 @@
+{
+  "domain": "cpu",
+  "expected": {
+    "registers": {
+      "A4": 0,
+      "A5": 0,
+      "A6": 286331153,
+      "A7": 572662306
+    }
+  },
+  "request": {
+    "action": "execute",
+    "cycles": 12,
+    "endian": "little",
+    "id": "cpu:doubleword-store-load",
+    "memory": [],
+    "pc": 0,
+    "registers": {
+      "A4": 286331153,
+      "A5": 572662306,
+      "B15": 8192
+    },
+    "words": [
+      37495748,
+      33596249,
+      41943080,
+      16384,
+      54272996,
+      32768,
+      0,
+      0
+    ]
+  }
+}

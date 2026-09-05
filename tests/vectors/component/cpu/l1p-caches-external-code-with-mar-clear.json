@@ -1,0 +1,35 @@
+{
+  "domain": "cpu",
+  "expected": {
+    "registers": {
+      "A4": 2147483648,
+      "A5": 2
+    }
+  },
+  "request": {
+    "action": "execute",
+    "cycles": 24,
+    "endian": "little",
+    "id": "cpu:l1p-caches-external-code-with-mar-clear",
+    "memory": [],
+    "pc": 2147483648,
+    "registers": {},
+    "setup": [
+      {
+        "address": 25428000,
+        "op": "write32",
+        "value": 4
+      }
+    ],
+    "words": [
+      33554472,
+      37748840,
+      41943208,
+      1098356,
+      0,
+      0,
+      43262040,
+      0
+    ]
+  }
+}

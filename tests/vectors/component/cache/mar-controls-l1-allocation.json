@@ -1,0 +1,58 @@
+{
+  "domain": "cache",
+  "expected": {
+    "observations": [
+      1,
+      2,
+      2,
+      2
+    ]
+  },
+  "request": {
+    "action": "system",
+    "id": "cache:mar-controls-l1-allocation",
+    "operations": [
+      {
+        "address": 3758100480,
+        "hex": "01000000",
+        "op": "write_bytes"
+      },
+      {
+        "address": 25428032,
+        "op": "write32",
+        "value": 4
+      },
+      {
+        "address": 3758100480,
+        "op": "read32"
+      },
+      {
+        "address": 3758100480,
+        "hex": "02000000",
+        "op": "write_bytes"
+      },
+      {
+        "address": 3758100480,
+        "op": "read32"
+      },
+      {
+        "address": 25461632,
+        "op": "write32",
+        "value": 1
+      },
+      {
+        "address": 3758100480,
+        "op": "read32"
+      },
+      {
+        "address": 3758100480,
+        "hex": "03000000",
+        "op": "write_bytes"
+      },
+      {
+        "address": 3758100480,
+        "op": "read32"
+      }
+    ]
+  }
+}

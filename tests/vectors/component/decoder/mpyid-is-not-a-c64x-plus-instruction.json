@@ -1,0 +1,12 @@
+{
+  "domain": "decoder",
+  "expected": {},
+  "request": {
+    "action": "decode",
+    "address": 0,
+    "endian": "little",
+    "id": "decoder:mpyid-is-not-a-c64x-plus-instruction",
+    "width": 32,
+    "word": 17040384
+  }
+}

@@ -1,0 +1,32 @@
+{
+  "domain": "cpu",
+  "expected": {
+    "registers": {
+      "A1": 0,
+      "A2": 1,
+      "A3": 1
+    }
+  },
+  "request": {
+    "action": "execute",
+    "cycles": 6,
+    "endian": "little",
+    "id": "cpu:l-unit-compares",
+    "memory": [],
+    "pc": 0,
+    "registers": {
+      "A0": 3,
+      "A4": 4294967295
+    },
+    "words": [
+      8432344,
+      17828856,
+      25209048,
+      32768,
+      0,
+      0,
+      0,
+      0
+    ]
+  }
+}

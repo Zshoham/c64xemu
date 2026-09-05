@@ -1,0 +1,15 @@
+{
+  "domain": "decoder",
+  "expected": {
+    "mnemonic": "smpy"
+  },
+  "request": {
+    "action": "decode",
+    "address": 0,
+    "endian": "little",
+    "header": 16384,
+    "id": "decoder:compact-mpy-with-saturation",
+    "width": 16,
+    "word": 7710
+  }
+}

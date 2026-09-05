@@ -1,0 +1,68 @@
+{
+  "domain": "ethernet",
+  "expected": {
+    "observations": [
+      [
+        "0180c200000102030405060788080001ffff000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+      ],
+      2,
+      131096,
+      [
+        "0180c2000001020304050607880800010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+      ]
+    ]
+  },
+  "request": {
+    "action": "system",
+    "id": "emac:receive-fifo-flow-control",
+    "operations": [
+      {
+        "address": 46662096,
+        "op": "write32",
+        "value": 515
+      },
+      {
+        "address": 46662100,
+        "op": "write32",
+        "value": 67438087
+      },
+      {
+        "address": 46661996,
+        "op": "write32",
+        "value": 131096
+      },
+      {
+        "address": 46661984,
+        "op": "write32",
+        "value": 4129
+      },
+      {
+        "hex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "op": "inject_frame"
+      },
+      {
+        "hex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "op": "inject_frame"
+      },
+      {
+        "op": "take_tx_frames"
+      },
+      {
+        "address": 46661988,
+        "op": "read32"
+      },
+      {
+        "address": 46661996,
+        "op": "read32"
+      },
+      {
+        "address": 46661984,
+        "op": "write32",
+        "value": 33
+      },
+      {
+        "op": "take_tx_frames"
+      }
+    ]
+  }
+}

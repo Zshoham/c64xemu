@@ -1,0 +1,38 @@
+{
+  "domain": "memory",
+  "expected": {
+    "observations": [
+      "443322114433221144332211"
+    ]
+  },
+  "request": {
+    "action": "system",
+    "id": "memory:idma1-fill",
+    "operations": [
+      {
+        "address": 25297160,
+        "op": "write32",
+        "value": 287454020
+      },
+      {
+        "address": 25297164,
+        "op": "write32",
+        "value": 15728672
+      },
+      {
+        "address": 25297168,
+        "op": "write32",
+        "value": 65548
+      },
+      {
+        "cycles": 3,
+        "op": "tick"
+      },
+      {
+        "address": 15728672,
+        "length": 12,
+        "op": "read_bytes"
+      }
+    ]
+  }
+}

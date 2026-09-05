@@ -1,0 +1,14 @@
+{
+  "domain": "decoder",
+  "expected": {
+    "mnemonic": "abs"
+  },
+  "request": {
+    "action": "decode",
+    "address": 0,
+    "endian": "little",
+    "id": "decoder:abs-still-decodes-beside-abssp",
+    "width": 32,
+    "word": 25428824
+  }
+}

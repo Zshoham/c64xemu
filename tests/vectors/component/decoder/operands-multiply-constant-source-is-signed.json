@@ -1,0 +1,15 @@
+{
+  "domain": "decoder",
+  "expected": {
+    "mnemonic": "mpy",
+    "operands": "-1,a4,a5"
+  },
+  "request": {
+    "action": "decode",
+    "address": 0,
+    "endian": "little",
+    "id": "decoder:operands-multiply-constant-source-is-signed",
+    "width": 32,
+    "word": 43248640
+  }
+}

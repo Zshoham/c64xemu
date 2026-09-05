@@ -1,0 +1,114 @@
+{
+  "domain": "memory",
+  "expected": {
+    "observations": [
+      4294967280,
+      1426063360,
+      {
+        "$bits": {
+          "clear": 0,
+          "set": 6
+        }
+      },
+      17,
+      {
+        "$bits": {
+          "clear": 6,
+          "set": 0
+        }
+      }
+    ]
+  },
+  "request": {
+    "action": "system",
+    "id": "memory:mcbsp-word-length-justification-and-overrun",
+    "operations": [
+      {
+        "address": 42729484,
+        "op": "write32",
+        "value": 0
+      },
+      {
+        "address": 42729488,
+        "op": "write32",
+        "value": 0
+      },
+      {
+        "address": 42729492,
+        "op": "write32",
+        "value": 536870912
+      },
+      {
+        "address": 42729480,
+        "op": "write32",
+        "value": 12689409
+      },
+      {
+        "address": 42729476,
+        "op": "write32",
+        "value": 240
+      },
+      {
+        "cycles": 8,
+        "op": "tick"
+      },
+      {
+        "address": 42729472,
+        "op": "read32"
+      },
+      {
+        "address": 42729480,
+        "op": "write32",
+        "value": 12697601
+      },
+      {
+        "address": 42729476,
+        "op": "write32",
+        "value": 85
+      },
+      {
+        "cycles": 8,
+        "op": "tick"
+      },
+      {
+        "address": 42729472,
+        "op": "read32"
+      },
+      {
+        "address": 42729480,
+        "op": "write32",
+        "value": 12681217
+      },
+      {
+        "address": 42729476,
+        "op": "write32",
+        "value": 17
+      },
+      {
+        "cycles": 8,
+        "op": "tick"
+      },
+      {
+        "address": 42729476,
+        "op": "write32",
+        "value": 34
+      },
+      {
+        "cycles": 8,
+        "op": "tick"
+      },
+      {
+        "address": 42729480,
+        "op": "read32"
+      },
+      {
+        "address": 42729472,
+        "op": "read32"
+      },
+      {
+        "address": 42729480,
+        "op": "read32"
+      }
+    ]
+  }
+}

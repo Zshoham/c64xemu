@@ -1,0 +1,16 @@
+{
+  "domain": "decoder",
+  "expected": {
+    "mnemonic": "shl",
+    "operands": "a3,20,a3"
+  },
+  "request": {
+    "action": "decode",
+    "address": 0,
+    "endian": "little",
+    "header": 0,
+    "id": "decoder:compact-operands-shift-repeats-the-register",
+    "width": 16,
+    "word": 38274
+  }
+}

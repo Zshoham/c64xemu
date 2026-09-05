@@ -1,0 +1,58 @@
+{
+  "domain": "memory",
+  "expected": {
+    "observations": [
+      1,
+      "000102030405060708090a0b0c0d0e0f",
+      0,
+      16384
+    ]
+  },
+  "request": {
+    "action": "system",
+    "id": "memory:idma1-block-copy",
+    "operations": [
+      {
+        "address": 8388608,
+        "hex": "000102030405060708090a0b0c0d0e0f",
+        "op": "write_bytes"
+      },
+      {
+        "address": 25297160,
+        "op": "write32",
+        "value": 8388608
+      },
+      {
+        "address": 25297164,
+        "op": "write32",
+        "value": 15728640
+      },
+      {
+        "address": 25297168,
+        "op": "write32",
+        "value": 268435472
+      },
+      {
+        "address": 25297152,
+        "op": "read32"
+      },
+      {
+        "cycles": 4,
+        "op": "tick"
+      },
+      {
+        "address": 15728640,
+        "length": 16,
+        "op": "read_bytes"
+      },
+      {
+        "address": 25297152,
+        "op": "read32"
+      },
+      {
+        "address": 25165824,
+        "op": "read32"
+      }
+    ]
+  }
+}

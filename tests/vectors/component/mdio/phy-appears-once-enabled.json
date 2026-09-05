@@ -1,0 +1,33 @@
+{
+  "domain": "ethernet",
+  "expected": {
+    "observations": [
+      0,
+      1,
+      1
+    ]
+  },
+  "request": {
+    "action": "system",
+    "id": "mdio:phy-appears-once-enabled",
+    "operations": [
+      {
+        "address": 46667784,
+        "op": "read32"
+      },
+      {
+        "address": 46667780,
+        "op": "write32",
+        "value": 1073742079
+      },
+      {
+        "address": 46667784,
+        "op": "read32"
+      },
+      {
+        "address": 46667788,
+        "op": "read32"
+      }
+    ]
+  }
+}

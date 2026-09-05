@@ -1,0 +1,44 @@
+{
+  "domain": "timing",
+  "expected": {
+    "cycles": 119,
+    "fault": null,
+    "reached_stop": true
+  },
+  "request": {
+    "action": "execute",
+    "control_events": [
+      {
+        "cycle": 12,
+        "register": 2,
+        "value": 32
+      }
+    ],
+    "controls": {
+      "1": 1,
+      "13": 100,
+      "4": 34,
+      "5": 14682112
+    },
+    "cycles": 200,
+    "endian": "little",
+    "id": "timing:sploop-interrupt-pipe-down-and-up",
+    "memory": [
+      {
+        "address": 14682272,
+        "hex": "e200180000800000"
+      }
+    ],
+    "pc": 14680064,
+    "registers": {
+      "A4": 0
+    },
+    "stop_pc": 14680076,
+    "words": [
+      229376,
+      34611288,
+      212992,
+      32768
+    ]
+  }
+}

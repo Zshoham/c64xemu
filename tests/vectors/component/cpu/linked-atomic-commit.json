@@ -1,0 +1,36 @@
+{
+  "domain": "cpu",
+  "expected": {
+    "registers": {
+      "B5": 287454020,
+      "B7": 1,
+      "B8": 2864434397
+    }
+  },
+  "request": {
+    "action": "execute",
+    "cycles": 30,
+    "endian": "little",
+    "id": "cpu:linked-atomic-commit",
+    "memory": [
+      {
+        "address": 4096,
+        "hex": "44332211"
+      }
+    ],
+    "pc": 0,
+    "registers": {
+      "B4": 4096,
+      "B6": 2864434397
+    },
+    "words": [
+      42993218,
+      24576,
+      51381954,
+      59770690,
+      24576,
+      68158182,
+      24576
+    ]
+  }
+}

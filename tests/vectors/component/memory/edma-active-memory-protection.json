@@ -1,0 +1,108 @@
+{
+  "domain": "memory",
+  "expected": {
+    "observations": [
+      65270,
+      65270,
+      0,
+      0,
+      2147483648,
+      16,
+      16,
+      44048936,
+      16,
+      {
+        "$bits": {
+          "clear": 0,
+          "set": 65536
+        }
+      },
+      0,
+      0
+    ]
+  },
+  "request": {
+    "action": "system",
+    "id": "memory:edma-active-memory-protection",
+    "operations": [
+      {
+        "address": 44042252,
+        "op": "read32"
+      },
+      {
+        "address": 44042260,
+        "op": "read32"
+      },
+      {
+        "address": 44042240,
+        "op": "read32"
+      },
+      {
+        "address": 44042244,
+        "op": "read32"
+      },
+      {
+        "address": 44056644,
+        "op": "write32",
+        "value": 8437760
+      },
+      {
+        "address": 44056640,
+        "op": "read32"
+      },
+      {
+        "address": 44041032,
+        "op": "write32",
+        "value": 16
+      },
+      {
+        "address": 44048944,
+        "op": "write32",
+        "value": 16
+      },
+      {
+        "address": 44044320,
+        "op": "read32"
+      },
+      {
+        "address": 44042260,
+        "op": "write32",
+        "value": 65254
+      },
+      {
+        "address": 44048936,
+        "op": "write32",
+        "value": 16
+      },
+      {
+        "address": 44044320,
+        "op": "read32"
+      },
+      {
+        "address": 44042240,
+        "op": "read32"
+      },
+      {
+        "address": 44042244,
+        "op": "read32"
+      },
+      {
+        "address": 25165832,
+        "op": "read32"
+      },
+      {
+        "address": 44042248,
+        "op": "write32",
+        "value": 1
+      },
+      {
+        "address": 44042240,
+        "op": "read32"
+      },
+      {
+        "address": 44042244,
+        "op": "read32"
+      }
+    ]
+  }
+}

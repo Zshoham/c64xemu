@@ -1,0 +1,81 @@
+{
+  "domain": "memory",
+  "expected": {
+    "observations": [
+      1,
+      {
+        "$bits": {
+          "clear": 0,
+          "set": 32768
+        }
+      },
+      3,
+      {
+        "$bits": {
+          "clear": 32768,
+          "set": 0
+        }
+      },
+      {
+        "$bits": {
+          "clear": 0,
+          "set": 32768
+        }
+      }
+    ]
+  },
+  "request": {
+    "action": "system",
+    "id": "memory:edma-error-interrupt-pulses",
+    "operations": [
+      {
+        "address": 44044304,
+        "op": "write32",
+        "value": 1
+      },
+      {
+        "cycles": 1,
+        "op": "tick"
+      },
+      {
+        "address": 44040960,
+        "op": "read32"
+      },
+      {
+        "address": 25165832,
+        "op": "read32"
+      },
+      {
+        "address": 25165896,
+        "op": "write32",
+        "value": 32768
+      },
+      {
+        "address": 44044304,
+        "op": "write32",
+        "value": 2
+      },
+      {
+        "cycles": 1,
+        "op": "tick"
+      },
+      {
+        "address": 44040960,
+        "op": "read32"
+      },
+      {
+        "address": 25165832,
+        "op": "read32"
+      },
+      {
+        "address": 44040992,
+        "op": "write32",
+        "value": 1
+      },
+      {
+        "address": 25165832,
+        "op": "read32"
+      }
+    ]
+  }
+}

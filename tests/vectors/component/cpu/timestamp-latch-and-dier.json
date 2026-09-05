@@ -1,0 +1,32 @@
+{
+  "domain": "cpu",
+  "expected": {
+    "controls": {
+      "10": 3,
+      "11": 0,
+      "25": 3221290992
+    },
+    "registers": {}
+  },
+  "request": {
+    "action": "execute",
+    "controls": {
+      "10": 3735928559,
+      "25": 3221290992
+    },
+    "cycles": 3,
+    "endian": "little",
+    "id": "cpu:timestamp-latch-and-dier",
+    "memory": [],
+    "observe_controls": [
+      10,
+      11,
+      25
+    ],
+    "pc": 0,
+    "registers": {},
+    "words": [
+      32768
+    ]
+  }
+}

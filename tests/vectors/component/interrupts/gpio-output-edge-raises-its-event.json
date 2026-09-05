@@ -1,0 +1,110 @@
+{
+  "domain": "interrupts",
+  "expected": {
+    "observations": [
+      65535,
+      3,
+      3,
+      1,
+      {
+        "$bits": {
+          "clear": 0,
+          "set": 524288
+        }
+      },
+      {
+        "$bits": {
+          "clear": 524288,
+          "set": 0
+        }
+      },
+      0,
+      {
+        "$bits": {
+          "clear": 524288,
+          "set": 0
+        }
+      }
+    ]
+  },
+  "request": {
+    "action": "system",
+    "id": "interrupts:gpio-output-edge-raises-its-event",
+    "operations": [
+      {
+        "address": 45088784,
+        "op": "read32"
+      },
+      {
+        "address": 45088784,
+        "op": "write32",
+        "value": 65534
+      },
+      {
+        "address": 45088776,
+        "op": "write32",
+        "value": 1
+      },
+      {
+        "address": 45088804,
+        "op": "write32",
+        "value": 3
+      },
+      {
+        "address": 45088804,
+        "op": "read32"
+      },
+      {
+        "address": 45088792,
+        "op": "write32",
+        "value": 3
+      },
+      {
+        "address": 45088792,
+        "op": "read32"
+      },
+      {
+        "address": 45088800,
+        "op": "read32"
+      },
+      {
+        "cycles": 6,
+        "op": "tick"
+      },
+      {
+        "address": 25165828,
+        "op": "read32"
+      },
+      {
+        "address": 25165892,
+        "op": "write32",
+        "value": 524288
+      },
+      {
+        "cycles": 12,
+        "op": "tick"
+      },
+      {
+        "address": 25165828,
+        "op": "read32"
+      },
+      {
+        "address": 45088796,
+        "op": "write32",
+        "value": 1
+      },
+      {
+        "cycles": 12,
+        "op": "tick"
+      },
+      {
+        "address": 45088800,
+        "op": "read32"
+      },
+      {
+        "address": 25165828,
+        "op": "read32"
+      }
+    ]
+  }
+}

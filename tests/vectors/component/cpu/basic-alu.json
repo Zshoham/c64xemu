@@ -1,0 +1,29 @@
+{
+  "domain": "cpu",
+  "expected": {
+    "registers": {
+      "A0": 5,
+      "A1": 12,
+      "B0": 7
+    }
+  },
+  "request": {
+    "action": "execute",
+    "cycles": 8,
+    "endian": "little",
+    "id": "cpu:basic-alu",
+    "memory": [],
+    "pc": 0,
+    "registers": {},
+    "words": [
+      1352536,
+      1876826,
+      8392824,
+      32768,
+      0,
+      0,
+      0,
+      0
+    ]
+  }
+}

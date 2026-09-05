@@ -1,0 +1,141 @@
+{
+  "domain": "interrupts",
+  "expected": {
+    "observations": [
+      536887296,
+      16711935,
+      3208462397,
+      0,
+      {
+        "$bits": {
+          "clear": 16,
+          "set": 0
+        }
+      },
+      131072,
+      {
+        "$bits": {
+          "clear": 16,
+          "set": 0
+        }
+      },
+      {
+        "$bits": {
+          "clear": 0,
+          "set": 16
+        }
+      },
+      0,
+      0,
+      1,
+      1,
+      {
+        "$bits": {
+          "clear": 0,
+          "set": 256
+        }
+      }
+    ]
+  },
+  "request": {
+    "action": "system",
+    "id": "interrupts:utopia-clock-failure-and-transmit-event",
+    "operations": [
+      {
+        "address": 45350912,
+        "op": "read32"
+      },
+      {
+        "address": 45350932,
+        "op": "read32"
+      },
+      {
+        "address": 45350912,
+        "op": "write32",
+        "value": 4294967295
+      },
+      {
+        "address": 45350912,
+        "op": "read32"
+      },
+      {
+        "address": 45350912,
+        "op": "write32",
+        "value": 536887296
+      },
+      {
+        "address": 45350932,
+        "op": "write32",
+        "value": 196613
+      },
+      {
+        "address": 45350912,
+        "op": "write32",
+        "value": 536952832
+      },
+      {
+        "cycles": 12,
+        "op": "tick"
+      },
+      {
+        "address": 45350940,
+        "op": "read32"
+      },
+      {
+        "address": 25165828,
+        "op": "read32"
+      },
+      {
+        "cycles": 6,
+        "op": "tick"
+      },
+      {
+        "address": 45350940,
+        "op": "read32"
+      },
+      {
+        "address": 25165828,
+        "op": "read32"
+      },
+      {
+        "address": 45350936,
+        "op": "write32",
+        "value": 131072
+      },
+      {
+        "address": 25165828,
+        "op": "read32"
+      },
+      {
+        "address": 45350940,
+        "op": "write32",
+        "value": 131072
+      },
+      {
+        "address": 45350940,
+        "op": "read32"
+      },
+      {
+        "address": 1006632960,
+        "op": "read32"
+      },
+      {
+        "address": 45350940,
+        "op": "read32"
+      },
+      {
+        "address": 45350940,
+        "op": "write32",
+        "value": 1
+      },
+      {
+        "address": 45350940,
+        "op": "read32"
+      },
+      {
+        "address": 44044292,
+        "op": "read32"
+      }
+    ]
+  }
+}

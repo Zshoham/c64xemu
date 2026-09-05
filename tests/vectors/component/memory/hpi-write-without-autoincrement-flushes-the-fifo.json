@@ -1,0 +1,78 @@
+{
+  "domain": "memory",
+  "expected": {
+    "observations": [
+      0,
+      2863267841,
+      2863267842,
+      3149594627,
+      3149594628,
+      2098706
+    ]
+  },
+  "request": {
+    "action": "system",
+    "id": "memory:hpi-write-without-autoincrement-flushes-the-fifo",
+    "operations": [
+      {
+        "address": 42467376,
+        "op": "write32",
+        "value": 0
+      },
+      {
+        "op": "hpi_write",
+        "port": "hpic",
+        "value": 0
+      },
+      {
+        "op": "hpi_write",
+        "port": "hpia",
+        "value": 2098704
+      },
+      {
+        "op": "hpi_write",
+        "port": "hpid_auto",
+        "value": 2863267841
+      },
+      {
+        "op": "hpi_write",
+        "port": "hpid_auto",
+        "value": 2863267842
+      },
+      {
+        "address": 8394816,
+        "op": "read32"
+      },
+      {
+        "op": "hpi_write",
+        "port": "hpid",
+        "value": 3149594627
+      },
+      {
+        "address": 8394816,
+        "op": "read32"
+      },
+      {
+        "address": 8394820,
+        "op": "read32"
+      },
+      {
+        "address": 8394824,
+        "op": "read32"
+      },
+      {
+        "op": "hpi_write",
+        "port": "hpid",
+        "value": 3149594628
+      },
+      {
+        "address": 8394824,
+        "op": "read32"
+      },
+      {
+        "op": "hpi_read",
+        "port": "hpia"
+      }
+    ]
+  }
+}

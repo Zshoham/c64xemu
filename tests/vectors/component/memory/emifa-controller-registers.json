@@ -1,0 +1,98 @@
+{
+  "domain": "memory",
+  "expected": {
+    "observations": [
+      3277585,
+      1073741824,
+      255,
+      268435452,
+      268435452,
+      1073742720,
+      0,
+      1,
+      1,
+      0,
+      0,
+      2147483651,
+      254
+    ]
+  },
+  "request": {
+    "action": "system",
+    "id": "memory:emifa-controller-registers",
+    "operations": [
+      {
+        "address": 1879048192,
+        "op": "read32"
+      },
+      {
+        "address": 1879048196,
+        "op": "read32"
+      },
+      {
+        "address": 1879048224,
+        "op": "read32"
+      },
+      {
+        "address": 1879048320,
+        "op": "read32"
+      },
+      {
+        "address": 1879048332,
+        "op": "read32"
+      },
+      {
+        "address": 1879048352,
+        "op": "read32"
+      },
+      {
+        "address": 1879048384,
+        "op": "read32"
+      },
+      {
+        "address": 1879048392,
+        "op": "write32",
+        "value": 1
+      },
+      {
+        "address": 1879048392,
+        "op": "read32"
+      },
+      {
+        "address": 1879048396,
+        "op": "read32"
+      },
+      {
+        "address": 1879048388,
+        "op": "read32"
+      },
+      {
+        "address": 1879048396,
+        "op": "write32",
+        "value": 1
+      },
+      {
+        "address": 1879048392,
+        "op": "read32"
+      },
+      {
+        "address": 1879048324,
+        "op": "write32",
+        "value": 2147483651
+      },
+      {
+        "address": 1879048324,
+        "op": "read32"
+      },
+      {
+        "address": 1879048224,
+        "op": "write32",
+        "value": 254
+      },
+      {
+        "address": 1879048224,
+        "op": "read32"
+      }
+    ]
+  }
+}

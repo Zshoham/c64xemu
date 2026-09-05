@@ -1,0 +1,89 @@
+{
+  "domain": "memory",
+  "expected": {
+    "observations": [
+      {
+        "$bits": {
+          "clear": 2,
+          "set": 16
+        }
+      },
+      {
+        "$bits": {
+          "clear": 4098,
+          "set": 48
+        }
+      },
+      "a53c",
+      {
+        "$bits": {
+          "clear": 3072,
+          "set": 0
+        }
+      }
+    ]
+  },
+  "request": {
+    "action": "system",
+    "id": "memory:i2c-slave-acknowledges-a-master-write",
+    "operations": [
+      {
+        "address": 80,
+        "op": "i2c_slave"
+      },
+      {
+        "address": 45105200,
+        "op": "write32",
+        "value": 0
+      },
+      {
+        "address": 45105172,
+        "op": "write32",
+        "value": 2
+      },
+      {
+        "address": 45105180,
+        "op": "write32",
+        "value": 80
+      },
+      {
+        "address": 45105188,
+        "op": "write32",
+        "value": 11808
+      },
+      {
+        "address": 45105184,
+        "op": "write32",
+        "value": 165
+      },
+      {
+        "cycles": 8,
+        "op": "tick"
+      },
+      {
+        "address": 45105160,
+        "op": "read32"
+      },
+      {
+        "address": 45105184,
+        "op": "write32",
+        "value": 60
+      },
+      {
+        "cycles": 8,
+        "op": "tick"
+      },
+      {
+        "address": 45105160,
+        "op": "read32"
+      },
+      {
+        "op": "i2c_slave_received"
+      },
+      {
+        "address": 45105188,
+        "op": "read32"
+      }
+    ]
+  }
+}

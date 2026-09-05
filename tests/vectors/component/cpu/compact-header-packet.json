@@ -1,0 +1,35 @@
+{
+  "domain": "cpu",
+  "expected": {
+    "registers": {
+      "A2": 9,
+      "A3": 5,
+      "A4": 5,
+      "B2": 7
+    }
+  },
+  "request": {
+    "action": "execute",
+    "cycles": 8,
+    "endian": "little",
+    "id": "cpu:compact-header-packet",
+    "memory": [],
+    "pc": 0,
+    "registers": {
+      "A0": 7,
+      "A1": 2,
+      "B0": 3,
+      "B1": 4
+    },
+    "words": [
+      10551456,
+      25176256,
+      2356060690,
+      0,
+      0,
+      0,
+      0,
+      3768582145
+    ]
+  }
+}

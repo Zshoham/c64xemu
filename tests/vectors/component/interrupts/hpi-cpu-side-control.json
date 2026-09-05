@@ -1,0 +1,103 @@
+{
+  "domain": "interrupts",
+  "expected": {
+    "observations": [
+      128,
+      0,
+      0,
+      0,
+      4,
+      4,
+      4,
+      0,
+      0,
+      3,
+      {
+        "$bits": {
+          "clear": 32768,
+          "set": 0
+        }
+      }
+    ]
+  },
+  "request": {
+    "action": "system",
+    "id": "interrupts:hpi-cpu-side-control",
+    "operations": [
+      {
+        "address": 42467376,
+        "op": "read32"
+      },
+      {
+        "address": 42467380,
+        "op": "read32"
+      },
+      {
+        "address": 42467384,
+        "op": "read32"
+      },
+      {
+        "address": 42467332,
+        "op": "read32"
+      },
+      {
+        "address": 42467376,
+        "op": "write32",
+        "value": 4
+      },
+      {
+        "address": 42467376,
+        "op": "read32"
+      },
+      {
+        "address": 42467376,
+        "op": "write32",
+        "value": 0
+      },
+      {
+        "address": 42467376,
+        "op": "read32"
+      },
+      {
+        "address": 42467376,
+        "op": "write32",
+        "value": 2
+      },
+      {
+        "address": 42467380,
+        "op": "write32",
+        "value": 305419896
+      },
+      {
+        "address": 42467384,
+        "op": "write32",
+        "value": 2097152
+      },
+      {
+        "address": 42467376,
+        "op": "read32"
+      },
+      {
+        "address": 42467380,
+        "op": "read32"
+      },
+      {
+        "address": 42467384,
+        "op": "read32"
+      },
+      {
+        "address": 42467332,
+        "op": "write32",
+        "value": 65535
+      },
+      {
+        "address": 42467332,
+        "op": "read32"
+      },
+      {
+        "address": 25165824,
+        "op": "read32"
+      }
+    ]
+  }
+}

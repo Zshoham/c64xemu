@@ -1,0 +1,14 @@
+{
+  "domain": "decoder",
+  "expected": {
+    "mnemonic": "ldw"
+  },
+  "request": {
+    "action": "decode",
+    "address": 0,
+    "endian": "little",
+    "id": "decode:pcr-relocs:12",
+    "width": 32,
+    "word": 16777828
+  }
+}

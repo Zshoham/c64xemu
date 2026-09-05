@@ -1,0 +1,47 @@
+{
+  "domain": "ethernet",
+  "expected": {
+    "observations": [
+      {
+        "$bits": {
+          "clear": 0,
+          "set": 2147483648
+        }
+      },
+      {
+        "$bits": {
+          "clear": 2147483648,
+          "set": 536870957
+        }
+      }
+    ]
+  },
+  "request": {
+    "action": "system",
+    "id": "mdio:read-bmsr",
+    "operations": [
+      {
+        "address": 46667780,
+        "op": "write32",
+        "value": 1073742079
+      },
+      {
+        "address": 46667904,
+        "op": "write32",
+        "value": 2149580800
+      },
+      {
+        "address": 46667904,
+        "op": "read32"
+      },
+      {
+        "cycles": 16,
+        "op": "tick"
+      },
+      {
+        "address": 46667904,
+        "op": "read32"
+      }
+    ]
+  }
+}

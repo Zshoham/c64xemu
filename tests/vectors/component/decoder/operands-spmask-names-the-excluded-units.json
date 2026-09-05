@@ -1,0 +1,15 @@
+{
+  "domain": "decoder",
+  "expected": {
+    "mnemonic": "spmask",
+    "operands": "s1,d2"
+  },
+  "request": {
+    "action": "decode",
+    "address": 0,
+    "endian": "little",
+    "id": "decoder:operands-spmask-names-the-excluded-units",
+    "width": 32,
+    "word": 9633792
+  }
+}

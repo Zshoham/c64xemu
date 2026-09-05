@@ -1,0 +1,46 @@
+{
+  "domain": "timing",
+  "expected": {
+    "cycles": 9,
+    "fault": null,
+    "reached_stop": true
+  },
+  "request": {
+    "action": "execute",
+    "cycles": 200,
+    "endian": "little",
+    "id": "timing:a-full-write-buffer-stalls-the-next-write-miss",
+    "memory": [],
+    "pc": 14680064,
+    "registers": {
+      "A3": 8388608,
+      "A4": 286331153,
+      "A5": 8388640,
+      "A7": 8388672,
+      "A9": 8388704,
+      "B3": 8388624,
+      "B4": 572662306,
+      "B5": 8388656,
+      "B7": 8388688,
+      "B9": 8388720
+    },
+    "setup": [
+      {
+        "address": 25428032,
+        "op": "write32",
+        "value": 4
+      }
+    ],
+    "stop_pc": 14680096,
+    "words": [
+      34341493,
+      34341622,
+      34865781,
+      34865910,
+      35390069,
+      35390198,
+      35914357,
+      35914486
+    ]
+  }
+}

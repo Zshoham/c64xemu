@@ -1,0 +1,63 @@
+{
+  "domain": "interrupts",
+  "expected": {
+    "observations": [
+      0,
+      32768,
+      0,
+      32768
+    ]
+  },
+  "request": {
+    "action": "system",
+    "id": "interrupts:hpi-host-to-cpu-interrupt-handshake",
+    "operations": [
+      {
+        "address": 42467376,
+        "op": "write32",
+        "value": 0
+      },
+      {
+        "address": 25165824,
+        "op": "read32"
+      },
+      {
+        "op": "hpi_write",
+        "port": "hpic",
+        "value": 2
+      },
+      {
+        "address": 25165824,
+        "op": "read32"
+      },
+      {
+        "address": 25165888,
+        "op": "write32",
+        "value": 32768
+      },
+      {
+        "op": "hpi_write",
+        "port": "hpic",
+        "value": 2
+      },
+      {
+        "address": 25165824,
+        "op": "read32"
+      },
+      {
+        "address": 42467376,
+        "op": "write32",
+        "value": 2
+      },
+      {
+        "op": "hpi_write",
+        "port": "hpic",
+        "value": 2
+      },
+      {
+        "address": 25165824,
+        "op": "read32"
+      }
+    ]
+  }
+}

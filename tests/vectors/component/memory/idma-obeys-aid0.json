@@ -1,0 +1,63 @@
+{
+  "domain": "memory",
+  "expected": {
+    "observations": [
+      "00000000",
+      15728640,
+      16,
+      134217728
+    ]
+  },
+  "request": {
+    "action": "system",
+    "id": "memory:idma-obeys-aid0",
+    "operations": [
+      {
+        "address": 25472512,
+        "op": "write32",
+        "value": 319
+      },
+      {
+        "address": 8388608,
+        "hex": "78563412",
+        "op": "write_bytes"
+      },
+      {
+        "address": 25297160,
+        "op": "write32",
+        "value": 8388608
+      },
+      {
+        "address": 25297164,
+        "op": "write32",
+        "value": 15728640
+      },
+      {
+        "address": 25297168,
+        "op": "write32",
+        "value": 4
+      },
+      {
+        "cycles": 1,
+        "op": "tick"
+      },
+      {
+        "address": 15728640,
+        "length": 4,
+        "op": "read_bytes"
+      },
+      {
+        "address": 25472000,
+        "op": "read32"
+      },
+      {
+        "address": 25472004,
+        "op": "read32"
+      },
+      {
+        "address": 25165836,
+        "op": "read32"
+      }
+    ]
+  }
+}

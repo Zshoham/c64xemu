@@ -1,0 +1,15 @@
+{
+  "domain": "decoder",
+  "expected": {
+    "operands": "a0,a1,a2"
+  },
+  "request": {
+    "action": "decode",
+    "address": 0,
+    "endian": "little",
+    "header": 3768582145,
+    "id": "decoder:compact-operands-three-operand-l-unit",
+    "width": 16,
+    "word": 2208
+  }
+}

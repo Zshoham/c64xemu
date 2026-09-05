@@ -1,0 +1,15 @@
+{
+  "domain": "decoder",
+  "expected": {
+    "mnemonic": "ldh"
+  },
+  "request": {
+    "action": "decode",
+    "address": 0,
+    "endian": "little",
+    "header": 196608,
+    "id": "decoder:compact-load-signed-halfword-by-dsz",
+    "width": 16,
+    "word": 620
+  }
+}

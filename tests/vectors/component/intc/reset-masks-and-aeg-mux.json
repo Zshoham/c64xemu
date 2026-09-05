@@ -1,0 +1,53 @@
+{
+  "domain": "interrupts",
+  "expected": {
+    "observations": [
+      4294967295,
+      4294967295,
+      4294967295,
+      4294967295,
+      50462976,
+      117835012,
+      3250586627
+    ]
+  },
+  "request": {
+    "action": "system",
+    "id": "intc:reset-masks-and-aeg-mux",
+    "operations": [
+      {
+        "address": 25166016,
+        "op": "read32"
+      },
+      {
+        "address": 25166020,
+        "op": "read32"
+      },
+      {
+        "address": 25166024,
+        "op": "read32"
+      },
+      {
+        "address": 25166028,
+        "op": "read32"
+      },
+      {
+        "address": 25231680,
+        "op": "read32"
+      },
+      {
+        "address": 25231684,
+        "op": "read32"
+      },
+      {
+        "address": 25231680,
+        "op": "write32",
+        "value": 3250586627
+      },
+      {
+        "address": 25231680,
+        "op": "read32"
+      }
+    ]
+  }
+}

@@ -1,0 +1,41 @@
+{
+  "domain": "cpu",
+  "expected": {
+    "registers": {
+      "A10": 0,
+      "A11": 0,
+      "A12": 0,
+      "A13": 0,
+      "A6": 6,
+      "A9": 0,
+      "B3": 4
+    }
+  },
+  "request": {
+    "action": "execute",
+    "cycles": 8,
+    "endian": "little",
+    "id": "cpu:callp-return-and-protection",
+    "memory": [],
+    "pc": 0,
+    "registers": {},
+    "words": [
+      268436498,
+      77898584,
+      86287192,
+      94675800,
+      103064408,
+      111453016,
+      8192,
+      0,
+      51946328,
+      32768,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ]
+  }
+}

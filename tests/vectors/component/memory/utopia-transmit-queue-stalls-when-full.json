@@ -1,0 +1,288 @@
+{
+  "domain": "memory",
+  "expected": {
+    "observations": [
+      0,
+      65536,
+      {
+        "$bits": {
+          "clear": 256,
+          "set": 0
+        }
+      },
+      "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435",
+      0,
+      {
+        "$bits": {
+          "clear": 256,
+          "set": 0
+        }
+      },
+      "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435",
+      "efbeadde05060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435"
+    ]
+  },
+  "request": {
+    "action": "system",
+    "id": "memory:utopia-transmit-queue-stalls-when-full",
+    "operations": [
+      {
+        "address": 45350912,
+        "op": "write32",
+        "value": 65536
+      },
+      {
+        "address": 1006633984,
+        "op": "write32",
+        "value": 67305985
+      },
+      {
+        "address": 1006633984,
+        "op": "write32",
+        "value": 134678021
+      },
+      {
+        "address": 1006633984,
+        "op": "write32",
+        "value": 202050057
+      },
+      {
+        "address": 1006633984,
+        "op": "write32",
+        "value": 269422093
+      },
+      {
+        "address": 1006633984,
+        "op": "write32",
+        "value": 336794129
+      },
+      {
+        "address": 1006633984,
+        "op": "write32",
+        "value": 404166165
+      },
+      {
+        "address": 1006633984,
+        "op": "write32",
+        "value": 471538201
+      },
+      {
+        "address": 1006633984,
+        "op": "write32",
+        "value": 538910237
+      },
+      {
+        "address": 1006633984,
+        "op": "write32",
+        "value": 606282273
+      },
+      {
+        "address": 1006633984,
+        "op": "write32",
+        "value": 673654309
+      },
+      {
+        "address": 1006633984,
+        "op": "write32",
+        "value": 741026345
+      },
+      {
+        "address": 1006633984,
+        "op": "write32",
+        "value": 808398381
+      },
+      {
+        "address": 1006633984,
+        "op": "write32",
+        "value": 875770417
+      },
+      {
+        "address": 1006633984,
+        "op": "write32",
+        "value": 53
+      },
+      {
+        "address": 1006633984,
+        "op": "write32",
+        "value": 67305985
+      },
+      {
+        "address": 1006633984,
+        "op": "write32",
+        "value": 134678021
+      },
+      {
+        "address": 1006633984,
+        "op": "write32",
+        "value": 202050057
+      },
+      {
+        "address": 1006633984,
+        "op": "write32",
+        "value": 269422093
+      },
+      {
+        "address": 1006633984,
+        "op": "write32",
+        "value": 336794129
+      },
+      {
+        "address": 1006633984,
+        "op": "write32",
+        "value": 404166165
+      },
+      {
+        "address": 1006633984,
+        "op": "write32",
+        "value": 471538201
+      },
+      {
+        "address": 1006633984,
+        "op": "write32",
+        "value": 538910237
+      },
+      {
+        "address": 1006633984,
+        "op": "write32",
+        "value": 606282273
+      },
+      {
+        "address": 1006633984,
+        "op": "write32",
+        "value": 673654309
+      },
+      {
+        "address": 1006633984,
+        "op": "write32",
+        "value": 741026345
+      },
+      {
+        "address": 1006633984,
+        "op": "write32",
+        "value": 808398381
+      },
+      {
+        "address": 1006633984,
+        "op": "write32",
+        "value": 875770417
+      },
+      {
+        "address": 1006633984,
+        "op": "write32",
+        "value": 53
+      },
+      {
+        "address": 45350940,
+        "op": "read32"
+      },
+      {
+        "address": 1006633984,
+        "op": "write32",
+        "value": 3735928559
+      },
+      {
+        "address": 45350940,
+        "op": "read32"
+      },
+      {
+        "address": 44044308,
+        "op": "write32",
+        "value": 256
+      },
+      {
+        "cycles": 12,
+        "op": "tick"
+      },
+      {
+        "address": 44044292,
+        "op": "read32"
+      },
+      {
+        "op": "utopia_master_read"
+      },
+      {
+        "address": 45350940,
+        "op": "read32"
+      },
+      {
+        "cycles": 12,
+        "op": "tick"
+      },
+      {
+        "address": 44044292,
+        "op": "read32"
+      },
+      {
+        "address": 1006633984,
+        "op": "write32",
+        "value": 134678021
+      },
+      {
+        "address": 1006633984,
+        "op": "write32",
+        "value": 202050057
+      },
+      {
+        "address": 1006633984,
+        "op": "write32",
+        "value": 269422093
+      },
+      {
+        "address": 1006633984,
+        "op": "write32",
+        "value": 336794129
+      },
+      {
+        "address": 1006633984,
+        "op": "write32",
+        "value": 404166165
+      },
+      {
+        "address": 1006633984,
+        "op": "write32",
+        "value": 471538201
+      },
+      {
+        "address": 1006633984,
+        "op": "write32",
+        "value": 538910237
+      },
+      {
+        "address": 1006633984,
+        "op": "write32",
+        "value": 606282273
+      },
+      {
+        "address": 1006633984,
+        "op": "write32",
+        "value": 673654309
+      },
+      {
+        "address": 1006633984,
+        "op": "write32",
+        "value": 741026345
+      },
+      {
+        "address": 1006633984,
+        "op": "write32",
+        "value": 808398381
+      },
+      {
+        "address": 1006633984,
+        "op": "write32",
+        "value": 875770417
+      },
+      {
+        "address": 1006633984,
+        "op": "write32",
+        "value": 53
+      },
+      {
+        "op": "utopia_master_read"
+      },
+      {
+        "op": "utopia_master_read"
+      }
+    ]
+  }
+}

@@ -1,0 +1,40 @@
+{
+  "domain": "cpu",
+  "expected": {
+    "registers": {
+      "A10": 9,
+      "A11": 0,
+      "A4": 4,
+      "A9": 9
+    }
+  },
+  "request": {
+    "action": "execute",
+    "cycles": 7,
+    "endian": "little",
+    "id": "cpu:bnop-immediate-word-scaled",
+    "memory": [],
+    "pc": 0,
+    "registers": {
+      "B0": 1
+    },
+    "words": [
+      537420064,
+      77898584,
+      86287192,
+      94675800,
+      32768,
+      0,
+      0,
+      0,
+      34644824,
+      32768,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ]
+  }
+}

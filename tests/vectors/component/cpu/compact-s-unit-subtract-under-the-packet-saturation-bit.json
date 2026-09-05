@@ -1,0 +1,30 @@
+{
+  "domain": "cpu",
+  "expected": {
+    "registers": {
+      "A2": 2147483647
+    }
+  },
+  "request": {
+    "action": "execute",
+    "cycles": 12,
+    "endian": "little",
+    "id": "cpu:compact-s-unit-subtract-under-the-packet-saturation-bit",
+    "memory": [],
+    "pc": 0,
+    "registers": {
+      "A0": 2147483648,
+      "A1": 1
+    },
+    "words": [
+      208537770,
+      208538734,
+      208538734,
+      208538734,
+      208538734,
+      208538734,
+      208538734,
+      3768598529
+    ]
+  }
+}

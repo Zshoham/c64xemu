@@ -1,0 +1,91 @@
+{
+  "domain": "interrupts",
+  "expected": {
+    "observations": [
+      202,
+      3,
+      {
+        "$bits": {
+          "clear": 8,
+          "set": 0
+        }
+      },
+      0,
+      4,
+      {
+        "$bits": {
+          "clear": 0,
+          "set": 8
+        }
+      }
+    ]
+  },
+  "request": {
+    "action": "system",
+    "id": "interrupts:timer-chained-prescaler-worked-example",
+    "operations": [
+      {
+        "address": 43253788,
+        "op": "write32",
+        "value": 202
+      },
+      {
+        "address": 43253784,
+        "op": "write32",
+        "value": 4
+      },
+      {
+        "address": 43253780,
+        "op": "write32",
+        "value": 200
+      },
+      {
+        "address": 43253776,
+        "op": "write32",
+        "value": 3
+      },
+      {
+        "address": 43253796,
+        "op": "write32",
+        "value": 15
+      },
+      {
+        "address": 43253792,
+        "op": "write32",
+        "value": 128
+      },
+      {
+        "cycles": 12,
+        "op": "tick"
+      },
+      {
+        "address": 43253780,
+        "op": "read32"
+      },
+      {
+        "address": 43253776,
+        "op": "read32"
+      },
+      {
+        "address": 25165832,
+        "op": "read32"
+      },
+      {
+        "cycles": 6,
+        "op": "tick"
+      },
+      {
+        "address": 43253780,
+        "op": "read32"
+      },
+      {
+        "address": 43253776,
+        "op": "read32"
+      },
+      {
+        "address": 25165832,
+        "op": "read32"
+      }
+    ]
+  }
+}

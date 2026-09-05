@@ -1,0 +1,15 @@
+{
+  "domain": "decoder",
+  "expected": {
+    "mnemonic": "rotl",
+    "operands": "a3,16,a4"
+  },
+  "request": {
+    "action": "decode",
+    "address": 0,
+    "endian": "little",
+    "id": "decoder:operands-rotate-count-is-unsigned",
+    "width": 32,
+    "word": 34473904
+  }
+}

@@ -1,0 +1,87 @@
+{
+  "domain": "ethernet",
+  "expected": {
+    "observations": [
+      "ffffffffffff0200000000010800000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d",
+      60,
+      3489660988,
+      46669856
+    ]
+  },
+  "request": {
+    "action": "system",
+    "id": "emac:broadcast-rx",
+    "operations": [
+      {
+        "address": 46669856,
+        "op": "write32",
+        "value": 0
+      },
+      {
+        "address": 46669860,
+        "op": "write32",
+        "value": 8392960
+      },
+      {
+        "address": 46669864,
+        "op": "write32",
+        "value": 128
+      },
+      {
+        "address": 46669868,
+        "op": "write32",
+        "value": 536870912
+      },
+      {
+        "address": 46661888,
+        "op": "write32",
+        "value": 8192
+      },
+      {
+        "address": 46661952,
+        "op": "write32",
+        "value": 1
+      },
+      {
+        "address": 46661652,
+        "op": "write32",
+        "value": 1
+      },
+      {
+        "address": 46663200,
+        "op": "write32",
+        "value": 46669856
+      },
+      {
+        "address": 46661984,
+        "op": "write32",
+        "value": 32
+      },
+      {
+        "hex": "ffffffffffff0200000000010800000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d",
+        "op": "inject_frame"
+      },
+      {
+        "cycles": 64,
+        "op": "tick"
+      },
+      {
+        "address": 8392960,
+        "length": 60,
+        "op": "read_bytes"
+      },
+      {
+        "address": 46669864,
+        "op": "read32"
+      },
+      {
+        "address": 46669868,
+        "op": "read32"
+      },
+      {
+        "address": 46663264,
+        "op": "read32"
+      }
+    ]
+  }
+}

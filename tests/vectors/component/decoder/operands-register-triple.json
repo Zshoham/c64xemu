@@ -1,0 +1,14 @@
+{
+  "domain": "decoder",
+  "expected": {
+    "operands": "a0,a1,a2"
+  },
+  "request": {
+    "action": "decode",
+    "address": 0,
+    "endian": "little",
+    "id": "decoder:operands-register-triple",
+    "width": 32,
+    "word": 17039480
+  }
+}

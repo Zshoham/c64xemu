@@ -1,0 +1,30 @@
+{
+  "domain": "cpu",
+  "expected": {
+    "registers": {
+      "A5": 2864434397
+    }
+  },
+  "request": {
+    "action": "execute",
+    "cycles": 10,
+    "endian": "little",
+    "id": "cpu:nonaligned-word-roundtrip",
+    "memory": [],
+    "pc": 0,
+    "registers": {
+      "A4": 2864434397,
+      "A8": 12289
+    },
+    "words": [
+      35652436,
+      8192,
+      44041012,
+      32768,
+      0,
+      0,
+      0,
+      0
+    ]
+  }
+}

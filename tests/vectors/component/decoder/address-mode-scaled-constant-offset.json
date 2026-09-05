@@ -1,0 +1,14 @@
+{
+  "domain": "decoder",
+  "expected": {
+    "address": "*+b15[532]"
+  },
+  "request": {
+    "action": "decode",
+    "address": 0,
+    "endian": "little",
+    "id": "decoder:address-mode-scaled-constant-offset",
+    "width": 32,
+    "word": 84022446
+  }
+}

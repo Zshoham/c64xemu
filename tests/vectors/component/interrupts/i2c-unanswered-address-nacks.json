@@ -1,0 +1,104 @@
+{
+  "domain": "interrupts",
+  "expected": {
+    "observations": [
+      {
+        "$bits": {
+          "clear": 0,
+          "set": 2
+        }
+      },
+      2,
+      "",
+      {
+        "$bits": {
+          "clear": 8,
+          "set": 0
+        }
+      },
+      119
+    ]
+  },
+  "request": {
+    "action": "system",
+    "id": "interrupts:i2c-unanswered-address-nacks",
+    "operations": [
+      {
+        "address": 80,
+        "hex": "77",
+        "op": "i2c_slave"
+      },
+      {
+        "address": 45105200,
+        "op": "write32",
+        "value": 0
+      },
+      {
+        "address": 45105172,
+        "op": "write32",
+        "value": 1
+      },
+      {
+        "address": 45105180,
+        "op": "write32",
+        "value": 81
+      },
+      {
+        "address": 45105156,
+        "op": "write32",
+        "value": 10
+      },
+      {
+        "address": 45105188,
+        "op": "write32",
+        "value": 9760
+      },
+      {
+        "address": 45105184,
+        "op": "write32",
+        "value": 15
+      },
+      {
+        "cycles": 8,
+        "op": "tick"
+      },
+      {
+        "address": 45105160,
+        "op": "read32"
+      },
+      {
+        "address": 45105192,
+        "op": "read32"
+      },
+      {
+        "op": "i2c_slave_received"
+      },
+      {
+        "address": 45105188,
+        "op": "write32",
+        "value": 9248
+      },
+      {
+        "cycles": 24,
+        "op": "tick"
+      },
+      {
+        "address": 45105160,
+        "op": "read32"
+      },
+      {
+        "address": 45105180,
+        "op": "write32",
+        "value": 80
+      },
+      {
+        "cycles": 8,
+        "op": "tick"
+      },
+      {
+        "address": 45105176,
+        "op": "read32"
+      }
+    ]
+  }
+}

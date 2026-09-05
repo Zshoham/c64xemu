@@ -1,0 +1,108 @@
+{
+  "domain": "memory",
+  "expected": {
+    "observations": [
+      3212047,
+      1073741824,
+      5442080,
+      1875,
+      2147483643,
+      33554431,
+      255,
+      1342202919,
+      1073741828,
+      2147483643,
+      1040187395,
+      62,
+      1950
+    ]
+  },
+  "request": {
+    "action": "system",
+    "id": "memory:ddr2-controller-registers",
+    "operations": [
+      {
+        "address": 2013265920,
+        "op": "read32"
+      },
+      {
+        "address": 2013265924,
+        "op": "read32"
+      },
+      {
+        "address": 2013265928,
+        "op": "read32"
+      },
+      {
+        "address": 2013265932,
+        "op": "read32"
+      },
+      {
+        "address": 2013265936,
+        "op": "read32"
+      },
+      {
+        "address": 2013265940,
+        "op": "read32"
+      },
+      {
+        "address": 2013265952,
+        "op": "read32"
+      },
+      {
+        "address": 2013266148,
+        "op": "read32"
+      },
+      {
+        "address": 2013266148,
+        "op": "write32",
+        "value": 25607
+      },
+      {
+        "address": 2013265924,
+        "op": "read32"
+      },
+      {
+        "address": 2013265936,
+        "op": "write32",
+        "value": 0
+      },
+      {
+        "address": 2013265936,
+        "op": "read32"
+      },
+      {
+        "address": 2013265928,
+        "op": "write32",
+        "value": 5474848
+      },
+      {
+        "address": 2013265936,
+        "op": "write32",
+        "value": 1040187395
+      },
+      {
+        "address": 2013265936,
+        "op": "read32"
+      },
+      {
+        "address": 2013265932,
+        "op": "write32",
+        "value": 128
+      },
+      {
+        "address": 2013265932,
+        "op": "read32"
+      },
+      {
+        "address": 2013265932,
+        "op": "write32",
+        "value": 1950
+      },
+      {
+        "address": 2013265932,
+        "op": "read32"
+      }
+    ]
+  }
+}

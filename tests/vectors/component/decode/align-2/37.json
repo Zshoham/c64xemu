@@ -1,0 +1,14 @@
+{
+  "domain": "decoder",
+  "expected": {
+    "mnemonic": "nop"
+  },
+  "request": {
+    "action": "decode",
+    "address": 0,
+    "endian": "little",
+    "id": "decode:align-2:37",
+    "width": 32,
+    "word": 1
+  }
+}

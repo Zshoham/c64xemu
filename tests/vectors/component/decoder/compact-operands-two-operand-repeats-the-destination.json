@@ -1,0 +1,15 @@
+{
+  "domain": "decoder",
+  "expected": {
+    "operands": "b7,b0,b7"
+  },
+  "request": {
+    "action": "decode",
+    "address": 0,
+    "endian": "little",
+    "header": 0,
+    "id": "decoder:compact-operands-two-operand-repeats-the-destination",
+    "width": 16,
+    "word": 57399
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "domain": "decoder",
+  "expected": {
+    "mnemonic": "sploop",
+    "operands": "3"
+  },
+  "request": {
+    "action": "decode",
+    "address": 0,
+    "endian": "little",
+    "id": "decoder:operands-sploop-prints-its-iteration-interval",
+    "width": 32,
+    "word": 17006592
+  }
+}

@@ -1,0 +1,49 @@
+{
+  "domain": "timing",
+  "expected": {
+    "cycles": 31,
+    "fault": null,
+    "reached_stop": true
+  },
+  "request": {
+    "action": "execute",
+    "controls": {
+      "1": 1,
+      "2": 32,
+      "4": 34,
+      "5": 14682112
+    },
+    "cycles": 200,
+    "endian": "little",
+    "id": "timing:interrupt-overhead-is-nine-cycles",
+    "memory": [
+      {
+        "address": 14682272,
+        "hex": "e200180000800000"
+      }
+    ],
+    "pc": 14680064,
+    "registers": {
+      "A4": 0
+    },
+    "stop_pc": 14680128,
+    "words": [
+      34611288,
+      34611288,
+      34611288,
+      34611288,
+      34611288,
+      34611288,
+      34611288,
+      34611288,
+      34611288,
+      34611288,
+      34611288,
+      34611288,
+      34611288,
+      34611288,
+      34611288,
+      34611288
+    ]
+  }
+}

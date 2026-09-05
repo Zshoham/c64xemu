@@ -1,0 +1,33 @@
+{
+  "domain": "cpu",
+  "expected": {
+    "controls": {
+      "29": 2,
+      "31": 8
+    },
+    "pc": 4128,
+    "registers": {}
+  },
+  "request": {
+    "action": "execute",
+    "controls": {
+      "26": 4,
+      "4": 2,
+      "5": 4096
+    },
+    "cycles": 2,
+    "endian": "little",
+    "id": "cpu:c67x-opcode-raises-an-exception",
+    "memory": [],
+    "observe_controls": [
+      31,
+      29
+    ],
+    "pc": 0,
+    "registers": {},
+    "words": [
+      17039872,
+      32768
+    ]
+  }
+}

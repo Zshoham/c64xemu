@@ -1,0 +1,100 @@
+{
+  "domain": "interrupts",
+  "expected": {
+    "observations": [
+      393216,
+      2,
+      {
+        "$bits": {
+          "clear": 8,
+          "set": 0
+        }
+      },
+      3,
+      {
+        "$bits": {
+          "clear": 0,
+          "set": 1
+        }
+      },
+      {
+        "$bits": {
+          "clear": 0,
+          "set": 8
+        }
+      },
+      0,
+      {
+        "$bits": {
+          "clear": 1,
+          "set": 0
+        }
+      }
+    ]
+  },
+  "request": {
+    "action": "system",
+    "id": "interrupts:timer-64-bit-period",
+    "operations": [
+      {
+        "address": 43253764,
+        "op": "read32"
+      },
+      {
+        "address": 43253784,
+        "op": "write32",
+        "value": 3
+      },
+      {
+        "address": 43253796,
+        "op": "write32",
+        "value": 3
+      },
+      {
+        "address": 43253792,
+        "op": "write32",
+        "value": 128
+      },
+      {
+        "cycles": 17,
+        "op": "tick"
+      },
+      {
+        "address": 43253776,
+        "op": "read32"
+      },
+      {
+        "address": 25165832,
+        "op": "read32"
+      },
+      {
+        "cycles": 1,
+        "op": "tick"
+      },
+      {
+        "address": 43253776,
+        "op": "read32"
+      },
+      {
+        "address": 43253792,
+        "op": "read32"
+      },
+      {
+        "address": 25165832,
+        "op": "read32"
+      },
+      {
+        "cycles": 6,
+        "op": "tick"
+      },
+      {
+        "address": 43253776,
+        "op": "read32"
+      },
+      {
+        "address": 43253792,
+        "op": "read32"
+      }
+    ]
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "domain": "decoder",
+  "expected": {
+    "mnemonic": "lddw"
+  },
+  "request": {
+    "action": "decode",
+    "address": 0,
+    "endian": "little",
+    "header": 262144,
+    "id": "decoder:compact-load-doubleword-by-dsz",
+    "width": 16,
+    "word": 76
+  }
+}

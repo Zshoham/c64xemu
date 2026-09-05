@@ -1,0 +1,132 @@
+{
+  "domain": "memory",
+  "expected": {
+    "observations": [
+      0,
+      256,
+      1060944,
+      8413208,
+      0,
+      0,
+      16,
+      256,
+      8,
+      8413200,
+      0,
+      2304
+    ]
+  },
+  "request": {
+    "action": "system",
+    "id": "memory:edma-source-active-window-reports-the-serviced-request",
+    "operations": [
+      {
+        "address": 44040836,
+        "op": "write32",
+        "value": 5
+      },
+      {
+        "address": 44040448,
+        "op": "write32",
+        "value": 192
+      },
+      {
+        "address": 44056768,
+        "op": "write32",
+        "value": 1060876
+      },
+      {
+        "address": 44056772,
+        "op": "write32",
+        "value": 8413184
+      },
+      {
+        "address": 44056776,
+        "op": "write32",
+        "value": 131080
+      },
+      {
+        "address": 44056780,
+        "op": "write32",
+        "value": 8413696
+      },
+      {
+        "address": 44056784,
+        "op": "write32",
+        "value": 2097168
+      },
+      {
+        "address": 44056788,
+        "op": "write32",
+        "value": 65535
+      },
+      {
+        "address": 44056792,
+        "op": "write32",
+        "value": 0
+      },
+      {
+        "address": 44056796,
+        "op": "write32",
+        "value": 1
+      },
+      {
+        "address": 44171840,
+        "op": "read32"
+      },
+      {
+        "address": 44171520,
+        "op": "read32"
+      },
+      {
+        "address": 44044304,
+        "op": "write32",
+        "value": 1
+      },
+      {
+        "cycles": 1,
+        "op": "tick"
+      },
+      {
+        "address": 44171840,
+        "op": "read32"
+      },
+      {
+        "address": 44171844,
+        "op": "read32"
+      },
+      {
+        "address": 44171848,
+        "op": "read32"
+      },
+      {
+        "address": 44171852,
+        "op": "read32"
+      },
+      {
+        "address": 44171856,
+        "op": "read32"
+      },
+      {
+        "address": 44171860,
+        "op": "read32"
+      },
+      {
+        "address": 44171864,
+        "op": "read32"
+      },
+      {
+        "address": 44171868,
+        "op": "read32"
+      },
+      {
+        "address": 44171872,
+        "op": "read32"
+      },
+      {
+        "address": 44171520,
+        "op": "read32"
+      }
+    ]
+  }
+}

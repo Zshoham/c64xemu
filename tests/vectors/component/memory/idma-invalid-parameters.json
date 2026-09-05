@@ -1,0 +1,38 @@
+{
+  "domain": "memory",
+  "expected": {
+    "observations": [
+      0,
+      2
+    ]
+  },
+  "request": {
+    "action": "system",
+    "id": "memory:idma-invalid-parameters",
+    "operations": [
+      {
+        "address": 25297160,
+        "op": "write32",
+        "value": 2147483648
+      },
+      {
+        "address": 25297164,
+        "op": "write32",
+        "value": 15728640
+      },
+      {
+        "address": 25297168,
+        "op": "write32",
+        "value": 4
+      },
+      {
+        "address": 25297152,
+        "op": "read32"
+      },
+      {
+        "address": 25165836,
+        "op": "read32"
+      }
+    ]
+  }
+}

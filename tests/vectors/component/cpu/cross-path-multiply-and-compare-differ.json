@@ -1,0 +1,23 @@
+{
+  "domain": "cpu",
+  "expected": {
+    "fault": "cross-path conflict on 1X at 0x00001004: reads B5 after B4"
+  },
+  "request": {
+    "action": "execute",
+    "cycles": 4,
+    "id": "cpu:cross-path-multiply-and-compare-differ",
+    "pc": 4096,
+    "registers": {
+      "A0": 3,
+      "A1": 1,
+      "B4": 5,
+      "B5": 6
+    },
+    "words": [
+      17833089,
+      26491640,
+      24576
+    ]
+  }
+}

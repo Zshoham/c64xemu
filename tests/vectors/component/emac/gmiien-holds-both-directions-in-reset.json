@@ -1,0 +1,142 @@
+{
+  "domain": "ethernet",
+  "expected": {
+    "observations": [
+      [],
+      3758096448,
+      536870912,
+      "00000000",
+      [
+        "020000112233020000445566080003080d12171c21262b30353a3f44494e53585d62676c71767b80858a8f94999ea3a8adb2b7bcc1c6cbd0d5dadfe4e9eef3f8"
+      ],
+      3489660992,
+      "02000011"
+    ]
+  },
+  "request": {
+    "action": "system",
+    "id": "emac:gmiien-holds-both-directions-in-reset",
+    "operations": [
+      {
+        "address": 8392704,
+        "hex": "020000112233020000445566080003080d12171c21262b30353a3f44494e53585d62676c71767b80858a8f94999ea3a8adb2b7bcc1c6cbd0d5dadfe4e9eef3f8",
+        "op": "write_bytes"
+      },
+      {
+        "address": 46669824,
+        "op": "write32",
+        "value": 0
+      },
+      {
+        "address": 46669828,
+        "op": "write32",
+        "value": 8392704
+      },
+      {
+        "address": 46669832,
+        "op": "write32",
+        "value": 64
+      },
+      {
+        "address": 46669836,
+        "op": "write32",
+        "value": 3758096448
+      },
+      {
+        "address": 46669840,
+        "op": "write32",
+        "value": 0
+      },
+      {
+        "address": 46669844,
+        "op": "write32",
+        "value": 8392960
+      },
+      {
+        "address": 46669848,
+        "op": "write32",
+        "value": 256
+      },
+      {
+        "address": 46669852,
+        "op": "write32",
+        "value": 536870912
+      },
+      {
+        "address": 46661888,
+        "op": "write32",
+        "value": 2097152
+      },
+      {
+        "address": 46661952,
+        "op": "write32",
+        "value": 1
+      },
+      {
+        "address": 46661636,
+        "op": "write32",
+        "value": 1
+      },
+      {
+        "address": 46661652,
+        "op": "write32",
+        "value": 1
+      },
+      {
+        "address": 46663168,
+        "op": "write32",
+        "value": 46669824
+      },
+      {
+        "address": 46663200,
+        "op": "write32",
+        "value": 46669840
+      },
+      {
+        "hex": "020000112233020000445566080003080d12171c21262b30353a3f44494e53585d62676c71767b80858a8f94999ea3a8adb2b7bcc1c6cbd0d5dadfe4e9eef3f8",
+        "op": "inject_frame"
+      },
+      {
+        "cycles": 64,
+        "op": "tick"
+      },
+      {
+        "op": "take_tx_frames"
+      },
+      {
+        "address": 46669836,
+        "op": "read32"
+      },
+      {
+        "address": 46669852,
+        "op": "read32"
+      },
+      {
+        "address": 8392960,
+        "length": 4,
+        "op": "read_bytes"
+      },
+      {
+        "address": 46661984,
+        "op": "write32",
+        "value": 32
+      },
+      {
+        "cycles": 64,
+        "op": "tick"
+      },
+      {
+        "op": "take_tx_frames"
+      },
+      {
+        "address": 46669836,
+        "op": "read32"
+      },
+      {
+        "address": 8392960,
+        "length": 4,
+        "op": "read_bytes"
+      }
+    ]
+  }
+}

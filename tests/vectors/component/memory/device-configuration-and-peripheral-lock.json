@@ -1,0 +1,131 @@
+{
+  "domain": "memory",
+  "expected": {
+    "observations": [
+      6357312,
+      1074307119,
+      785,
+      3903,
+      4042322160,
+      0,
+      1088,
+      1088,
+      166400,
+      166400,
+      33280,
+      1,
+      786432,
+      524288
+    ]
+  },
+  "request": {
+    "action": "system",
+    "id": "memory:device-configuration-and-peripheral-lock",
+    "operations": [
+      {
+        "address": 44564480,
+        "op": "read32"
+      },
+      {
+        "address": 44564488,
+        "op": "read32"
+      },
+      {
+        "address": 44564484,
+        "op": "read32"
+      },
+      {
+        "address": 44564484,
+        "op": "write32",
+        "value": 4294967295
+      },
+      {
+        "address": 44564484,
+        "op": "read32"
+      },
+      {
+        "address": 44826628,
+        "op": "read32"
+      },
+      {
+        "address": 44826632,
+        "op": "write32",
+        "value": 1024
+      },
+      {
+        "address": 44826632,
+        "op": "read32"
+      },
+      {
+        "address": 44826628,
+        "op": "write32",
+        "value": 252316416
+      },
+      {
+        "address": 44826632,
+        "op": "write32",
+        "value": 1088
+      },
+      {
+        "address": 44826632,
+        "op": "read32"
+      },
+      {
+        "address": 44826632,
+        "op": "write32",
+        "value": 4096
+      },
+      {
+        "address": 44826632,
+        "op": "read32"
+      },
+      {
+        "address": 44826644,
+        "op": "read32"
+      },
+      {
+        "cycles": 90,
+        "op": "tick"
+      },
+      {
+        "address": 44826644,
+        "op": "read32"
+      },
+      {
+        "cycles": 6,
+        "op": "tick"
+      },
+      {
+        "address": 44826644,
+        "op": "read32"
+      },
+      {
+        "address": 44826668,
+        "op": "write32",
+        "value": 1
+      },
+      {
+        "address": 44826668,
+        "op": "write32",
+        "value": 0
+      },
+      {
+        "address": 44826668,
+        "op": "read32"
+      },
+      {
+        "address": 44826656,
+        "op": "read32"
+      },
+      {
+        "address": 44826656,
+        "op": "write32",
+        "value": 0
+      },
+      {
+        "address": 44826656,
+        "op": "read32"
+      }
+    ]
+  }
+}

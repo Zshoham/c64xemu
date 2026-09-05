@@ -1,0 +1,85 @@
+{
+  "domain": "ethernet",
+  "expected": {
+    "observations": [
+      [
+        "0180c200000102030405060788080001ffff000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+      ],
+      2,
+      65280,
+      [
+        "0180c2000001020304050607880800010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+      ],
+      0,
+      0,
+      2
+    ]
+  },
+  "request": {
+    "action": "system",
+    "id": "emac:receive-buffer-flow-control-pause",
+    "operations": [
+      {
+        "address": 46662096,
+        "op": "write32",
+        "value": 515
+      },
+      {
+        "address": 46662100,
+        "op": "write32",
+        "value": 67438087
+      },
+      {
+        "address": 46661920,
+        "op": "write32",
+        "value": 2
+      },
+      {
+        "address": 46661952,
+        "op": "write32",
+        "value": 2
+      },
+      {
+        "address": 46661892,
+        "op": "write32",
+        "value": 1
+      },
+      {
+        "address": 46661984,
+        "op": "write32",
+        "value": 41
+      },
+      {
+        "op": "take_tx_frames"
+      },
+      {
+        "address": 46661988,
+        "op": "read32"
+      },
+      {
+        "address": 46662120,
+        "op": "read32"
+      },
+      {
+        "address": 46661952,
+        "op": "write32",
+        "value": 1
+      },
+      {
+        "op": "take_tx_frames"
+      },
+      {
+        "address": 46661988,
+        "op": "read32"
+      },
+      {
+        "address": 46662120,
+        "op": "read32"
+      },
+      {
+        "address": 46662208,
+        "op": "read32"
+      }
+    ]
+  }
+}

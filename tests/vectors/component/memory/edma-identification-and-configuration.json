@@ -1,0 +1,53 @@
+{
+  "domain": "memory",
+  "expected": {
+    "observations": [
+      1073814272,
+      53691429,
+      16352,
+      6,
+      4
+    ]
+  },
+  "request": {
+    "action": "system",
+    "id": "memory:edma-identification-and-configuration",
+    "operations": [
+      {
+        "address": 44040192,
+        "op": "read32"
+      },
+      {
+        "address": 44040196,
+        "op": "read32"
+      },
+      {
+        "address": 44040448,
+        "op": "write32",
+        "value": 4294967295
+      },
+      {
+        "address": 44040448,
+        "op": "read32"
+      },
+      {
+        "address": 44044336,
+        "op": "write32",
+        "value": 6
+      },
+      {
+        "address": 44044320,
+        "op": "read32"
+      },
+      {
+        "address": 44044328,
+        "op": "write32",
+        "value": 2
+      },
+      {
+        "address": 44044320,
+        "op": "read32"
+      }
+    ]
+  }
+}

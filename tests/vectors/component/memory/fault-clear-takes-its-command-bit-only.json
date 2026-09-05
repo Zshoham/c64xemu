@@ -1,0 +1,90 @@
+{
+  "domain": "memory",
+  "expected": {
+    "observations": [
+      false,
+      8454176,
+      272,
+      8454176,
+      272,
+      272,
+      0,
+      0,
+      false,
+      8454180,
+      272
+    ]
+  },
+  "request": {
+    "action": "system",
+    "id": "memory:fault-clear-takes-its-command-bit-only",
+    "operations": [
+      {
+        "address": 25469444,
+        "op": "write32",
+        "value": 303
+      },
+      {
+        "address": 8454176,
+        "op": "cpu_access",
+        "permission": "write"
+      },
+      {
+        "address": 25468928,
+        "op": "read32"
+      },
+      {
+        "address": 25468932,
+        "op": "read32"
+      },
+      {
+        "address": 25468936,
+        "op": "write32",
+        "value": 272
+      },
+      {
+        "address": 25468928,
+        "op": "read32"
+      },
+      {
+        "address": 25468932,
+        "op": "read32"
+      },
+      {
+        "address": 25468936,
+        "op": "write32",
+        "value": 2
+      },
+      {
+        "address": 25468932,
+        "op": "read32"
+      },
+      {
+        "address": 25468936,
+        "op": "write32",
+        "value": 1
+      },
+      {
+        "address": 25468928,
+        "op": "read32"
+      },
+      {
+        "address": 25468932,
+        "op": "read32"
+      },
+      {
+        "address": 8454180,
+        "op": "cpu_access",
+        "permission": "write"
+      },
+      {
+        "address": 25468928,
+        "op": "read32"
+      },
+      {
+        "address": 25468932,
+        "op": "read32"
+      }
+    ]
+  }
+}

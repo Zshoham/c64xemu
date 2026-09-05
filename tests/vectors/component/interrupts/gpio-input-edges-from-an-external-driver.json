@@ -1,0 +1,98 @@
+{
+  "domain": "interrupts",
+  "expected": {
+    "observations": [
+      0,
+      2,
+      {
+        "$bits": {
+          "clear": 0,
+          "set": 1048576
+        }
+      },
+      0,
+      0,
+      {
+        "$bits": {
+          "clear": 0,
+          "set": 1048576
+        }
+      }
+    ]
+  },
+  "request": {
+    "action": "system",
+    "id": "interrupts:gpio-input-edges-from-an-external-driver",
+    "operations": [
+      {
+        "address": 45088784,
+        "op": "write32",
+        "value": 65534
+      },
+      {
+        "address": 45088776,
+        "op": "write32",
+        "value": 1
+      },
+      {
+        "address": 45088804,
+        "op": "write32",
+        "value": 2
+      },
+      {
+        "address": 45088812,
+        "op": "write32",
+        "value": 2
+      },
+      {
+        "address": 45088800,
+        "op": "read32"
+      },
+      {
+        "op": "gpio_input",
+        "value": 2
+      },
+      {
+        "address": 45088800,
+        "op": "read32"
+      },
+      {
+        "cycles": 6,
+        "op": "tick"
+      },
+      {
+        "address": 25165828,
+        "op": "read32"
+      },
+      {
+        "address": 25165892,
+        "op": "write32",
+        "value": 1048576
+      },
+      {
+        "cycles": 12,
+        "op": "tick"
+      },
+      {
+        "address": 25165828,
+        "op": "read32"
+      },
+      {
+        "op": "gpio_input",
+        "value": 0
+      },
+      {
+        "cycles": 12,
+        "op": "tick"
+      },
+      {
+        "address": 45088800,
+        "op": "read32"
+      },
+      {
+        "address": 25165828,
+        "op": "read32"
+      }
+    ]
+  }
+}

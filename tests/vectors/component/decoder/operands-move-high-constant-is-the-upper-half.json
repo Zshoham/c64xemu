@@ -1,0 +1,15 @@
+{
+  "domain": "decoder",
+  "expected": {
+    "mnemonic": "mvkh",
+    "operands": "0x810000,b0"
+  },
+  "request": {
+    "action": "decode",
+    "address": 0,
+    "endian": "little",
+    "id": "decoder:operands-move-high-constant-is-the-upper-half",
+    "width": 32,
+    "word": 16618
+  }
+}

@@ -1,0 +1,117 @@
+{
+  "domain": "ethernet",
+  "expected": {
+    "observations": [
+      "ffffffffffff0200000000010800000102030405060708090a0b0c0d0e0f1011",
+      60,
+      3221225532,
+      536870912,
+      46669872,
+      0
+    ]
+  },
+  "request": {
+    "action": "system",
+    "id": "emac:receive-no-chain-uses-one-buffer",
+    "operations": [
+      {
+        "address": 46669856,
+        "op": "write32",
+        "value": 46669872
+      },
+      {
+        "address": 46669860,
+        "op": "write32",
+        "value": 8392960
+      },
+      {
+        "address": 46669864,
+        "op": "write32",
+        "value": 32
+      },
+      {
+        "address": 46669868,
+        "op": "write32",
+        "value": 536870912
+      },
+      {
+        "address": 46669872,
+        "op": "write32",
+        "value": 0
+      },
+      {
+        "address": 46669876,
+        "op": "write32",
+        "value": 8393216
+      },
+      {
+        "address": 46669880,
+        "op": "write32",
+        "value": 32
+      },
+      {
+        "address": 46669884,
+        "op": "write32",
+        "value": 536870912
+      },
+      {
+        "address": 46661952,
+        "op": "write32",
+        "value": 2
+      },
+      {
+        "address": 46661652,
+        "op": "write32",
+        "value": 1
+      },
+      {
+        "address": 46661888,
+        "op": "write32",
+        "value": 268443648
+      },
+      {
+        "address": 46663200,
+        "op": "write32",
+        "value": 46669856
+      },
+      {
+        "address": 46661984,
+        "op": "write32",
+        "value": 32
+      },
+      {
+        "hex": "ffffffffffff0200000000010800000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d",
+        "op": "inject_frame"
+      },
+      {
+        "cycles": 2,
+        "op": "tick"
+      },
+      {
+        "address": 8392960,
+        "length": 32,
+        "op": "read_bytes"
+      },
+      {
+        "address": 46669864,
+        "op": "read32"
+      },
+      {
+        "address": 46669868,
+        "op": "read32"
+      },
+      {
+        "address": 46669884,
+        "op": "read32"
+      },
+      {
+        "address": 46663200,
+        "op": "read32"
+      },
+      {
+        "address": 46662284,
+        "op": "read32"
+      }
+    ]
+  }
+}

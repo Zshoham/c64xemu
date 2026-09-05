@@ -1,0 +1,124 @@
+{
+  "domain": "ethernet",
+  "expected": {
+    "observations": [
+      [],
+      2,
+      2,
+      131072,
+      4259840,
+      4194304,
+      [],
+      0,
+      0
+    ]
+  },
+  "request": {
+    "action": "system",
+    "id": "emac:transmit-host-error-halts-the-dma",
+    "operations": [
+      {
+        "address": 46665732,
+        "op": "write32",
+        "value": 1
+      },
+      {
+        "address": 46661816,
+        "op": "write32",
+        "value": 2
+      },
+      {
+        "address": 46669824,
+        "op": "write32",
+        "value": 0
+      },
+      {
+        "address": 46669828,
+        "op": "write32",
+        "value": 0
+      },
+      {
+        "address": 46669832,
+        "op": "write32",
+        "value": 60
+      },
+      {
+        "address": 46669836,
+        "op": "write32",
+        "value": 3758096444
+      },
+      {
+        "address": 46661636,
+        "op": "write32",
+        "value": 1
+      },
+      {
+        "address": 46663172,
+        "op": "write32",
+        "value": 46669824
+      },
+      {
+        "address": 46661984,
+        "op": "write32",
+        "value": 32
+      },
+      {
+        "cycles": 4,
+        "op": "tick"
+      },
+      {
+        "op": "take_tx_frames"
+      },
+      {
+        "address": 46661808,
+        "op": "read32"
+      },
+      {
+        "address": 46661812,
+        "op": "read32"
+      },
+      {
+        "address": 46661776,
+        "op": "read32"
+      },
+      {
+        "address": 46661988,
+        "op": "read32"
+      },
+      {
+        "address": 46661988,
+        "op": "read32"
+      },
+      {
+        "address": 8392704,
+        "op": "write32",
+        "value": 287454020
+      },
+      {
+        "address": 46669828,
+        "op": "write32",
+        "value": 8392704
+      },
+      {
+        "cycles": 4,
+        "op": "tick"
+      },
+      {
+        "op": "take_tx_frames"
+      },
+      {
+        "address": 46662004,
+        "op": "write32",
+        "value": 1
+      },
+      {
+        "address": 46661808,
+        "op": "read32"
+      },
+      {
+        "address": 46661988,
+        "op": "read32"
+      }
+    ]
+  }
+}

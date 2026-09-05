@@ -1,0 +1,93 @@
+{
+  "domain": "memory",
+  "expected": {
+    "observations": [
+      1,
+      1,
+      32769,
+      1,
+      1,
+      0,
+      1,
+      0,
+      0,
+      1,
+      32772,
+      0
+    ]
+  },
+  "request": {
+    "action": "system",
+    "id": "memory:pll2-controller-and-reset-type",
+    "operations": [
+      {
+        "address": 43647204,
+        "op": "read32"
+      },
+      {
+        "address": 43647204,
+        "op": "write32",
+        "value": 0
+      },
+      {
+        "address": 43647204,
+        "op": "read32"
+      },
+      {
+        "address": 43778328,
+        "op": "read32"
+      },
+      {
+        "address": 43778368,
+        "op": "read32"
+      },
+      {
+        "address": 43778384,
+        "op": "read32"
+      },
+      {
+        "address": 43778372,
+        "op": "read32"
+      },
+      {
+        "address": 43778328,
+        "op": "write32",
+        "value": 32772
+      },
+      {
+        "address": 43778372,
+        "op": "read32"
+      },
+      {
+        "address": 43778364,
+        "op": "read32"
+      },
+      {
+        "address": 43778360,
+        "op": "write32",
+        "value": 1
+      },
+      {
+        "address": 43778372,
+        "op": "read32"
+      },
+      {
+        "address": 43778360,
+        "op": "read32"
+      },
+      {
+        "address": 43778328,
+        "op": "read32"
+      },
+      {
+        "address": 43778328,
+        "op": "write32",
+        "value": 32772
+      },
+      {
+        "address": 43778372,
+        "op": "read32"
+      }
+    ]
+  }
+}

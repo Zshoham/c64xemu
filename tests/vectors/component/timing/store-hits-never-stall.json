@@ -1,0 +1,37 @@
+{
+  "domain": "timing",
+  "expected": {
+    "cycles": 4,
+    "fault": null,
+    "reached_stop": true
+  },
+  "request": {
+    "action": "execute",
+    "cycles": 200,
+    "endian": "little",
+    "id": "timing:store-hits-never-stall",
+    "memory": [],
+    "pc": 14680064,
+    "registers": {
+      "A3": 15728640,
+      "A4": 305419896,
+      "A5": 15728656,
+      "A7": 15728672,
+      "A9": 15728688
+    },
+    "setup": [
+      {
+        "address": 25428032,
+        "op": "write32",
+        "value": 4
+      }
+    ],
+    "stop_pc": 14680080,
+    "words": [
+      34341492,
+      34865780,
+      35390068,
+      35914356
+    ]
+  }
+}

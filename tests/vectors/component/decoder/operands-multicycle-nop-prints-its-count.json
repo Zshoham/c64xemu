@@ -1,0 +1,15 @@
+{
+  "domain": "decoder",
+  "expected": {
+    "mnemonic": "nop",
+    "operands": "4"
+  },
+  "request": {
+    "action": "decode",
+    "address": 0,
+    "endian": "little",
+    "id": "decoder:operands-multicycle-nop-prints-its-count",
+    "width": 32,
+    "word": 24576
+  }
+}

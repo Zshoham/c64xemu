@@ -1,0 +1,123 @@
+{
+  "domain": "memory",
+  "expected": {
+    "observations": [
+      72,
+      32771,
+      32771,
+      24,
+      31,
+      0,
+      75,
+      63,
+      32799,
+      8,
+      0,
+      0,
+      1,
+      32773,
+      0
+    ]
+  },
+  "request": {
+    "action": "system",
+    "id": "memory:pll-controller-go-operation",
+    "operations": [
+      {
+        "address": 43647232,
+        "op": "read32"
+      },
+      {
+        "address": 43647328,
+        "op": "read32"
+      },
+      {
+        "address": 43647332,
+        "op": "read32"
+      },
+      {
+        "address": 43647296,
+        "op": "read32"
+      },
+      {
+        "address": 43647312,
+        "op": "read32"
+      },
+      {
+        "address": 43647300,
+        "op": "read32"
+      },
+      {
+        "address": 43647232,
+        "op": "write32",
+        "value": 4294967295
+      },
+      {
+        "address": 43647232,
+        "op": "read32"
+      },
+      {
+        "address": 43647248,
+        "op": "write32",
+        "value": 65535
+      },
+      {
+        "address": 43647248,
+        "op": "read32"
+      },
+      {
+        "address": 43647252,
+        "op": "write32",
+        "value": 65535
+      },
+      {
+        "address": 43647252,
+        "op": "read32"
+      },
+      {
+        "address": 43647328,
+        "op": "write32",
+        "value": 32773
+      },
+      {
+        "address": 43647332,
+        "op": "write32",
+        "value": 32771
+      },
+      {
+        "address": 43647300,
+        "op": "read32"
+      },
+      {
+        "address": 43647292,
+        "op": "read32"
+      },
+      {
+        "address": 43647288,
+        "op": "write32",
+        "value": 1
+      },
+      {
+        "address": 43647300,
+        "op": "read32"
+      },
+      {
+        "address": 43647288,
+        "op": "read32"
+      },
+      {
+        "address": 43647328,
+        "op": "read32"
+      },
+      {
+        "address": 43647328,
+        "op": "write32",
+        "value": 32773
+      },
+      {
+        "address": 43647300,
+        "op": "read32"
+      }
+    ]
+  }
+}

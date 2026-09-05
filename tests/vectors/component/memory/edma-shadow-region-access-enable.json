@@ -1,0 +1,118 @@
+{
+  "domain": "memory",
+  "expected": {
+    "observations": [
+      32,
+      16,
+      16,
+      "11223344",
+      32,
+      {
+        "$bits": {
+          "clear": 0,
+          "set": 256
+        }
+      },
+      0
+    ]
+  },
+  "request": {
+    "action": "system",
+    "id": "memory:edma-shadow-region-access-enable",
+    "operations": [
+      {
+        "address": 8413184,
+        "hex": "11223344",
+        "op": "write_bytes"
+      },
+      {
+        "address": 44041032,
+        "op": "write32",
+        "value": 48
+      },
+      {
+        "address": 44040464,
+        "op": "write32",
+        "value": 96
+      },
+      {
+        "address": 44056672,
+        "op": "write32",
+        "value": 1069056
+      },
+      {
+        "address": 44056676,
+        "op": "write32",
+        "value": 8413184
+      },
+      {
+        "address": 44056680,
+        "op": "write32",
+        "value": 65540
+      },
+      {
+        "address": 44056684,
+        "op": "write32",
+        "value": 8413440
+      },
+      {
+        "address": 44056692,
+        "op": "write32",
+        "value": 65535
+      },
+      {
+        "address": 44056700,
+        "op": "write32",
+        "value": 1
+      },
+      {
+        "address": 44048992,
+        "op": "write32",
+        "value": 96
+      },
+      {
+        "address": 44044368,
+        "op": "read32"
+      },
+      {
+        "address": 44048912,
+        "op": "write32",
+        "value": 24
+      },
+      {
+        "address": 44044288,
+        "op": "read32"
+      },
+      {
+        "address": 44048896,
+        "op": "read32"
+      },
+      {
+        "cycles": 1,
+        "op": "tick"
+      },
+      {
+        "address": 8413440,
+        "length": 4,
+        "op": "read_bytes"
+      },
+      {
+        "address": 44049000,
+        "op": "read32"
+      },
+      {
+        "address": 25165832,
+        "op": "read32"
+      },
+      {
+        "address": 44049008,
+        "op": "write32",
+        "value": 32
+      },
+      {
+        "address": 44044392,
+        "op": "read32"
+      }
+    ]
+  }
+}

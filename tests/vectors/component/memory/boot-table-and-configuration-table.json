@@ -1,0 +1,56 @@
+{
+  "domain": "memory",
+  "expected": {
+    "observations": [
+      8393268,
+      "4433221188776655",
+      3735928559,
+      [
+        8393268
+      ],
+      65280,
+      3517100512
+    ]
+  },
+  "request": {
+    "action": "system",
+    "id": "memory:boot-table-and-configuration-table",
+    "operations": [
+      {
+        "address": 8409088,
+        "hex": "34128000080000000060800044332211887766550400000000618000efbeadde00000000",
+        "op": "write_bytes"
+      },
+      {
+        "address": 8409344,
+        "hex": "1000b002000f0000ff000000006180000f0f0f0f0f0f0f0f341280000000000000000000000000000000000000000000",
+        "op": "write_bytes"
+      },
+      {
+        "address": 8409088,
+        "op": "boot_table"
+      },
+      {
+        "address": 8413184,
+        "length": 8,
+        "op": "read_bytes"
+      },
+      {
+        "address": 8413440,
+        "op": "read32"
+      },
+      {
+        "address": 8409344,
+        "op": "boot_config"
+      },
+      {
+        "address": 45088784,
+        "op": "read32"
+      },
+      {
+        "address": 8413440,
+        "op": "read32"
+      }
+    ]
+  }
+}

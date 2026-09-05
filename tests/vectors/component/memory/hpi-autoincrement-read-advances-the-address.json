@@ -1,0 +1,83 @@
+{
+  "domain": "memory",
+  "expected": {
+    "observations": [
+      168496141,
+      287454020,
+      1432778632,
+      2578103244,
+      3723427584,
+      2098725
+    ]
+  },
+  "request": {
+    "action": "system",
+    "id": "memory:hpi-autoincrement-read-advances-the-address",
+    "operations": [
+      {
+        "address": 42467376,
+        "op": "write32",
+        "value": 0
+      },
+      {
+        "op": "hpi_write",
+        "port": "hpic",
+        "value": 0
+      },
+      {
+        "address": 8394880,
+        "op": "write32",
+        "value": 168496141
+      },
+      {
+        "address": 8394884,
+        "op": "write32",
+        "value": 287454020
+      },
+      {
+        "address": 8394888,
+        "op": "write32",
+        "value": 1432778632
+      },
+      {
+        "address": 8394892,
+        "op": "write32",
+        "value": 2578103244
+      },
+      {
+        "address": 8394896,
+        "op": "write32",
+        "value": 3723427584
+      },
+      {
+        "op": "hpi_write",
+        "port": "hpia",
+        "value": 2098720
+      },
+      {
+        "op": "hpi_read",
+        "port": "hpid_auto"
+      },
+      {
+        "op": "hpi_read",
+        "port": "hpid_auto"
+      },
+      {
+        "op": "hpi_read",
+        "port": "hpid_auto"
+      },
+      {
+        "op": "hpi_read",
+        "port": "hpid_auto"
+      },
+      {
+        "op": "hpi_read",
+        "port": "hpid_auto"
+      },
+      {
+        "op": "hpi_read",
+        "port": "hpia"
+      }
+    ]
+  }
+}

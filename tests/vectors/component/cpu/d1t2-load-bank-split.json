@@ -1,0 +1,35 @@
+{
+  "domain": "cpu",
+  "expected": {
+    "registers": {
+      "A4": 0,
+      "B4": 2289526357
+    }
+  },
+  "request": {
+    "action": "execute",
+    "cycles": 7,
+    "endian": "little",
+    "id": "cpu:d1t2-load-bank-split",
+    "memory": [
+      {
+        "address": 4100,
+        "hex": "55667788"
+      }
+    ],
+    "pc": 0,
+    "registers": {
+      "A12": 4096
+    },
+    "words": [
+      36708966,
+      32768,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ]
+  }
+}

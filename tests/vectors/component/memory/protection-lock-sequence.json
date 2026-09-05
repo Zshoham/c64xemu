@@ -1,0 +1,148 @@
+{
+  "domain": "memory",
+  "expected": {
+    "observations": [
+      1,
+      65535,
+      1,
+      25472272,
+      272,
+      0,
+      319
+    ]
+  },
+  "request": {
+    "action": "system",
+    "id": "memory:protection-lock-sequence",
+    "operations": [
+      {
+        "address": 25472272,
+        "op": "write32",
+        "value": 4
+      },
+      {
+        "address": 25472256,
+        "op": "write32",
+        "value": 19088743
+      },
+      {
+        "address": 25472260,
+        "op": "write32",
+        "value": 2309737967
+      },
+      {
+        "address": 25472264,
+        "op": "write32",
+        "value": 195948557
+      },
+      {
+        "address": 25472268,
+        "op": "write32",
+        "value": 1437217740
+      },
+      {
+        "address": 25472272,
+        "op": "write32",
+        "value": 2
+      },
+      {
+        "address": 25472276,
+        "op": "read32"
+      },
+      {
+        "address": 25472512,
+        "op": "write32",
+        "value": 0
+      },
+      {
+        "address": 25472512,
+        "op": "read32"
+      },
+      {
+        "address": 25472272,
+        "op": "write32",
+        "value": 4
+      },
+      {
+        "address": 25472256,
+        "op": "write32",
+        "value": 0
+      },
+      {
+        "address": 25472260,
+        "op": "write32",
+        "value": 0
+      },
+      {
+        "address": 25472264,
+        "op": "write32",
+        "value": 0
+      },
+      {
+        "address": 25472268,
+        "op": "write32",
+        "value": 0
+      },
+      {
+        "address": 25472272,
+        "op": "write32",
+        "value": 1
+      },
+      {
+        "address": 25472276,
+        "op": "read32"
+      },
+      {
+        "address": 25472000,
+        "op": "read32"
+      },
+      {
+        "address": 25472004,
+        "op": "read32"
+      },
+      {
+        "address": 25472272,
+        "op": "write32",
+        "value": 4
+      },
+      {
+        "address": 25472256,
+        "op": "write32",
+        "value": 19088743
+      },
+      {
+        "address": 25472260,
+        "op": "write32",
+        "value": 2309737967
+      },
+      {
+        "address": 25472264,
+        "op": "write32",
+        "value": 195948557
+      },
+      {
+        "address": 25472268,
+        "op": "write32",
+        "value": 1437217740
+      },
+      {
+        "address": 25472272,
+        "op": "write32",
+        "value": 1
+      },
+      {
+        "address": 25472276,
+        "op": "read32"
+      },
+      {
+        "address": 25472512,
+        "op": "write32",
+        "value": 319
+      },
+      {
+        "address": 25472512,
+        "op": "read32"
+      }
+    ]
+  }
+}

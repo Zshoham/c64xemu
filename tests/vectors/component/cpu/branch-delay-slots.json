@@ -1,0 +1,41 @@
+{
+  "domain": "cpu",
+  "expected": {
+    "registers": {
+      "A0": 1,
+      "A1": 2,
+      "A2": 3,
+      "A3": 4,
+      "A4": 5,
+      "A5": 0,
+      "A6": 0
+    }
+  },
+  "request": {
+    "action": "execute",
+    "cycles": 6,
+    "endian": "little",
+    "id": "cpu:branch-delay-slots",
+    "memory": [],
+    "pc": 0,
+    "registers": {},
+    "words": [
+      912,
+      303960,
+      8954712,
+      17605464,
+      26256216,
+      34906968,
+      44344152,
+      51946328,
+      32768,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ]
+  }
+}

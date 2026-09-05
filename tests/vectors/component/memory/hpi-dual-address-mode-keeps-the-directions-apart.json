@@ -1,0 +1,78 @@
+{
+  "domain": "memory",
+  "expected": {
+    "observations": [
+      1515847681,
+      2071658497,
+      2098737,
+      2098752
+    ]
+  },
+  "request": {
+    "action": "system",
+    "id": "memory:hpi-dual-address-mode-keeps-the-directions-apart",
+    "operations": [
+      {
+        "address": 42467376,
+        "op": "write32",
+        "value": 0
+      },
+      {
+        "op": "hpi_write",
+        "port": "hpic",
+        "value": 2560
+      },
+      {
+        "op": "hpi_write",
+        "port": "hpia",
+        "value": 2098736
+      },
+      {
+        "op": "hpi_write",
+        "port": "hpic",
+        "value": 512
+      },
+      {
+        "op": "hpi_write",
+        "port": "hpia",
+        "value": 2098752
+      },
+      {
+        "address": 8394944,
+        "op": "write32",
+        "value": 1515847681
+      },
+      {
+        "op": "hpi_read",
+        "port": "hpid_auto"
+      },
+      {
+        "op": "hpi_write",
+        "port": "hpid",
+        "value": 2071658497
+      },
+      {
+        "address": 8395008,
+        "op": "read32"
+      },
+      {
+        "op": "hpi_write",
+        "port": "hpic",
+        "value": 2560
+      },
+      {
+        "op": "hpi_read",
+        "port": "hpia"
+      },
+      {
+        "op": "hpi_write",
+        "port": "hpic",
+        "value": 512
+      },
+      {
+        "op": "hpi_read",
+        "port": "hpia"
+      }
+    ]
+  }
+}

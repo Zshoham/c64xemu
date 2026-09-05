@@ -1,0 +1,73 @@
+{
+  "domain": "memory",
+  "expected": {
+    "observations": [
+      305441741,
+      305441741,
+      null,
+      195948557
+    ]
+  },
+  "request": {
+    "action": "system",
+    "id": "memory:hpi-software-reset-holds-the-host-off",
+    "operations": [
+      {
+        "address": 42467376,
+        "op": "write32",
+        "value": 0
+      },
+      {
+        "op": "hpi_write",
+        "port": "hpic",
+        "value": 0
+      },
+      {
+        "op": "hpi_write",
+        "port": "hpia",
+        "value": 2098768
+      },
+      {
+        "op": "hpi_write",
+        "port": "hpid",
+        "value": 305441741
+      },
+      {
+        "address": 8395072,
+        "op": "read32"
+      },
+      {
+        "address": 42467376,
+        "op": "write32",
+        "value": 128
+      },
+      {
+        "op": "hpi_write",
+        "port": "hpid",
+        "value": 4294967295
+      },
+      {
+        "address": 8395072,
+        "op": "read32"
+      },
+      {
+        "op": "hpi_read",
+        "port": "hpic"
+      },
+      {
+        "address": 42467376,
+        "op": "write32",
+        "value": 0
+      },
+      {
+        "op": "hpi_write",
+        "port": "hpid",
+        "value": 195948557
+      },
+      {
+        "address": 8395072,
+        "op": "read32"
+      }
+    ]
+  }
+}

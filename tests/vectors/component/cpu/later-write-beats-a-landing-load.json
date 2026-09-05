@@ -1,0 +1,34 @@
+{
+  "domain": "cpu",
+  "expected": {
+    "registers": {
+      "A4": 85
+    }
+  },
+  "request": {
+    "action": "execute",
+    "cycles": 10,
+    "endian": "little",
+    "id": "cpu:later-write-beats-a-landing-load",
+    "memory": [
+      {
+        "address": 4096,
+        "hex": "efbeadde"
+      }
+    ],
+    "pc": 0,
+    "registers": {
+      "A5": 4096
+    },
+    "words": [
+      34865764,
+      16384,
+      33565352,
+      32768,
+      0,
+      0,
+      0,
+      0
+    ]
+  }
+}

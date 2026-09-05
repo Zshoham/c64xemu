@@ -1,0 +1,25 @@
+{
+  "domain": "timing",
+  "expected": {
+    "cycles": 1,
+    "fault": null,
+    "reached_stop": true
+  },
+  "request": {
+    "action": "execute",
+    "cycles": 200,
+    "endian": "little",
+    "id": "timing:l1d-bank-conflict-free",
+    "memory": [],
+    "pc": 14680064,
+    "registers": {
+      "A3": 15728640,
+      "B3": 15728644
+    },
+    "stop_pc": 14680072,
+    "words": [
+      34341477,
+      34341606
+    ]
+  }
+}

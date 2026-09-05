@@ -1,0 +1,16 @@
+{
+  "domain": "decoder",
+  "expected": {
+    "mnemonic": "subaw",
+    "operands": "b15,4,b15"
+  },
+  "request": {
+    "action": "decode",
+    "address": 0,
+    "endian": "little",
+    "header": 0,
+    "id": "decoder:compact-operands-stack-adjust-prints-the-word-count",
+    "width": 16,
+    "word": 36087
+  }
+}

@@ -1,0 +1,68 @@
+{
+  "domain": "memory",
+  "expected": {
+    "observations": [
+      0,
+      286331153,
+      1145324612,
+      2098692
+    ]
+  },
+  "request": {
+    "action": "system",
+    "id": "memory:hpi-autoincrement-write-bursts-on-four-words",
+    "operations": [
+      {
+        "address": 42467376,
+        "op": "write32",
+        "value": 0
+      },
+      {
+        "op": "hpi_write",
+        "port": "hpic",
+        "value": 0
+      },
+      {
+        "op": "hpi_write",
+        "port": "hpia",
+        "value": 2098688
+      },
+      {
+        "op": "hpi_write",
+        "port": "hpid_auto",
+        "value": 286331153
+      },
+      {
+        "op": "hpi_write",
+        "port": "hpid_auto",
+        "value": 572662306
+      },
+      {
+        "op": "hpi_write",
+        "port": "hpid_auto",
+        "value": 858993459
+      },
+      {
+        "address": 8394752,
+        "op": "read32"
+      },
+      {
+        "op": "hpi_write",
+        "port": "hpid_auto",
+        "value": 1145324612
+      },
+      {
+        "address": 8394752,
+        "op": "read32"
+      },
+      {
+        "address": 8394764,
+        "op": "read32"
+      },
+      {
+        "op": "hpi_read",
+        "port": "hpia"
+      }
+    ]
+  }
+}

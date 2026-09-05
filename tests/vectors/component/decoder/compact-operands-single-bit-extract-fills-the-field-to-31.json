@@ -1,0 +1,16 @@
+{
+  "domain": "decoder",
+  "expected": {
+    "mnemonic": "extu",
+    "operands": "b0,27,31,b0"
+  },
+  "request": {
+    "action": "decode",
+    "address": 0,
+    "endian": "little",
+    "header": 0,
+    "id": "decoder:compact-operands-single-bit-extract-fills-the-field-to-31",
+    "width": 16,
+    "word": 30723
+  }
+}

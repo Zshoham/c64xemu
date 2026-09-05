@@ -1,0 +1,148 @@
+{
+  "domain": "memory",
+  "expected": {
+    "observations": [
+      "44332211ddccbbaa",
+      0,
+      0
+    ]
+  },
+  "request": {
+    "action": "system",
+    "id": "memory:mcbsp-edma-services-the-data-bus",
+    "operations": [
+      {
+        "address": 8417280,
+        "hex": "44332211ddccbbaa",
+        "op": "write_bytes"
+      },
+      {
+        "address": 44040496,
+        "op": "write32",
+        "value": 512
+      },
+      {
+        "address": 44057088,
+        "op": "write32",
+        "value": 1097728
+      },
+      {
+        "address": 44057092,
+        "op": "write32",
+        "value": 8417280
+      },
+      {
+        "address": 44057096,
+        "op": "write32",
+        "value": 131076
+      },
+      {
+        "address": 44057100,
+        "op": "write32",
+        "value": 805306384
+      },
+      {
+        "address": 44057104,
+        "op": "write32",
+        "value": 4
+      },
+      {
+        "address": 44057108,
+        "op": "write32",
+        "value": 65535
+      },
+      {
+        "address": 44057116,
+        "op": "write32",
+        "value": 1
+      },
+      {
+        "address": 44040500,
+        "op": "write32",
+        "value": 544
+      },
+      {
+        "address": 44057120,
+        "op": "write32",
+        "value": 1101824
+      },
+      {
+        "address": 44057124,
+        "op": "write32",
+        "value": 805306368
+      },
+      {
+        "address": 44057128,
+        "op": "write32",
+        "value": 131076
+      },
+      {
+        "address": 44057132,
+        "op": "write32",
+        "value": 8417536
+      },
+      {
+        "address": 44057136,
+        "op": "write32",
+        "value": 262144
+      },
+      {
+        "address": 44057140,
+        "op": "write32",
+        "value": 65535
+      },
+      {
+        "address": 44057148,
+        "op": "write32",
+        "value": 1
+      },
+      {
+        "address": 44044336,
+        "op": "write32",
+        "value": 12288
+      },
+      {
+        "address": 42729484,
+        "op": "write32",
+        "value": 160
+      },
+      {
+        "address": 42729488,
+        "op": "write32",
+        "value": 160
+      },
+      {
+        "address": 42729492,
+        "op": "write32",
+        "value": 536870913
+      },
+      {
+        "address": 42729480,
+        "op": "write32",
+        "value": 12681217
+      },
+      {
+        "address": 44044304,
+        "op": "write32",
+        "value": 4096
+      },
+      {
+        "cycles": 400,
+        "op": "tick"
+      },
+      {
+        "address": 8417536,
+        "length": 8,
+        "op": "read_bytes"
+      },
+      {
+        "address": 44057096,
+        "op": "read32"
+      },
+      {
+        "address": 44057128,
+        "op": "read32"
+      }
+    ]
+  }
+}

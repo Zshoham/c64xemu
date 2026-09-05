@@ -1,0 +1,14 @@
+{
+  "domain": "decoder",
+  "expected": {
+    "mnemonic": "mpyhir"
+  },
+  "request": {
+    "action": "decode",
+    "address": 0,
+    "endian": "little",
+    "id": "decoder:mpyhir-still-decodes-beside-mpyid",
+    "width": 32,
+    "word": 17040432
+  }
+}

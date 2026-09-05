@@ -1,0 +1,35 @@
+{
+  "domain": "cpu",
+  "expected": {
+    "registers": {
+      "A1": 0,
+      "A2": 0
+    }
+  },
+  "request": {
+    "action": "execute",
+    "cycles": 4,
+    "endian": "little",
+    "id": "cpu:load-not-ready",
+    "memory": [
+      {
+        "address": 4096,
+        "hex": "11223344"
+      }
+    ],
+    "pc": 0,
+    "registers": {
+      "A0": 4096
+    },
+    "words": [
+      8389220,
+      17043416,
+      16384,
+      25432024,
+      32768,
+      0,
+      0,
+      0
+    ]
+  }
+}

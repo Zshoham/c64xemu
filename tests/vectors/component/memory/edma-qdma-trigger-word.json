@@ -1,0 +1,117 @@
+{
+  "domain": "memory",
+  "expected": {
+    "observations": [
+      0,
+      1,
+      "aabbccdd",
+      1,
+      512,
+      {
+        "$bits": {
+          "clear": 0,
+          "set": 16777216
+        }
+      },
+      1,
+      1
+    ]
+  },
+  "request": {
+    "action": "system",
+    "id": "memory:edma-qdma-trigger-word",
+    "operations": [
+      {
+        "address": 8409088,
+        "hex": "aabbccdd",
+        "op": "write_bytes"
+      },
+      {
+        "address": 44040704,
+        "op": "write32",
+        "value": 188
+      },
+      {
+        "address": 44044428,
+        "op": "write32",
+        "value": 1
+      },
+      {
+        "address": 44056736,
+        "op": "write32",
+        "value": 1085440
+      },
+      {
+        "address": 44056740,
+        "op": "write32",
+        "value": 8409088
+      },
+      {
+        "address": 44056744,
+        "op": "write32",
+        "value": 65540
+      },
+      {
+        "address": 44056748,
+        "op": "write32",
+        "value": 8409344
+      },
+      {
+        "address": 44056756,
+        "op": "write32",
+        "value": 65535
+      },
+      {
+        "address": 44044416,
+        "op": "read32"
+      },
+      {
+        "address": 44056764,
+        "op": "write32",
+        "value": 1
+      },
+      {
+        "address": 44044416,
+        "op": "read32"
+      },
+      {
+        "address": 44044384,
+        "op": "write32",
+        "value": 512
+      },
+      {
+        "cycles": 1,
+        "op": "tick"
+      },
+      {
+        "address": 8409344,
+        "length": 4,
+        "op": "read_bytes"
+      },
+      {
+        "address": 44044416,
+        "op": "read32"
+      },
+      {
+        "address": 44044392,
+        "op": "read32"
+      },
+      {
+        "address": 25165824,
+        "op": "read32"
+      },
+      {
+        "cycles": 1,
+        "op": "tick"
+      },
+      {
+        "address": 44040976,
+        "op": "read32"
+      },
+      {
+        "address": 44044432,
+        "op": "read32"
+      }
+    ]
+  }
+}

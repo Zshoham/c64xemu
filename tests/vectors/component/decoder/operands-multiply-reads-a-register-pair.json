@@ -1,0 +1,15 @@
+{
+  "domain": "decoder",
+  "expected": {
+    "mnemonic": "ddotph2",
+    "operands": "a5:a4,a8,a7:a6"
+  },
+  "request": {
+    "action": "decode",
+    "address": 0,
+    "endian": "little",
+    "id": "decoder:operands-multiply-reads-a-register-pair",
+    "width": 32,
+    "word": 320898544
+  }
+}

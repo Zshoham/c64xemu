@@ -1,0 +1,62 @@
+{
+  "domain": "memory",
+  "expected": {
+    "observations": [
+      1,
+      1073742079,
+      0,
+      8192
+    ]
+  },
+  "request": {
+    "action": "system",
+    "id": "memory:idma0-masked-configuration-write",
+    "operations": [
+      {
+        "address": 8388864,
+        "hex": "00000000ff000040",
+        "op": "write_bytes"
+      },
+      {
+        "address": 25296900,
+        "op": "write32",
+        "value": 4294967293
+      },
+      {
+        "address": 25296904,
+        "op": "write32",
+        "value": 8388864
+      },
+      {
+        "address": 25296908,
+        "op": "write32",
+        "value": 46667776
+      },
+      {
+        "address": 25296912,
+        "op": "write32",
+        "value": 268435456
+      },
+      {
+        "address": 25296896,
+        "op": "read32"
+      },
+      {
+        "cycles": 2,
+        "op": "tick"
+      },
+      {
+        "address": 46667780,
+        "op": "read32"
+      },
+      {
+        "address": 25296896,
+        "op": "read32"
+      },
+      {
+        "address": 25165824,
+        "op": "read32"
+      }
+    ]
+  }
+}

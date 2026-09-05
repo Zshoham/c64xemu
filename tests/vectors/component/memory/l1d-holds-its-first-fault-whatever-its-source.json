@@ -1,0 +1,109 @@
+{
+  "domain": "memory",
+  "expected": {
+    "observations": [
+      15728640,
+      16,
+      false,
+      15728640,
+      16,
+      {
+        "$bits": {
+          "clear": 67108864,
+          "set": 0
+        }
+      },
+      false,
+      15728656,
+      272,
+      {
+        "$bits": {
+          "clear": 0,
+          "set": 67108864
+        }
+      }
+    ]
+  },
+  "request": {
+    "action": "system",
+    "id": "memory:l1d-holds-its-first-fault-whatever-its-source",
+    "operations": [
+      {
+        "address": 25472512,
+        "op": "write32",
+        "value": 303
+      },
+      {
+        "address": 25297160,
+        "op": "write32",
+        "value": 8388608
+      },
+      {
+        "address": 25297164,
+        "op": "write32",
+        "value": 15728640
+      },
+      {
+        "address": 25297168,
+        "op": "write32",
+        "value": 4
+      },
+      {
+        "cycles": 1,
+        "op": "tick"
+      },
+      {
+        "address": 25472000,
+        "op": "read32"
+      },
+      {
+        "address": 25472004,
+        "op": "read32"
+      },
+      {
+        "address": 25165900,
+        "op": "write32",
+        "value": 134217728
+      },
+      {
+        "address": 15728656,
+        "op": "cpu_access",
+        "permission": "write"
+      },
+      {
+        "address": 25472000,
+        "op": "read32"
+      },
+      {
+        "address": 25472004,
+        "op": "read32"
+      },
+      {
+        "address": 25165836,
+        "op": "read32"
+      },
+      {
+        "address": 25472008,
+        "op": "write32",
+        "value": 1
+      },
+      {
+        "address": 15728656,
+        "op": "cpu_access",
+        "permission": "write"
+      },
+      {
+        "address": 25472000,
+        "op": "read32"
+      },
+      {
+        "address": 25472004,
+        "op": "read32"
+      },
+      {
+        "address": 25165836,
+        "op": "read32"
+      }
+    ]
+  }
+}

@@ -1,0 +1,48 @@
+{
+  "domain": "cache",
+  "expected": {
+    "observations": [
+      1,
+      0,
+      0,
+      0,
+      1
+    ]
+  },
+  "request": {
+    "action": "system",
+    "id": "cache:mar-reset-and-permissions",
+    "operations": [
+      {
+        "address": 25460736,
+        "op": "read32"
+      },
+      {
+        "address": 25460740,
+        "op": "read32"
+      },
+      {
+        "address": 25461632,
+        "op": "read32"
+      },
+      {
+        "address": 25460740,
+        "op": "write32",
+        "value": 1
+      },
+      {
+        "address": 25460740,
+        "op": "read32"
+      },
+      {
+        "address": 25461632,
+        "op": "write32",
+        "value": 1
+      },
+      {
+        "address": 25461632,
+        "op": "read32"
+      }
+    ]
+  }
+}

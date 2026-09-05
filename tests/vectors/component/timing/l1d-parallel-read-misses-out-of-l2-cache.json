@@ -1,0 +1,47 @@
+{
+  "domain": "timing",
+  "expected": {
+    "cycles": {
+      "$one_of": [
+        23,
+        24
+      ]
+    },
+    "fault": null,
+    "reached_stop": true
+  },
+  "request": {
+    "action": "execute",
+    "cycles": 200,
+    "endian": "little",
+    "id": "timing:l1d-parallel-read-misses-out-of-l2-cache",
+    "memory": [],
+    "pc": 14680064,
+    "registers": {
+      "A3": 2147483648,
+      "B3": 2147483712
+    },
+    "setup": [
+      {
+        "address": 25428032,
+        "op": "write32",
+        "value": 4
+      },
+      {
+        "address": 25427968,
+        "op": "write32",
+        "value": 4
+      },
+      {
+        "address": 25461248,
+        "op": "write32",
+        "value": 1
+      }
+    ],
+    "stop_pc": 14680072,
+    "words": [
+      34341477,
+      34341606
+    ]
+  }
+}

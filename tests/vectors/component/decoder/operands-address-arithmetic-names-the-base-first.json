@@ -1,0 +1,15 @@
+{
+  "domain": "decoder",
+  "expected": {
+    "mnemonic": "addaw",
+    "operands": "b15,129,b13"
+  },
+  "request": {
+    "action": "decode",
+    "address": 0,
+    "endian": "little",
+    "id": "decoder:operands-address-arithmetic-names-the-base-first",
+    "width": 32,
+    "word": 377520638
+  }
+}

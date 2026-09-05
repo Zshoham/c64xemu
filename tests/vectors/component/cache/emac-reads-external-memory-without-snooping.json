@@ -1,0 +1,88 @@
+{
+  "domain": "cache",
+  "expected": {
+    "observations": [
+      4294967295,
+      1144201745,
+      [
+        "ffffffffffff0200000000010800000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d"
+      ]
+    ]
+  },
+  "request": {
+    "action": "system",
+    "id": "cache:emac-reads-external-memory-without-snooping",
+    "operations": [
+      {
+        "address": 3758100480,
+        "hex": "ffffffffffff0200000000010800000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d",
+        "op": "write_bytes"
+      },
+      {
+        "address": 46669856,
+        "op": "write32",
+        "value": 0
+      },
+      {
+        "address": 46669860,
+        "op": "write32",
+        "value": 3758100480
+      },
+      {
+        "address": 46669864,
+        "op": "write32",
+        "value": 60
+      },
+      {
+        "address": 46669868,
+        "op": "write32",
+        "value": 3758096444
+      },
+      {
+        "address": 46661636,
+        "op": "write32",
+        "value": 1
+      },
+      {
+        "address": 25428032,
+        "op": "write32",
+        "value": 4
+      },
+      {
+        "address": 25461632,
+        "op": "write32",
+        "value": 1
+      },
+      {
+        "address": 3758100480,
+        "op": "read32"
+      },
+      {
+        "address": 3758100480,
+        "op": "write32",
+        "value": 1144201745
+      },
+      {
+        "address": 3758100480,
+        "op": "read32"
+      },
+      {
+        "address": 46663168,
+        "op": "write32",
+        "value": 46669856
+      },
+      {
+        "address": 46661984,
+        "op": "write32",
+        "value": 32
+      },
+      {
+        "cycles": 64,
+        "op": "tick"
+      },
+      {
+        "op": "take_tx_frames"
+      }
+    ]
+  }
+}

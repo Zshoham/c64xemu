@@ -1,0 +1,38 @@
+{
+  "domain": "cpu",
+  "expected": {
+    "registers": {
+      "B5": 287454020,
+      "B7": 0,
+      "B8": 3735928559
+    }
+  },
+  "request": {
+    "action": "execute",
+    "cycles": 30,
+    "endian": "little",
+    "id": "cpu:linked-atomic-intervening-store-fails",
+    "memory": [
+      {
+        "address": 4096,
+        "hex": "44332211"
+      }
+    ],
+    "pc": 0,
+    "registers": {
+      "B4": 4096,
+      "B6": 2864434397,
+      "B9": 3735928559
+    },
+    "words": [
+      42993218,
+      24576,
+      76546806,
+      51381954,
+      59770690,
+      24576,
+      68158182,
+      3759144960
+    ]
+  }
+}

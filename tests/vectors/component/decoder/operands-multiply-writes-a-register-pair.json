@@ -1,0 +1,15 @@
+{
+  "domain": "decoder",
+  "expected": {
+    "mnemonic": "mpy32",
+    "operands": "a3,a4,a7:a6"
+  },
+  "request": {
+    "action": "decode",
+    "address": 0,
+    "endian": "little",
+    "id": "decoder:operands-multiply-writes-a-register-pair",
+    "width": 32,
+    "word": 51407360
+  }
+}

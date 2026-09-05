@@ -1,0 +1,88 @@
+{
+  "domain": "memory",
+  "expected": {
+    "observations": [
+      65535,
+      131071,
+      0,
+      0,
+      3,
+      2,
+      1,
+      0,
+      1
+    ]
+  },
+  "request": {
+    "action": "system",
+    "id": "memory:power-down-control-registers",
+    "operations": [
+      {
+        "address": 25231360,
+        "op": "read32"
+      },
+      {
+        "address": 25231360,
+        "op": "write32",
+        "value": 65536
+      },
+      {
+        "address": 25231360,
+        "op": "read32"
+      },
+      {
+        "address": 25477216,
+        "op": "read32"
+      },
+      {
+        "address": 25477220,
+        "op": "read32"
+      },
+      {
+        "address": 25477200,
+        "op": "write32",
+        "value": 3
+      },
+      {
+        "address": 25477204,
+        "op": "write32",
+        "value": 2
+      },
+      {
+        "address": 25477216,
+        "op": "read32"
+      },
+      {
+        "address": 25477220,
+        "op": "read32"
+      },
+      {
+        "address": 25477184,
+        "op": "write32",
+        "value": 2
+      },
+      {
+        "address": 25477188,
+        "op": "write32",
+        "value": 2
+      },
+      {
+        "address": 25477216,
+        "op": "read32"
+      },
+      {
+        "address": 25477220,
+        "op": "read32"
+      },
+      {
+        "address": 25477216,
+        "op": "write32",
+        "value": 3
+      },
+      {
+        "address": 25477216,
+        "op": "read32"
+      }
+    ]
+  }
+}

@@ -1,0 +1,68 @@
+{
+  "domain": "ethernet",
+  "expected": {
+    "observations": [
+      789000,
+      789000,
+      1518,
+      131096,
+      0,
+      1518,
+      131096,
+      0
+    ]
+  },
+  "request": {
+    "action": "system",
+    "id": "emac:identification-defaults-and-reset",
+    "operations": [
+      {
+        "address": 46661632,
+        "op": "read32"
+      },
+      {
+        "address": 46661648,
+        "op": "read32"
+      },
+      {
+        "address": 46661900,
+        "op": "read32"
+      },
+      {
+        "address": 46661996,
+        "op": "read32"
+      },
+      {
+        "address": 46661636,
+        "op": "write32",
+        "value": 1
+      },
+      {
+        "address": 46661900,
+        "op": "write32",
+        "value": 64
+      },
+      {
+        "address": 46662004,
+        "op": "write32",
+        "value": 1
+      },
+      {
+        "address": 46661636,
+        "op": "read32"
+      },
+      {
+        "address": 46661900,
+        "op": "read32"
+      },
+      {
+        "address": 46661996,
+        "op": "read32"
+      },
+      {
+        "address": 46662004,
+        "op": "read32"
+      }
+    ]
+  }
+}

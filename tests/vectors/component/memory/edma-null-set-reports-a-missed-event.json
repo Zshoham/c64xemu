@@ -1,0 +1,62 @@
+{
+  "domain": "memory",
+  "expected": {
+    "observations": [
+      4,
+      4,
+      0,
+      0,
+      0
+    ]
+  },
+  "request": {
+    "action": "system",
+    "id": "memory:edma-null-set-reports-a-missed-event",
+    "operations": [
+      {
+        "address": 44040456,
+        "op": "write32",
+        "value": 64
+      },
+      {
+        "address": 44044304,
+        "op": "write32",
+        "value": 4
+      },
+      {
+        "cycles": 1,
+        "op": "tick"
+      },
+      {
+        "address": 44040960,
+        "op": "read32"
+      },
+      {
+        "address": 44044344,
+        "op": "read32"
+      },
+      {
+        "address": 44044392,
+        "op": "read32"
+      },
+      {
+        "address": 44040968,
+        "op": "write32",
+        "value": 4
+      },
+      {
+        "address": 44044352,
+        "op": "write32",
+        "value": 4
+      },
+      {
+        "address": 44040960,
+        "op": "read32"
+      },
+      {
+        "address": 44044344,
+        "op": "read32"
+      }
+    ]
+  }
+}

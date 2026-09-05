@@ -1,0 +1,234 @@
+{
+  "domain": "memory",
+  "expected": {
+    "observations": [
+      65792,
+      65792,
+      65,
+      66,
+      196624,
+      0,
+      "05060708",
+      "00000000",
+      "01020304",
+      1,
+      16908801,
+      {
+        "$bits": {
+          "clear": 0,
+          "set": 32768
+        }
+      },
+      0,
+      513
+    ]
+  },
+  "request": {
+    "action": "system",
+    "id": "memory:edma-event-queues-and-watermark",
+    "operations": [
+      {
+        "address": 8433664,
+        "hex": "01020304",
+        "op": "write_bytes"
+      },
+      {
+        "address": 8433920,
+        "hex": "05060708",
+        "op": "write_bytes"
+      },
+      {
+        "address": 8434176,
+        "hex": "090A0B0C",
+        "op": "write_bytes"
+      },
+      {
+        "address": 44040452,
+        "op": "write32",
+        "value": 96
+      },
+      {
+        "address": 44040456,
+        "op": "write32",
+        "value": 128
+      },
+      {
+        "address": 44040460,
+        "op": "write32",
+        "value": 160
+      },
+      {
+        "address": 44040768,
+        "op": "write32",
+        "value": 256
+      },
+      {
+        "address": 44040836,
+        "op": "write32",
+        "value": 1
+      },
+      {
+        "address": 44041760,
+        "op": "write32",
+        "value": 269488130
+      },
+      {
+        "address": 44056676,
+        "op": "write32",
+        "value": 8433664
+      },
+      {
+        "address": 44056680,
+        "op": "write32",
+        "value": 65540
+      },
+      {
+        "address": 44056684,
+        "op": "write32",
+        "value": 8434432
+      },
+      {
+        "address": 44056692,
+        "op": "write32",
+        "value": 65535
+      },
+      {
+        "address": 44056700,
+        "op": "write32",
+        "value": 1
+      },
+      {
+        "address": 44056708,
+        "op": "write32",
+        "value": 8433920
+      },
+      {
+        "address": 44056712,
+        "op": "write32",
+        "value": 65540
+      },
+      {
+        "address": 44056716,
+        "op": "write32",
+        "value": 8434688
+      },
+      {
+        "address": 44056724,
+        "op": "write32",
+        "value": 65535
+      },
+      {
+        "address": 44056732,
+        "op": "write32",
+        "value": 1
+      },
+      {
+        "address": 44056740,
+        "op": "write32",
+        "value": 8434176
+      },
+      {
+        "address": 44056744,
+        "op": "write32",
+        "value": 65540
+      },
+      {
+        "address": 44056748,
+        "op": "write32",
+        "value": 8434944
+      },
+      {
+        "address": 44056756,
+        "op": "write32",
+        "value": 65535
+      },
+      {
+        "address": 44056764,
+        "op": "write32",
+        "value": 1
+      },
+      {
+        "address": 44044304,
+        "op": "write32",
+        "value": 6
+      },
+      {
+        "address": 44041728,
+        "op": "read32"
+      },
+      {
+        "address": 44041732,
+        "op": "read32"
+      },
+      {
+        "address": 44041216,
+        "op": "read32"
+      },
+      {
+        "address": 44041280,
+        "op": "read32"
+      },
+      {
+        "address": 44041792,
+        "op": "read32"
+      },
+      {
+        "address": 44040984,
+        "op": "read32"
+      },
+      {
+        "cycles": 1,
+        "op": "tick"
+      },
+      {
+        "address": 8434688,
+        "length": 4,
+        "op": "read_bytes"
+      },
+      {
+        "address": 8434432,
+        "length": 4,
+        "op": "read_bytes"
+      },
+      {
+        "cycles": 1,
+        "op": "tick"
+      },
+      {
+        "address": 8434432,
+        "length": 4,
+        "op": "read_bytes"
+      },
+      {
+        "address": 44044304,
+        "op": "write32",
+        "value": 10
+      },
+      {
+        "address": 44040984,
+        "op": "read32"
+      },
+      {
+        "address": 44041728,
+        "op": "read32"
+      },
+      {
+        "address": 25165832,
+        "op": "read32"
+      },
+      {
+        "address": 44040988,
+        "op": "write32",
+        "value": 1
+      },
+      {
+        "address": 44040984,
+        "op": "read32"
+      },
+      {
+        "address": 44041728,
+        "op": "read32"
+      }
+    ]
+  }
+}

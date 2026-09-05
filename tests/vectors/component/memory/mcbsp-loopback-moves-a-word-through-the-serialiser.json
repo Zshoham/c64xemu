@@ -1,0 +1,111 @@
+{
+  "domain": "memory",
+  "expected": {
+    "observations": [
+      393216,
+      536870913,
+      {
+        "$bits": {
+          "clear": 262144,
+          "set": 131072
+        }
+      },
+      {
+        "$bits": {
+          "clear": 2,
+          "set": 0
+        }
+      },
+      {
+        "$bits": {
+          "clear": 0,
+          "set": 262146
+        }
+      },
+      48879,
+      {
+        "$bits": {
+          "clear": 2,
+          "set": 0
+        }
+      },
+      {
+        "$bits": {
+          "clear": 0,
+          "set": 12288
+        }
+      }
+    ]
+  },
+  "request": {
+    "action": "system",
+    "id": "memory:mcbsp-loopback-moves-a-word-through-the-serialiser",
+    "operations": [
+      {
+        "address": 42729480,
+        "op": "read32"
+      },
+      {
+        "address": 42729492,
+        "op": "read32"
+      },
+      {
+        "address": 42729484,
+        "op": "write32",
+        "value": 64
+      },
+      {
+        "address": 42729488,
+        "op": "write32",
+        "value": 64
+      },
+      {
+        "address": 42729492,
+        "op": "write32",
+        "value": 536870913
+      },
+      {
+        "address": 42729480,
+        "op": "write32",
+        "value": 12681217
+      },
+      {
+        "address": 42729476,
+        "op": "write32",
+        "value": 48879
+      },
+      {
+        "address": 42729480,
+        "op": "read32"
+      },
+      {
+        "cycles": 30,
+        "op": "tick"
+      },
+      {
+        "address": 42729480,
+        "op": "read32"
+      },
+      {
+        "cycles": 2,
+        "op": "tick"
+      },
+      {
+        "address": 42729480,
+        "op": "read32"
+      },
+      {
+        "address": 42729472,
+        "op": "read32"
+      },
+      {
+        "address": 42729480,
+        "op": "read32"
+      },
+      {
+        "address": 44044288,
+        "op": "read32"
+      }
+    ]
+  }
+}

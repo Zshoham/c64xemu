@@ -1,0 +1,128 @@
+{
+  "domain": "memory",
+  "expected": {
+    "observations": [
+      "00000000",
+      "5a5aa5a5",
+      0,
+      128,
+      {
+        "$bits": {
+          "clear": 0,
+          "set": 2097152
+        }
+      }
+    ]
+  },
+  "request": {
+    "action": "system",
+    "id": "memory:gpio-event-triggers-edma-transfer",
+    "operations": [
+      {
+        "address": 8421376,
+        "hex": "5a5aa5a5",
+        "op": "write_bytes"
+      },
+      {
+        "address": 44040648,
+        "op": "write32",
+        "value": 192
+      },
+      {
+        "address": 44056768,
+        "op": "write32",
+        "value": 1077248
+      },
+      {
+        "address": 44056772,
+        "op": "write32",
+        "value": 8421376
+      },
+      {
+        "address": 44056776,
+        "op": "write32",
+        "value": 65540
+      },
+      {
+        "address": 44056780,
+        "op": "write32",
+        "value": 8421632
+      },
+      {
+        "address": 44056788,
+        "op": "write32",
+        "value": 65535
+      },
+      {
+        "address": 44056796,
+        "op": "write32",
+        "value": 1
+      },
+      {
+        "address": 44044340,
+        "op": "write32",
+        "value": 262144
+      },
+      {
+        "address": 44044384,
+        "op": "write32",
+        "value": 128
+      },
+      {
+        "address": 45088784,
+        "op": "write32",
+        "value": 65531
+      },
+      {
+        "address": 45088776,
+        "op": "write32",
+        "value": 1
+      },
+      {
+        "address": 45088812,
+        "op": "write32",
+        "value": 4
+      },
+      {
+        "address": 45088792,
+        "op": "write32",
+        "value": 4
+      },
+      {
+        "cycles": 12,
+        "op": "tick"
+      },
+      {
+        "address": 8421632,
+        "length": 4,
+        "op": "read_bytes"
+      },
+      {
+        "address": 45088796,
+        "op": "write32",
+        "value": 4
+      },
+      {
+        "cycles": 12,
+        "op": "tick"
+      },
+      {
+        "address": 8421632,
+        "length": 4,
+        "op": "read_bytes"
+      },
+      {
+        "address": 44044292,
+        "op": "read32"
+      },
+      {
+        "address": 44044392,
+        "op": "read32"
+      },
+      {
+        "address": 25165828,
+        "op": "read32"
+      }
+    ]
+  }
+}

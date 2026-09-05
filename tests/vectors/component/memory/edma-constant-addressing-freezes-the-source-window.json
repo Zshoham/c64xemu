@@ -1,0 +1,102 @@
+{
+  "domain": "memory",
+  "expected": {
+    "observations": [
+      1060865,
+      8413184,
+      8413184,
+      8413728,
+      2304,
+      0
+    ]
+  },
+  "request": {
+    "action": "system",
+    "id": "memory:edma-constant-addressing-freezes-the-source-window",
+    "operations": [
+      {
+        "address": 44040768,
+        "op": "write32",
+        "value": 16
+      },
+      {
+        "address": 44040452,
+        "op": "write32",
+        "value": 192
+      },
+      {
+        "address": 44056768,
+        "op": "write32",
+        "value": 1060877
+      },
+      {
+        "address": 44056772,
+        "op": "write32",
+        "value": 8413184
+      },
+      {
+        "address": 44056776,
+        "op": "write32",
+        "value": 131104
+      },
+      {
+        "address": 44056780,
+        "op": "write32",
+        "value": 8413696
+      },
+      {
+        "address": 44056784,
+        "op": "write32",
+        "value": 2097184
+      },
+      {
+        "address": 44056788,
+        "op": "write32",
+        "value": 65535
+      },
+      {
+        "address": 44056792,
+        "op": "write32",
+        "value": 0
+      },
+      {
+        "address": 44056796,
+        "op": "write32",
+        "value": 1
+      },
+      {
+        "address": 44044304,
+        "op": "write32",
+        "value": 2
+      },
+      {
+        "cycles": 1,
+        "op": "tick"
+      },
+      {
+        "address": 44204608,
+        "op": "read32"
+      },
+      {
+        "address": 44204612,
+        "op": "read32"
+      },
+      {
+        "address": 44204636,
+        "op": "read32"
+      },
+      {
+        "address": 44204812,
+        "op": "read32"
+      },
+      {
+        "address": 44204288,
+        "op": "read32"
+      },
+      {
+        "address": 44171840,
+        "op": "read32"
+      }
+    ]
+  }
+}

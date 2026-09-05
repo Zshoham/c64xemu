@@ -1,0 +1,14 @@
+{
+  "domain": "decoder",
+  "expected": {
+    "operands": "a1,b2,a3"
+  },
+  "request": {
+    "action": "decode",
+    "address": 0,
+    "endian": "little",
+    "id": "decoder:operands-cross-path-second-source",
+    "width": 32,
+    "word": 25705208
+  }
+}

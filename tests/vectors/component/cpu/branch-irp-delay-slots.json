@@ -1,0 +1,39 @@
+{
+  "domain": "cpu",
+  "expected": {
+    "registers": {
+      "A1": 1,
+      "A3": 3,
+      "A9": 0
+    }
+  },
+  "request": {
+    "action": "execute",
+    "cycles": 12,
+    "endian": "little",
+    "id": "cpu:branch-irp-delay-slots",
+    "memory": [],
+    "pc": 0,
+    "registers": {
+      "B4": 32
+    },
+    "words": [
+      51381154,
+      24576,
+      1573090,
+      8692568,
+      24576,
+      77898584,
+      32768,
+      0,
+      25994072,
+      32768,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ]
+  }
+}

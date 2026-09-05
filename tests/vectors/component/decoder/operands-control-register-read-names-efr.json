@@ -1,0 +1,15 @@
+{
+  "domain": "decoder",
+  "expected": {
+    "mnemonic": "mvc",
+    "operands": "efr,b11"
+  },
+  "request": {
+    "action": "decode",
+    "address": 0,
+    "endian": "little",
+    "id": "decoder:operands-control-register-read-names-efr",
+    "width": 32,
+    "word": 99877858
+  }
+}

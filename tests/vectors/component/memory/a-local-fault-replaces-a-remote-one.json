@@ -1,0 +1,148 @@
+{
+  "domain": "memory",
+  "expected": {
+    "observations": [
+      8454144,
+      16,
+      {
+        "$bits": {
+          "clear": 268435456,
+          "set": 536870912
+        }
+      },
+      false,
+      8454148,
+      272,
+      {
+        "$bits": {
+          "clear": 0,
+          "set": 268435456
+        }
+      },
+      false,
+      8454148,
+      272,
+      8454148,
+      272,
+      {
+        "$bits": {
+          "clear": 805306368,
+          "set": 0
+        }
+      }
+    ]
+  },
+  "request": {
+    "action": "system",
+    "id": "memory:a-local-fault-replaces-a-remote-one",
+    "operations": [
+      {
+        "address": 25469444,
+        "op": "write32",
+        "value": 303
+      },
+      {
+        "address": 25297160,
+        "op": "write32",
+        "value": 8388608
+      },
+      {
+        "address": 25297164,
+        "op": "write32",
+        "value": 8454144
+      },
+      {
+        "address": 25297168,
+        "op": "write32",
+        "value": 4
+      },
+      {
+        "cycles": 1,
+        "op": "tick"
+      },
+      {
+        "address": 25468928,
+        "op": "read32"
+      },
+      {
+        "address": 25468932,
+        "op": "read32"
+      },
+      {
+        "address": 25165836,
+        "op": "read32"
+      },
+      {
+        "address": 25165900,
+        "op": "write32",
+        "value": 536870912
+      },
+      {
+        "address": 8454148,
+        "op": "cpu_access",
+        "permission": "write"
+      },
+      {
+        "address": 25468928,
+        "op": "read32"
+      },
+      {
+        "address": 25468932,
+        "op": "read32"
+      },
+      {
+        "address": 25165836,
+        "op": "read32"
+      },
+      {
+        "address": 8454152,
+        "op": "cpu_access",
+        "permission": "write"
+      },
+      {
+        "address": 25468928,
+        "op": "read32"
+      },
+      {
+        "address": 25468932,
+        "op": "read32"
+      },
+      {
+        "address": 25165900,
+        "op": "write32",
+        "value": 268435456
+      },
+      {
+        "address": 25297160,
+        "op": "write32",
+        "value": 8388608
+      },
+      {
+        "address": 25297164,
+        "op": "write32",
+        "value": 8454144
+      },
+      {
+        "address": 25297168,
+        "op": "write32",
+        "value": 4
+      },
+      {
+        "cycles": 1,
+        "op": "tick"
+      },
+      {
+        "address": 25468928,
+        "op": "read32"
+      },
+      {
+        "address": 25468932,
+        "op": "read32"
+      },
+      {
+        "address": 25165836,
+        "op": "read32"
+      }
+    ]
+  }
+}

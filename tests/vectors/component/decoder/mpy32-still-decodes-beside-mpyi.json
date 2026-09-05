@@ -1,0 +1,14 @@
+{
+  "domain": "decoder",
+  "expected": {
+    "mnemonic": "mpy32"
+  },
+  "request": {
+    "action": "decode",
+    "address": 0,
+    "endian": "little",
+    "id": "decoder:mpy32-still-decodes-beside-mpyi",
+    "width": 32,
+    "word": 17041408
+  }
+}

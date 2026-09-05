@@ -1,0 +1,71 @@
+{
+  "domain": "cpu",
+  "expected": {
+    "registers": {},
+    "system": {
+      "25165836": 0,
+      "25166208": 0
+    }
+  },
+  "request": {
+    "action": "execute",
+    "controls": {
+      "4": 18
+    },
+    "cycles": 8,
+    "endian": "little",
+    "id": "cpu:dropped-interrupt-mask",
+    "memory": [],
+    "observe_system": [
+      25166208,
+      25165836
+    ],
+    "pc": 0,
+    "registers": {},
+    "setup": [
+      {
+        "address": 25166084,
+        "op": "write32",
+        "value": 117835028
+      },
+      {
+        "address": 25165856,
+        "op": "write32",
+        "value": 1048576
+      },
+      {
+        "address": 25166216,
+        "op": "write32",
+        "value": 16
+      }
+    ],
+    "system_events": [
+      {
+        "address": 25165888,
+        "cycle": 3,
+        "op": "write32",
+        "value": 1048576
+      },
+      {
+        "address": 25165856,
+        "cycle": 4,
+        "op": "write32",
+        "value": 1048576
+      }
+    ],
+    "words": [
+      34611288,
+      34611288,
+      34611288,
+      34611288,
+      34611288,
+      34611288,
+      34611288,
+      34611288,
+      34611288,
+      34611288,
+      34611288,
+      34611288
+    ]
+  }
+}

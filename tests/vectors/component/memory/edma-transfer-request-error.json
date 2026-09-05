@@ -1,0 +1,103 @@
+{
+  "domain": "memory",
+  "expected": {
+    "observations": [
+      "00000000",
+      4,
+      68864,
+      {
+        "$bits": {
+          "clear": 0,
+          "set": 262144
+        }
+      },
+      0
+    ]
+  },
+  "request": {
+    "action": "system",
+    "id": "memory:edma-transfer-request-error",
+    "operations": [
+      {
+        "address": 8429568,
+        "hex": "deadbeef",
+        "op": "write_bytes"
+      },
+      {
+        "address": 44040460,
+        "op": "write32",
+        "value": 256
+      },
+      {
+        "address": 44040768,
+        "op": "write32",
+        "value": 4096
+      },
+      {
+        "address": 44204324,
+        "op": "write32",
+        "value": 15
+      },
+      {
+        "address": 44056832,
+        "op": "write32",
+        "value": 1101825
+      },
+      {
+        "address": 44056836,
+        "op": "write32",
+        "value": 8429572
+      },
+      {
+        "address": 44056840,
+        "op": "write32",
+        "value": 65540
+      },
+      {
+        "address": 44056844,
+        "op": "write32",
+        "value": 8429824
+      },
+      {
+        "address": 44056852,
+        "op": "write32",
+        "value": 65535
+      },
+      {
+        "address": 44056860,
+        "op": "write32",
+        "value": 1
+      },
+      {
+        "address": 44044304,
+        "op": "write32",
+        "value": 8
+      },
+      {
+        "cycles": 2,
+        "op": "tick"
+      },
+      {
+        "address": 8429824,
+        "length": 4,
+        "op": "read_bytes"
+      },
+      {
+        "address": 44204320,
+        "op": "read32"
+      },
+      {
+        "address": 44204332,
+        "op": "read32"
+      },
+      {
+        "address": 25165832,
+        "op": "read32"
+      },
+      {
+        "address": 44171552,
+        "op": "read32"
+      }
+    ]
+  }
+}

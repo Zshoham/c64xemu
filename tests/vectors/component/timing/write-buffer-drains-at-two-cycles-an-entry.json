@@ -1,0 +1,44 @@
+{
+  "domain": "timing",
+  "expected": {
+    "cycles": {
+      "$one_of": [
+        21,
+        22
+      ]
+    },
+    "fault": null,
+    "reached_stop": true
+  },
+  "request": {
+    "action": "execute",
+    "cycles": 200,
+    "endian": "little",
+    "id": "timing:write-buffer-drains-at-two-cycles-an-entry",
+    "memory": [],
+    "pc": 14680064,
+    "registers": {
+      "A11": 8388864,
+      "A3": 8388608,
+      "A4": 305419896,
+      "A5": 8388672,
+      "A7": 8388736,
+      "A9": 8388800
+    },
+    "setup": [
+      {
+        "address": 25428032,
+        "op": "write32",
+        "value": 4
+      }
+    ],
+    "stop_pc": 14680084,
+    "words": [
+      34341492,
+      34865780,
+      35390068,
+      35914356,
+      36438628
+    ]
+  }
+}

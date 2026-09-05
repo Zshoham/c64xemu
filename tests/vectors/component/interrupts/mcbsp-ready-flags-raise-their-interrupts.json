@@ -1,0 +1,125 @@
+{
+  "domain": "interrupts",
+  "expected": {
+    "observations": [
+      {
+        "$bits": {
+          "clear": 0,
+          "set": 768
+        }
+      },
+      393216,
+      66,
+      {
+        "$bits": {
+          "clear": 768,
+          "set": 0
+        }
+      },
+      {
+        "$bits": {
+          "clear": 131074,
+          "set": 262144
+        }
+      },
+      67,
+      {
+        "$bits": {
+          "clear": 0,
+          "set": 768
+        }
+      }
+    ]
+  },
+  "request": {
+    "action": "system",
+    "id": "interrupts:mcbsp-ready-flags-raise-their-interrupts",
+    "operations": [
+      {
+        "address": 42729484,
+        "op": "write32",
+        "value": 0
+      },
+      {
+        "address": 42729488,
+        "op": "write32",
+        "value": 0
+      },
+      {
+        "address": 42729492,
+        "op": "write32",
+        "value": 536870912
+      },
+      {
+        "address": 42729480,
+        "op": "write32",
+        "value": 12681217
+      },
+      {
+        "address": 42729476,
+        "op": "write32",
+        "value": 66
+      },
+      {
+        "cycles": 8,
+        "op": "tick"
+      },
+      {
+        "address": 25165828,
+        "op": "read32"
+      },
+      {
+        "address": 42991624,
+        "op": "read32"
+      },
+      {
+        "address": 42729472,
+        "op": "read32"
+      },
+      {
+        "address": 25165892,
+        "op": "write32",
+        "value": 768
+      },
+      {
+        "address": 42729480,
+        "op": "write32",
+        "value": 98305
+      },
+      {
+        "address": 42729476,
+        "op": "write32",
+        "value": 67
+      },
+      {
+        "cycles": 64,
+        "op": "tick"
+      },
+      {
+        "address": 25165828,
+        "op": "read32"
+      },
+      {
+        "address": 42729480,
+        "op": "read32"
+      },
+      {
+        "address": 42729480,
+        "op": "write32",
+        "value": 12681217
+      },
+      {
+        "cycles": 8,
+        "op": "tick"
+      },
+      {
+        "address": 42729472,
+        "op": "read32"
+      },
+      {
+        "address": 25165828,
+        "op": "read32"
+      }
+    ]
+  }
+}

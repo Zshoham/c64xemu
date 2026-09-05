@@ -1,0 +1,14 @@
+{
+  "domain": "decoder",
+  "expected": {
+    "mnemonic": "mpy32u"
+  },
+  "request": {
+    "action": "decode",
+    "address": 0,
+    "endian": "little",
+    "id": "decoder:mpy32u-still-decodes-beside-mpydp",
+    "width": 32,
+    "word": 17040944
+  }
+}

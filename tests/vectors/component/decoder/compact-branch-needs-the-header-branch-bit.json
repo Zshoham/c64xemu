@@ -1,0 +1,15 @@
+{
+  "domain": "decoder",
+  "expected": {
+    "mnemonic": "bnop"
+  },
+  "request": {
+    "action": "decode",
+    "address": 0,
+    "endian": "little",
+    "header": 32768,
+    "id": "decoder:compact-branch-needs-the-header-branch-bit",
+    "width": 16,
+    "word": 3850
+  }
+}

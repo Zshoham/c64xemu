@@ -1,0 +1,61 @@
+{
+  "domain": "memory",
+  "expected": {
+    "observations": [
+      305419896,
+      4660,
+      22136
+    ]
+  },
+  "request": {
+    "action": "system",
+    "id": "memory:hpi-16-bit-halfwords-most-significant-first",
+    "operations": [
+      {
+        "address": 42467376,
+        "op": "write32",
+        "value": 0
+      },
+      {
+        "op": "hpi_write",
+        "port": "hpic",
+        "value": 0
+      },
+      {
+        "op": "hpi_write16",
+        "port": "hpia",
+        "value": 32
+      },
+      {
+        "op": "hpi_write16",
+        "port": "hpia",
+        "second": true,
+        "value": 1664
+      },
+      {
+        "op": "hpi_write16",
+        "port": "hpid",
+        "value": 4660
+      },
+      {
+        "op": "hpi_write16",
+        "port": "hpid",
+        "second": true,
+        "value": 22136
+      },
+      {
+        "address": 8395264,
+        "op": "read32"
+      },
+      {
+        "op": "hpi_read16",
+        "port": "hpid"
+      },
+      {
+        "op": "hpi_read16",
+        "port": "hpid",
+        "second": true
+      }
+    ]
+  }
+}

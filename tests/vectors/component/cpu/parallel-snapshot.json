@@ -1,0 +1,28 @@
+{
+  "domain": "cpu",
+  "expected": {
+    "registers": {
+      "A0": 2,
+      "A1": 1
+    }
+  },
+  "request": {
+    "action": "execute",
+    "cycles": 8,
+    "endian": "little",
+    "id": "cpu:parallel-snapshot",
+    "memory": [],
+    "pc": 0,
+    "registers": {},
+    "words": [
+      303960,
+      8954712,
+      8392665,
+      263840,
+      32768,
+      0,
+      0,
+      0
+    ]
+  }
+}

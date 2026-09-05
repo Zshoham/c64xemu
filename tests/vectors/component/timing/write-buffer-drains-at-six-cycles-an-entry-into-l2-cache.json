@@ -1,0 +1,54 @@
+{
+  "domain": "timing",
+  "expected": {
+    "cycles": {
+      "$one_of": [
+        39,
+        40
+      ]
+    },
+    "fault": null,
+    "reached_stop": true
+  },
+  "request": {
+    "action": "execute",
+    "cycles": 200,
+    "endian": "little",
+    "id": "timing:write-buffer-drains-at-six-cycles-an-entry-into-l2-cache",
+    "memory": [],
+    "pc": 14680064,
+    "registers": {
+      "A11": 2147483904,
+      "A3": 2147483648,
+      "A4": 305419896,
+      "A5": 2147483712,
+      "A7": 2147483776,
+      "A9": 2147483840
+    },
+    "setup": [
+      {
+        "address": 25428032,
+        "op": "write32",
+        "value": 4
+      },
+      {
+        "address": 25427968,
+        "op": "write32",
+        "value": 4
+      },
+      {
+        "address": 25461248,
+        "op": "write32",
+        "value": 1
+      }
+    ],
+    "stop_pc": 14680084,
+    "words": [
+      34341492,
+      34865780,
+      35390068,
+      35914356,
+      36438628
+    ]
+  }
+}

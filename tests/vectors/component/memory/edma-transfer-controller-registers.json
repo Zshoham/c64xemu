@@ -1,0 +1,103 @@
+{
+  "domain": "memory",
+  "expected": {
+    "observations": [
+      53691429,
+      290,
+      546,
+      547,
+      256,
+      0,
+      7,
+      0,
+      {
+        "$bits": {
+          "clear": 131072,
+          "set": 0
+        }
+      },
+      0,
+      8,
+      {
+        "$bits": {
+          "clear": 0,
+          "set": 131072
+        }
+      },
+      0
+    ]
+  },
+  "request": {
+    "action": "system",
+    "id": "memory:edma-transfer-controller-registers",
+    "operations": [
+      {
+        "address": 44171264,
+        "op": "read32"
+      },
+      {
+        "address": 44171268,
+        "op": "read32"
+      },
+      {
+        "address": 44204036,
+        "op": "read32"
+      },
+      {
+        "address": 44269572,
+        "op": "read32"
+      },
+      {
+        "address": 44171520,
+        "op": "read32"
+      },
+      {
+        "address": 44171552,
+        "op": "read32"
+      },
+      {
+        "address": 44171584,
+        "op": "write32",
+        "value": 65535
+      },
+      {
+        "address": 44171584,
+        "op": "read32"
+      },
+      {
+        "address": 44171844,
+        "op": "read32"
+      },
+      {
+        "address": 25165832,
+        "op": "read32"
+      },
+      {
+        "address": 44171556,
+        "op": "write32",
+        "value": 15
+      },
+      {
+        "address": 44171776,
+        "op": "read32"
+      },
+      {
+        "address": 44171552,
+        "op": "read32"
+      },
+      {
+        "address": 25165832,
+        "op": "read32"
+      },
+      {
+        "address": 44171560,
+        "op": "write32",
+        "value": 8
+      },
+      {
+        "address": 44171552,
+        "op": "read32"
+      }
+    ]
+  }
+}

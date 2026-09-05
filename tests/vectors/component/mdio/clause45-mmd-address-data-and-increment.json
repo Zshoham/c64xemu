@@ -1,0 +1,195 @@
+{
+  "domain": "ethernet",
+  "expected": {
+    "observations": [
+      536919791,
+      536875281,
+      536879650
+    ]
+  },
+  "request": {
+    "action": "system",
+    "id": "mdio:clause45-mmd-address-data-and-increment",
+    "operations": [
+      {
+        "address": 46667780,
+        "op": "write32",
+        "value": 1073742079
+      },
+      {
+        "address": 46667904,
+        "op": "write32",
+        "value": 3248488451
+      },
+      {
+        "cycles": 16,
+        "op": "tick"
+      },
+      {
+        "address": 46667904,
+        "op": "write32",
+        "value": 3250590260
+      },
+      {
+        "cycles": 16,
+        "op": "tick"
+      },
+      {
+        "address": 46667904,
+        "op": "write32",
+        "value": 3248504835
+      },
+      {
+        "cycles": 16,
+        "op": "tick"
+      },
+      {
+        "address": 46667904,
+        "op": "write32",
+        "value": 3250634479
+      },
+      {
+        "cycles": 16,
+        "op": "tick"
+      },
+      {
+        "address": 46667904,
+        "op": "write32",
+        "value": 3248488451
+      },
+      {
+        "cycles": 16,
+        "op": "tick"
+      },
+      {
+        "address": 46667904,
+        "op": "write32",
+        "value": 3250590260
+      },
+      {
+        "cycles": 16,
+        "op": "tick"
+      },
+      {
+        "address": 46667904,
+        "op": "write32",
+        "value": 3248504835
+      },
+      {
+        "cycles": 16,
+        "op": "tick"
+      },
+      {
+        "address": 46667904,
+        "op": "write32",
+        "value": 2176843776
+      },
+      {
+        "cycles": 16,
+        "op": "tick"
+      },
+      {
+        "address": 46667904,
+        "op": "read32"
+      },
+      {
+        "address": 46667904,
+        "op": "write32",
+        "value": 3248488451
+      },
+      {
+        "cycles": 16,
+        "op": "tick"
+      },
+      {
+        "address": 46667904,
+        "op": "write32",
+        "value": 3250593792
+      },
+      {
+        "cycles": 16,
+        "op": "tick"
+      },
+      {
+        "address": 46667904,
+        "op": "write32",
+        "value": 3248521219
+      },
+      {
+        "cycles": 16,
+        "op": "tick"
+      },
+      {
+        "address": 46667904,
+        "op": "write32",
+        "value": 3250589969
+      },
+      {
+        "cycles": 16,
+        "op": "tick"
+      },
+      {
+        "address": 46667904,
+        "op": "write32",
+        "value": 3250594338
+      },
+      {
+        "cycles": 16,
+        "op": "tick"
+      },
+      {
+        "address": 46667904,
+        "op": "write32",
+        "value": 3248488451
+      },
+      {
+        "cycles": 16,
+        "op": "tick"
+      },
+      {
+        "address": 46667904,
+        "op": "write32",
+        "value": 3250593792
+      },
+      {
+        "cycles": 16,
+        "op": "tick"
+      },
+      {
+        "address": 46667904,
+        "op": "write32",
+        "value": 3248521219
+      },
+      {
+        "cycles": 16,
+        "op": "tick"
+      },
+      {
+        "address": 46667904,
+        "op": "write32",
+        "value": 2176843776
+      },
+      {
+        "cycles": 16,
+        "op": "tick"
+      },
+      {
+        "address": 46667904,
+        "op": "read32"
+      },
+      {
+        "address": 46667904,
+        "op": "write32",
+        "value": 2176843776
+      },
+      {
+        "cycles": 16,
+        "op": "tick"
+      },
+      {
+        "address": 46667904,
+        "op": "read32"
+      }
+    ]
+  }
+}

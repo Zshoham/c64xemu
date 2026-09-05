@@ -1,0 +1,37 @@
+{
+  "domain": "timing",
+  "expected": {
+    "cycles": 4,
+    "fault": null,
+    "reached_stop": true
+  },
+  "request": {
+    "action": "execute",
+    "cycles": 200,
+    "endian": "little",
+    "id": "timing:write-misses-fill-the-write-buffer-without-stalling",
+    "memory": [],
+    "pc": 14680064,
+    "registers": {
+      "A3": 8388608,
+      "A4": 305419896,
+      "A5": 8388624,
+      "A7": 8388640,
+      "A9": 8388656
+    },
+    "setup": [
+      {
+        "address": 25428032,
+        "op": "write32",
+        "value": 4
+      }
+    ],
+    "stop_pc": 14680080,
+    "words": [
+      34341492,
+      34865780,
+      35390068,
+      35914356
+    ]
+  }
+}

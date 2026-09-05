@@ -1,0 +1,20 @@
+{
+  "domain": "cpu",
+  "expected": {
+    "registers": {
+      "A0": 5,
+      "A1": 12,
+      "B0": 7
+    }
+  },
+  "request": {
+    "action": "execute",
+    "cycles": 8,
+    "endian": "little",
+    "id": "cpu:compact-fetch-packet",
+    "memory": [],
+    "pc": 0,
+    "program_hex": "26a427e410106e8c0000000000000000000000000000000000000000000060e0",
+    "registers": {}
+  }
+}

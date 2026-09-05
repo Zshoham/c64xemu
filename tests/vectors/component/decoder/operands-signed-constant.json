@@ -1,0 +1,14 @@
+{
+  "domain": "decoder",
+  "expected": {
+    "operands": "5,a1,a2"
+  },
+  "request": {
+    "action": "decode",
+    "address": 0,
+    "endian": "little",
+    "id": "decoder:operands-signed-constant",
+    "width": 32,
+    "word": 17080408
+  }
+}

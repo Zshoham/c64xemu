@@ -1,0 +1,15 @@
+{
+  "domain": "decoder",
+  "expected": {
+    "mnemonic": "clr",
+    "operands": "a4,0,4,a4"
+  },
+  "request": {
+    "action": "decode",
+    "address": 0,
+    "endian": "little",
+    "id": "decoder:operands-bit-field-constant-bounds",
+    "width": 32,
+    "word": 34604232
+  }
+}

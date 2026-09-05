@@ -1,0 +1,28 @@
+{
+  "domain": "timing",
+  "expected": {
+    "cycles": 6,
+    "fault": null,
+    "reached_stop": true
+  },
+  "request": {
+    "action": "execute",
+    "cycles": 200,
+    "endian": "little",
+    "id": "timing:branch-delay-slots",
+    "memory": [],
+    "pc": 14680064,
+    "registers": {},
+    "stop_pc": 14680092,
+    "words": [
+      912,
+      17039480,
+      25428088,
+      33816696,
+      42205304,
+      50593912,
+      58982520,
+      58982522
+    ]
+  }
+}

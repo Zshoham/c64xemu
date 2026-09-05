@@ -1,0 +1,30 @@
+{
+  "domain": "cpu",
+  "expected": {
+    "registers": {
+      "A10": 0,
+      "A7": 0,
+      "A9": 0,
+      "B4": 4
+    }
+  },
+  "request": {
+    "action": "execute",
+    "cycles": 3,
+    "endian": "little",
+    "id": "cpu:addkpc-nop-count-stalls",
+    "memory": [],
+    "pc": 0,
+    "registers": {},
+    "words": [
+      33636706,
+      77898584,
+      86287192,
+      60597080,
+      32768,
+      0,
+      0,
+      0
+    ]
+  }
+}

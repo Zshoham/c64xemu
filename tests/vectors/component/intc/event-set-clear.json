@@ -1,0 +1,43 @@
+{
+  "domain": "interrupts",
+  "expected": {
+    "observations": [
+      131072,
+      131072,
+      0,
+      0
+    ]
+  },
+  "request": {
+    "action": "system",
+    "id": "intc:event-set-clear",
+    "operations": [
+      {
+        "address": 25165856,
+        "op": "write32",
+        "value": 131072
+      },
+      {
+        "address": 25165824,
+        "op": "read32"
+      },
+      {
+        "address": 25165984,
+        "op": "read32"
+      },
+      {
+        "address": 25165888,
+        "op": "write32",
+        "value": 131072
+      },
+      {
+        "address": 25165824,
+        "op": "read32"
+      },
+      {
+        "address": 25165984,
+        "op": "read32"
+      }
+    ]
+  }
+}

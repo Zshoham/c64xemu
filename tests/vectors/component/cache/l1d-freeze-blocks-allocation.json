@@ -1,0 +1,93 @@
+{
+  "domain": "cache",
+  "expected": {
+    "observations": [
+      1,
+      1,
+      1,
+      2,
+      4,
+      65536,
+      4,
+      4
+    ]
+  },
+  "request": {
+    "action": "system",
+    "id": "cache:l1d-freeze-blocks-allocation",
+    "operations": [
+      {
+        "address": 4096,
+        "hex": "01000000",
+        "op": "write_bytes"
+      },
+      {
+        "address": 8192,
+        "hex": "02000000",
+        "op": "write_bytes"
+      },
+      {
+        "address": 25428032,
+        "op": "write32",
+        "value": 4
+      },
+      {
+        "address": 4096,
+        "op": "read32"
+      },
+      {
+        "address": 4096,
+        "hex": "03000000",
+        "op": "write_bytes"
+      },
+      {
+        "address": 4096,
+        "op": "read32"
+      },
+      {
+        "address": 25428036,
+        "op": "write32",
+        "value": 1
+      },
+      {
+        "address": 25428036,
+        "op": "read32"
+      },
+      {
+        "address": 8192,
+        "op": "read32"
+      },
+      {
+        "address": 8192,
+        "hex": "04000000",
+        "op": "write_bytes"
+      },
+      {
+        "address": 8192,
+        "op": "read32"
+      },
+      {
+        "address": 25428036,
+        "op": "write32",
+        "value": 0
+      },
+      {
+        "address": 25428036,
+        "op": "read32"
+      },
+      {
+        "address": 8192,
+        "op": "read32"
+      },
+      {
+        "address": 8192,
+        "hex": "05000000",
+        "op": "write_bytes"
+      },
+      {
+        "address": 8192,
+        "op": "read32"
+      }
+    ]
+  }
+}
