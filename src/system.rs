@@ -1,0 +1,3837 @@
+//! The peripheral fabric: the megamodules, the shared peripherals, and the routing between
+//! them.
+//!
+//! A C64x+ device is a set of megamodules around one set of peripherals. Everything private to
+//! a megamodule - its caches, its interrupt controller, its memory protection units, its
+//! bandwidth manager, its IDMA - is a [`Megamodule`]; everything the device shares - the
+//! Ethernet MACs, the EDMA3, the timers, the memory behind the caches - is [`Shared`]; and the
+//! [`Fabric`] holds both and answers every access, from a core or from a DMA master, by
+//! deciding which of the two it belongs to.
+//!
+//! That split is what makes six cores expressible. On a C6472 an access from core 3 to
+//! 0080 0000h is core 3's own L2 SRAM, an access from the EMAC to 1380 0000h is the same
+//! bytes, and both have to be snooped against core 3's L1D (SPRS612G Table 2-2, SPRU862B
+//! chapter 2). The address map in `space.rs` resolves the aliases and the fabric applies the
+//! coherence rules on whichever megamodule owns the memory - which on a single-core device is
+//! always the only one there is, so the C6455 behaves exactly as it did before.
+
+use crate::boot::BootMemory;
+use crate::bootctl::BootController;
+use crate::cache::CacheView;
+use crate::chipcfg::{ChipConfig, DEVSTAT_LITTLE_ENDIAN};
+use crate::ddr2::Ddr2;
+use crate::devcfg::DeviceConfig;
+use crate::device::{DeviceProfile, MpuRegion};
+use crate::edma::Edma;
+use crate::edma_tc::TransferController;
+use crate::emac::{DmaMemory as EmacDmaMemory, Emac};
+use crate::emic::{EmacInterruptControl, Sources as EmacSources};
+use crate::emifa::Emifa;
+use crate::events::Destination;
+use crate::gpio::Gpio;
+use crate::hpi::{HostPort, Hpi};
+use crate::i2c::I2c;
+use crate::idma::{Idma, Source as IdmaSource};
+use crate::mcbsp::Mcbsp;
+use crate::mdio::Mdio;
+use crate::memory::{is_memory, AccessTiming, Backing, BoundHierarchy, LineFill, MemoryHierarchy};
+use crate::pll::{Pll, Pll2};
+use crate::port::{PortContext, PortWrite, SlavePort};
+use crate::psc::PowerSleep;
+use crate::smc::{SharedMemory, SharedMemoryProfiler};
+use crate::space::{Placement, Requester};
+use crate::timer::Timer;
+use crate::utopia::Utopia;
+#[cfg(test)]
+use serde_json::{json, Value};
+
+const EVTFLAG0: u32 = 0x0180_0000;
+const EVTSET0: u32 = 0x0180_0020;
+const EVTCLR0: u32 = 0x0180_0040;
+const EVTMASK0: u32 = 0x0180_0080;
+const MEVTFLAG0: u32 = 0x0180_00a0;
+const EXPMASK0: u32 = 0x0180_00c0;
+const MEXPFLAG0: u32 = 0x0180_00e0;
+const INTMUX1: u32 = 0x0180_0104;
+const INTXSTAT: u32 = 0x0180_0180;
+const INTXCLR: u32 = 0x0180_0184;
+const INTDMASK: u32 = 0x0180_0188;
+const AEGMUX0: u32 = 0x0181_0140;
+const AEGMUX1: u32 = 0x0181_0144;
+const PDCCMD: u32 = 0x0181_0000;
+/// MM_REVID, the megamodule revision (SPRS612G section 5.6).
+const MM_REVID: u32 = 0x0181_2000;
+const L2PDWAKE0: u32 = 0x0184_c040;
+const L2PDWAKE1: u32 = 0x0184_c044;
+const L2PDSLEEP0: u32 = 0x0184_c050;
+const L2PDSLEEP1: u32 = 0x0184_c054;
+const L2PDSTAT0: u32 = 0x0184_c060;
+const L2PDSTAT1: u32 = 0x0184_c064;
+/// Arbitration register address, reset value and writable field mask (SPRU871K Table 6-2).
+const BWM_REGISTERS: [(u32, u32, u32); 12] = [
+    (0x0184_1000, 0x0001_0010, 0x0007_003f), // CPUARBU
+    (0x0184_1004, 0x0000_0010, 0x0000_003f), // IDMAARBU
+    (0x0184_1008, 0x0000_0001, 0x0000_003f), // SDMAARBU
+    (0x0184_100c, 0x0000_0020, 0x0000_003f), // UCARBU
+    (0x0184_1040, 0x0001_0010, 0x0007_003f), // CPUARBD
+    (0x0184_1044, 0x0000_0010, 0x0000_003f), // IDMAARBD
+    (0x0184_1048, 0x0000_0001, 0x0000_003f), // SDMAARBD
+    (0x0184_104c, 0x0000_0020, 0x0000_003f), // UCARBD
+    (0x0182_0200, 0x0001_0010, 0x0007_003f), // CPUARBE
+    (0x0182_0204, 0x0000_0010, 0x0000_003f), // IDMAARBE
+    (0x0182_0208, 0x0000_0001, 0x0000_003f), // SDMAARBE
+    (0x0182_020c, 0x0007_0000, 0x0007_0000), // MDMAARBE
+];
+
+/// The memory protection units, one per local memory. Register offsets come from
+/// `linux-c6x/arch/c6x/platforms/cache.c`: fault address, fault status and fault clear at the
+/// base, and the per-page attribute registers 0x200 further on.
+const MPU_BASES: [(u32, u32); 3] = [
+    (0x0184_a000, 0x0184_a200),
+    (0x0184_a400, 0x0184_a600),
+    (0x0184_ac00, 0x0184_ae00),
+];
+/// `MPFSR` bit 8: the fault was a local (CPU) request rather than a requestor's
+/// (SPRU871K Table 4-39 and section 8.4.2.1.3).
+const MPFSR_LOCAL: u32 = 1 << 8;
+
+/// Whether a unit's fault registers let a local (CPU) fault replace the remote (DMA or IDMA)
+/// one they are already holding. L1P and L2 say they do - SPRU871K 2.9.2.3.3: "The L1P allows
+/// a local fault to replace a remote fault and generate a new exception", and 4.6.2.4.3 states
+/// it as a rule: "If the LOCAL field of the MPFSR register = 0, and the pending exception sets
+/// it to 1, the hardware records the new fault and signals the new exception". L1D's own
+/// section carries neither sentence, only the general rule of 3.7.2.3.3: "The hardware records
+/// the information about the first fault and generates an exception only for that fault." The
+/// units are L2, L1P and L1D, in `MPU_BASES` order.
+const fn local_replaces_remote(unit: usize) -> bool {
+    unit != 2
+}
+
+/// How many MPPA registers a unit can have. The C6455 uses 32 pages per unit; the C6472 uses
+/// index 43 for the last shared-L2 page (SPRS612G section 5.2), so the file is 64 wide and the
+/// device profile says which entries mean anything.
+const MPU_PAGES: usize = 64;
+
+/// `MPPA`: bit 8 LOCAL, bits 5-0 SR SW SX UR UW UX. A page that grants everything a CPU can
+/// ask for needs all seven, which is the reset state - firmware that never programs the unit
+/// must see no faults.
+const MPPA_CPU_MASK: u32 = 0x0000_013f;
+/// The bits a DMA master's access is checked against: the six AID enables (SPRU871K 8.2.2)
+/// and the same six permission bits.
+const MPPA_DMA_MASK: u32 = 0x0000_fe3f;
+/// The single `EXCEP` input the exception combiner presents, which the dropped-interrupt
+/// reporting also uses. Every C64x+ megamodule numbers it 96 (SPRU871K 7.2.1).
+const EXCEP_EVENT: usize = 96;
+const SYSCLK3_DIVIDER: u8 = 6;
+const ACTIVE_IDMA: u8 = 1 << 0;
+const ACTIVE_EMAC: u8 = 1 << 1;
+const ACTIVE_EDMA: u8 = 1 << 2;
+const ACTIVE_I2C: u8 = 1 << 3;
+const ACTIVE_MCBSP: u8 = 1 << 4;
+const ACTIVE_MDIO: u8 = 1 << 5;
+/// Every bit the summary defines: a wake-everything write sets all of them and the tick
+/// settles each one back, so nothing outside this mask may survive a tick.
+const ACTIVE_ALL: u8 =
+    ACTIVE_IDMA | ACTIVE_EMAC | ACTIVE_EDMA | ACTIVE_I2C | ACTIVE_MCBSP | ACTIVE_MDIO;
+
+#[inline]
+fn directly_routed_memory(address: u32) -> bool {
+    !(0x0180_0000..0xa000_0000).contains(&address)
+}
+
+fn mux_uses_combiner(value: u32) -> bool {
+    (0..4).any(|slot| ((value >> (slot * 8)) & 0x7f) < 4)
+}
+
+/// Events 0-3 are the interrupt combiner's own outputs: they never latch in EVTFLAG0 and so
+/// cannot reach the exception combiner (SPRU871K 7.2.1).
+const fn reserved_events(bank: usize) -> u32 {
+    if bank == 0 {
+        0xf
+    } else {
+        0
+    }
+}
+
+/// What a CPU access asks a page for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Permission {
+    Read,
+    Write,
+    Execute,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum Endian {
+    #[default]
+    Little,
+    Big,
+}
+
+/// One megamodule: the caches and everything in its 0180 0000h configuration space.
+pub(crate) struct Megamodule {
+    /// The caches, the MAR bits and the cache configuration of this megamodule.
+    memory: MemoryHierarchy,
+    event_flags: [u32; 4],
+    /// Which events are asserted this cycle. The interrupt selector routes these raw lines to
+    /// the CPU, while the latched flags above feed the event combiner (SPRU871K Figure 7-9), so
+    /// a level source keeps its line high until it is quieted and a pulse source raises it for
+    /// one cycle.
+    event_lines: [u32; 4],
+    event_masks: [u32; 4],
+    /// The exception combiner's mask: a set bit keeps that event out of the single `EXCEP`
+    /// input, the same polarity as `EVTMASK` (SPRU871K 7.2.4).
+    exception_masks: [u32; 4],
+    /// Whether any latched flag reaches `EXCEP` through those masks. The CPU asks once per
+    /// cycle and only a flag or mask write can change the answer, so it is maintained on
+    /// those writes rather than recomputed over the four banks every cycle.
+    exception_pending: bool,
+    interrupt_mux: [u32; 3],
+    selector_uses_combiner: bool,
+    interrupt_exception: u32,
+    dropped_interrupt_mask: u16,
+    aeg_mux: [u32; 2],
+    bandwidth: [u32; 12],
+    pdccmd: u32,
+    l2_power_status: [u32; 2],
+    /// Per-page attributes for L2, L1P and L1D, with the fault address and status each unit
+    /// latches. `restrictive` is false while every page still grants a CPU everything, which
+    /// is the reset state and lets the access path skip the check entirely.
+    mpu_pages: [[u32; MPU_PAGES]; 3],
+    mpu_fault_address: [u32; 3],
+    mpu_fault_status: [u32; 3],
+    mpu_restrictive: bool,
+    /// Whether any page has stopped granting every DMA requester id everything. The DMA check
+    /// runs per byte, so the reset state has to cost nothing.
+    mpu_dma_restrictive: bool,
+    mpu_lock_key: [[u32; 4]; 3],
+    mpu_lock_input: [[u32; 4]; 3],
+    mpu_lock_written: [u8; 3],
+    mpu_lock_sequence: [bool; 3],
+    mpu_locked: [bool; 3],
+    idma: Idma,
+    /// Level-triggered events known at the last device tick, and the CPU lines they select,
+    /// used only by the dormant short path.
+    idle_level_events: [u32; 4],
+    idle_cpu_lines: u16,
+    /// Whether the boot controller is holding this core in reset. Its memories still answer -
+    /// a host or core 0 initialises them while the core waits (SPRUEC6G section 4.3.2).
+    held_in_reset: bool,
+}
+
+impl Megamodule {
+    fn new(core: usize, profile: &'static DeviceProfile) -> Self {
+        Self {
+            memory: MemoryHierarchy::new(core, profile.map),
+            event_flags: [0; 4],
+            event_lines: [0; 4],
+            event_masks: [0; 4],
+            exception_masks: [u32::MAX; 4],
+            exception_pending: false,
+            interrupt_mux: [0x0706_0504, 0x0b0a_0908, 0x0f0e_0d0c],
+            selector_uses_combiner: false,
+            interrupt_exception: 0,
+            dropped_interrupt_mask: 0,
+            aeg_mux: [0x0302_0100, 0x0706_0504],
+            bandwidth: BWM_REGISTERS.map(|(_, reset, _)| reset),
+            pdccmd: 0,
+            l2_power_status: [0; 2],
+            mpu_pages: [[0x0000_ffff; MPU_PAGES]; 3],
+            mpu_fault_address: [0; 3],
+            mpu_fault_status: [0; 3],
+            mpu_restrictive: false,
+            mpu_dma_restrictive: false,
+            mpu_lock_key: [[0; 4]; 3],
+            mpu_lock_input: [[0; 4]; 3],
+            mpu_lock_written: [0; 3],
+            mpu_lock_sequence: [false; 3],
+            mpu_locked: [false; 3],
+            idma: Idma::default(),
+            idle_level_events: [0; 4],
+            idle_cpu_lines: 0,
+            held_in_reset: false,
+        }
+    }
+
+    /// Live view of the three cache levels, for the debugger and the dashboard.
+    pub(crate) fn cache_views(&self) -> [CacheView; 3] {
+        self.memory.cache_views()
+    }
+
+    pub(crate) fn cache_line_data(&self, level: usize, address: u32) -> Option<&[u8]> {
+        self.memory.cache_line_data(level, address)
+    }
+
+    /// The 256 MAR registers; bit 0 of each enables caching for its 16 MiB segment.
+    pub(crate) fn mar_registers(&self) -> [u32; 256] {
+        self.memory.mar_registers()
+    }
+
+    /// INTMUX1-3: the selector byte per CPU interrupt INT4-INT15.
+    pub(crate) fn interrupt_selectors(&self) -> [u32; 3] {
+        self.interrupt_mux
+    }
+
+    /// EVTFLAG0-3: the latched flag for each of the 128 chip-level events.
+    pub(crate) fn event_flag_registers(&self) -> [u32; 4] {
+        self.event_flags
+    }
+
+    /// Assert a system event for this cycle: its flag latches until software clears it, and
+    /// its line is what the interrupt selector routes to the CPU.
+    pub(crate) fn raise_event(&mut self, event: usize) {
+        let bank = event / 32;
+        let bit = 1 << (event % 32);
+        self.event_flags[bank] |= bit;
+        self.event_lines[bank] |= bit;
+        self.exception_pending |= bit & !self.exception_masks[bank] & !reserved_events(bank) != 0;
+    }
+
+    /// The interrupt lines the selector presents to the CPU this cycle, consuming the event
+    /// receptions that produced them.
+    ///
+    /// SPRU871K Figure 7-9 feeds the interrupt selector from the raw system events while the
+    /// latched flags feed the event combiner, and section 7.4.2 states that a service routine
+    /// for a directly selected single event needs neither to read nor to clear EVTFLAG. So a
+    /// directly routed event asserts its CPU interrupt when it is *received*, not for as long as
+    /// its flag stays set: an unacknowledged flag cannot re-enter the handler. The four combiner
+    /// outputs are different - they are the level of their group's unmasked flags (7.2.2), which
+    /// is why a combined-event routine has to clear the flags before it returns.
+    pub(crate) fn take_pending_cpu_interrupts(&mut self, short_tick: bool) -> u16 {
+        if short_tick {
+            return self.idle_cpu_lines;
+        }
+        if self.event_lines == [0; 4] && !self.selector_uses_combiner {
+            return 0;
+        }
+        let pending = self.selected_cpu_interrupts(&self.event_lines);
+        self.event_lines = [0; 4];
+        pending
+    }
+
+    fn selected_cpu_interrupts(&self, event_lines: &[u32; 4]) -> u16 {
+        let mut pending = 0u16;
+        for interrupt in 4..16 {
+            let mux = self.interrupt_mux[(interrupt - 4) / 4];
+            let event = ((mux >> (((interrupt - 4) % 4) * 8)) & 0x7f) as usize;
+            let asserted = if event < 4 {
+                self.event_flags[event] & !self.event_masks[event] != 0
+            } else {
+                event_lines[event / 32] & (1 << (event % 32)) != 0
+            };
+            if asserted {
+                pending |= 1 << interrupt;
+            }
+        }
+        pending
+    }
+
+    pub(crate) fn record_dropped_interrupt(&mut self, interrupt: u8) {
+        let bit = 1u16 << interrupt;
+        if self.interrupt_exception != 0 || self.dropped_interrupt_mask & bit != 0 {
+            return;
+        }
+        let mux = self.interrupt_mux[(interrupt as usize - 4) / 4];
+        let event = (mux >> (((interrupt as usize - 4) % 4) * 8)) & 0x7f;
+        self.interrupt_exception = (event << 24) | (u32::from(interrupt) << 16) | 1;
+        self.raise_event(EXCEP_EVENT);
+    }
+
+    /// The single `EXCEP` input the CPU sees: the OR of every latched event the exception
+    /// combiner does not mask out. Events 0-3 are the interrupt combiner's own outputs and
+    /// never appear in EVTFLAG0, so they cannot reach it (SPRU871K 7.2.1, 7.2.4).
+    pub(crate) fn pending_exception_event(&self) -> bool {
+        self.exception_pending
+    }
+
+    fn masked_exception_flags(&self, bank: usize) -> u32 {
+        self.event_flags[bank] & !self.exception_masks[bank] & !reserved_events(bank)
+    }
+
+    /// Recompute the cached `EXCEP` summary after a write to the flags or the mask.
+    fn refresh_exception_pending(&mut self) {
+        self.exception_pending = (0..4).any(|bank| self.masked_exception_flags(bank) != 0);
+    }
+
+    /// Record one memory protection fault in a unit's MPFAR and MPFSR and raise the exception
+    /// that belongs to its source.
+    ///
+    /// SPRU871K 8.4.2.1.3: "The MPFAR and MPFSR registers only store information for one
+    /// fault... each individual memory generates no more than one exception until the CPU
+    /// clears that memory's MPFAR and MPFSR registers." The single exception to that is a
+    /// local fault arriving at a unit holding a remote one, which `local_replaces_remote`
+    /// quotes.
+    pub(crate) fn record_mpu_fault(
+        &mut self,
+        unit: usize,
+        address: u32,
+        status: u32,
+        events: &crate::events::EventMap,
+    ) {
+        let recorded = self.mpu_fault_status[unit];
+        let local = status & MPFSR_LOCAL != 0;
+        if recorded != 0 && !(local && recorded & MPFSR_LOCAL == 0 && local_replaces_remote(unit)) {
+            return;
+        }
+        self.mpu_fault_address[unit] = address;
+        self.mpu_fault_status[unit] = status;
+        let event = if local {
+            events.mpu_cpu[unit]
+        } else {
+            events.mpu_dma[unit]
+        };
+        self.raise_event(event);
+    }
+
+    fn record_lock_fault(&mut self, unit: usize, address: u32, events: &crate::events::EventMap) {
+        // A refused lock command is the supervisor's own write, so it is a local fault with SW.
+        self.record_mpu_fault(unit, address, MPFSR_LOCAL | (1 << 4), events);
+        self.mpu_lock_sequence[unit] = false;
+    }
+
+    /// The megamodule's own configuration registers, except the ones the fabric has to see:
+    /// `None` when the address is not one of them.
+    fn cfg_read(
+        &mut self,
+        address: u32,
+        profile: &'static DeviceProfile,
+        context: PortContext,
+    ) -> Option<u32> {
+        if let Some(value) = self.idma.read(address, context) {
+            return Some(value);
+        }
+        if let Some((bank, kind)) = intc_register(address) {
+            return Some(match kind {
+                IntcRegister::Flag => self.event_flags[bank],
+                IntcRegister::Mask => self.event_masks[bank],
+                IntcRegister::MaskedFlag => self.event_flags[bank] & !self.event_masks[bank],
+                IntcRegister::ExceptionMask => self.exception_masks[bank],
+                IntcRegister::MaskedExceptionFlag => self.masked_exception_flags(bank),
+            });
+        }
+        match address {
+            INTXSTAT => return Some(self.interrupt_exception),
+            INTXCLR => return Some(0),
+            INTDMASK => return Some(u32::from(self.dropped_interrupt_mask)),
+            AEGMUX0 => return Some(self.aeg_mux[0]),
+            AEGMUX1 => return Some(self.aeg_mux[1]),
+            MM_REVID => return Some(profile.megamodule_revision),
+            _ => {}
+        }
+        if let Some(value) = self.mpu_register(address, None, profile) {
+            return Some(value);
+        }
+        if let Some(index) = bank_index(address, INTMUX1) {
+            if index < 3 {
+                return Some(self.interrupt_mux[index]);
+            }
+        }
+        if let Some(index) = bandwidth_register(address) {
+            return Some(self.bandwidth[index]);
+        }
+        match address {
+            PDCCMD => return Some(self.pdccmd | 0xffff),
+            L2PDWAKE0 | L2PDWAKE1 | L2PDSLEEP0 | L2PDSLEEP1 => return Some(0),
+            L2PDSTAT0 => return Some(self.l2_power_status[0]),
+            L2PDSTAT1 => return Some(self.l2_power_status[1]),
+            _ => {}
+        }
+        if let Some(value) = self.memory.cache_register_read(address) {
+            return Some(value);
+        }
+        self.memory.mar_read(address)
+    }
+
+    /// Returns the event an IDMA completion raised, if the write started one.
+    fn cfg_write(
+        &mut self,
+        backing: &mut Backing,
+        address: u32,
+        value: u32,
+        profile: &'static DeviceProfile,
+        context: PortContext,
+    ) -> Option<CfgWrite> {
+        match self.idma.write(address, value, context) {
+            PortWrite::Unhandled => {}
+            PortWrite::Done => return Some(CfgWrite::Done),
+            PortWrite::Event(event) => return Some(CfgWrite::Event(event)),
+        }
+        if let Some(index) = bandwidth_register(address) {
+            self.bandwidth[index] = value & BWM_REGISTERS[index].2;
+            return Some(CfgWrite::Done);
+        }
+        match address {
+            INTXSTAT | MM_REVID => return Some(CfgWrite::Done),
+            INTXCLR => {
+                if value & 1 != 0 {
+                    self.interrupt_exception = 0;
+                }
+                return Some(CfgWrite::Done);
+            }
+            INTDMASK => {
+                self.dropped_interrupt_mask = (value & 0xfff0) as u16;
+                return Some(CfgWrite::Done);
+            }
+            AEGMUX0 => {
+                self.aeg_mux[0] = value;
+                return Some(CfgWrite::Done);
+            }
+            AEGMUX1 => {
+                self.aeg_mux[1] = value;
+                return Some(CfgWrite::Done);
+            }
+            PDCCMD => {
+                self.pdccmd = value & (1 << 16);
+                return Some(CfgWrite::Done);
+            }
+            L2PDWAKE0 => {
+                self.l2_power_status[0] &= !(value & 3);
+                return Some(CfgWrite::Done);
+            }
+            L2PDWAKE1 => {
+                self.l2_power_status[1] &= !(value & 3);
+                return Some(CfgWrite::Done);
+            }
+            L2PDSLEEP0 => {
+                self.l2_power_status[0] |= value & 3;
+                return Some(CfgWrite::Done);
+            }
+            L2PDSLEEP1 => {
+                self.l2_power_status[1] |= value & 3;
+                return Some(CfgWrite::Done);
+            }
+            L2PDSTAT0 | L2PDSTAT1 => return Some(CfgWrite::Done),
+            _ => {}
+        }
+        if let Some(index) = bank_index(address, EVTSET0) {
+            let writable = if index == 0 { value & !0xf } else { value };
+            self.event_flags[index] |= writable;
+            self.event_lines[index] |= writable;
+            self.exception_pending |=
+                writable & !self.exception_masks[index] & !reserved_events(index) != 0;
+            return Some(CfgWrite::Done);
+        }
+        if let Some(index) = bank_index(address, EVTCLR0) {
+            self.event_flags[index] &= !value;
+            self.refresh_exception_pending();
+            return Some(CfgWrite::Done);
+        }
+        if let Some(index) = bank_index(address, EVTMASK0) {
+            self.event_masks[index] = value;
+            return Some(CfgWrite::Done);
+        }
+        if let Some(index) = bank_index(address, EXPMASK0) {
+            self.exception_masks[index] = value;
+            self.refresh_exception_pending();
+            return Some(CfgWrite::Done);
+        }
+        if self.mpu_register(address, Some(value), profile).is_some() {
+            return Some(CfgWrite::Done);
+        }
+        if let Some(index) = bank_index(address, INTMUX1) {
+            if index < 3 {
+                self.interrupt_mux[index] = value;
+                self.selector_uses_combiner =
+                    self.interrupt_mux.iter().copied().any(mux_uses_combiner);
+                return Some(CfgWrite::Done);
+            }
+        }
+        if self
+            .memory
+            .bind(backing)
+            .cache_register_write(address, value)
+        {
+            return Some(CfgWrite::Done);
+        }
+        if self.memory.mar_write(address, value) {
+            return Some(CfgWrite::Done);
+        }
+        None
+    }
+
+    fn mpu_register(
+        &mut self,
+        address: u32,
+        value: Option<u32>,
+        profile: &'static DeviceProfile,
+    ) -> Option<u32> {
+        for (unit, (fault_base, page_base)) in MPU_BASES.iter().copied().enumerate() {
+            if let Some(index) = page_index(address, page_base) {
+                if let Some(value) = value {
+                    if !self.mpu_locked[unit] {
+                        self.mpu_pages[unit][index] = value & 0xffff;
+                        self.mpu_restrictive = self
+                            .mpu_pages
+                            .iter()
+                            .flatten()
+                            .any(|page| page & MPPA_CPU_MASK != MPPA_CPU_MASK);
+                        self.mpu_dma_restrictive = self
+                            .mpu_pages
+                            .iter()
+                            .flatten()
+                            .any(|page| page & MPPA_DMA_MASK != MPPA_DMA_MASK);
+                    }
+                }
+                return Some(self.mpu_pages[unit][index]);
+            }
+            let lock_base = fault_base + 0x100;
+            if let Some(offset) = address.checked_sub(lock_base) {
+                match offset {
+                    0x00 | 0x04 | 0x08 | 0x0c => {
+                        if let Some(value) = value {
+                            let index = (offset / 4) as usize;
+                            let bit = 1 << index;
+                            if !self.mpu_lock_sequence[unit]
+                                || self.mpu_lock_written[unit] & bit != 0
+                            {
+                                self.record_lock_fault(unit, address, profile.events);
+                            } else {
+                                self.mpu_lock_input[unit][index] = value;
+                                self.mpu_lock_written[unit] |= bit;
+                            }
+                        }
+                        return Some(0);
+                    }
+                    0x10 => {
+                        if let Some(command) = value {
+                            if command & !7 != 0 || command.count_ones() > 1 {
+                                self.record_lock_fault(unit, address, profile.events);
+                            } else if command & 4 != 0 {
+                                self.mpu_lock_sequence[unit] = true;
+                                self.mpu_lock_written[unit] = 0;
+                                self.mpu_lock_input[unit] = [0; 4];
+                            } else if command & 2 != 0 {
+                                if !self.mpu_locked[unit]
+                                    && self.mpu_lock_sequence[unit]
+                                    && self.mpu_lock_written[unit] == 0x0f
+                                {
+                                    self.mpu_lock_key[unit] = self.mpu_lock_input[unit];
+                                    self.mpu_locked[unit] = true;
+                                    self.mpu_lock_sequence[unit] = false;
+                                } else {
+                                    self.record_lock_fault(unit, address, profile.events);
+                                }
+                            } else if command & 1 != 0 {
+                                if self.mpu_locked[unit]
+                                    && self.mpu_lock_sequence[unit]
+                                    && self.mpu_lock_written[unit] == 0x0f
+                                    && self.mpu_lock_input[unit] == self.mpu_lock_key[unit]
+                                {
+                                    self.mpu_locked[unit] = false;
+                                    self.mpu_lock_sequence[unit] = false;
+                                } else {
+                                    self.record_lock_fault(unit, address, profile.events);
+                                }
+                            }
+                        }
+                        return Some(0);
+                    }
+                    0x14 => return Some(u32::from(self.mpu_locked[unit])),
+                    _ => {}
+                }
+            }
+            match address.checked_sub(fault_base) {
+                Some(0) => return Some(self.mpu_fault_address[unit]),
+                Some(4) => return Some(self.mpu_fault_status[unit]),
+                // MPFCLR: bit 0 is a command and nothing else in the register means anything.
+                // SPRU871K Table 4-40 gives bit 0 as "Clear the L2MPFAR and the L2MPFCR
+                // registers" and 8.4.2.1.3 adds that "Writing a 1 to any other bit of the
+                // MPFCR register has no effect", so a write that misses the command bit leaves
+                // the recorded fault standing.
+                Some(8) => {
+                    if value.is_some_and(|value| value & 1 != 0) {
+                        self.mpu_fault_address[unit] = 0;
+                        self.mpu_fault_status[unit] = 0;
+                    }
+                    return Some(0);
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+}
+
+/// What a megamodule configuration write turned out to be.
+enum CfgWrite {
+    Done,
+    /// An IDMA transfer completed and raised this event in the local core.
+    Event(usize),
+}
+
+/// Names one shared peripheral port.
+///
+/// Declaration order is consult order, and it is load-bearing: the chip-level registers claim a
+/// whole window, so they must answer after every port whose registers sit inside it. Nothing
+/// else in the list overlaps, which is what `no_two_slave_ports_claim_one_address` proves - over
+/// this same list, so the proof cannot drift from the dispatch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Port {
+    Emac(usize),
+    Emic(usize),
+    Edma,
+    Timer(usize),
+    Gpio,
+    I2c,
+    Pll,
+    Hpi,
+    Ddr2,
+    Emifa,
+    Mcbsp(usize),
+    Utopia,
+    Devcfg,
+    Pll2,
+    TransferController(usize),
+    Mdio,
+    BootController,
+    Psc,
+    Smc,
+    SmcProfiler(usize),
+    ChipConfig,
+}
+
+/// What the router owes the megamodules once a port has handled an access.
+///
+/// CONTEXT.md keeps the interrupt latchers in the router rather than in a port, because a
+/// follow-up the megamodules are owed is not part of a port's shape. This names the follow-ups
+/// so they belong to the port rather than to a position in a hand-written chain.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Follow {
+    Nothing,
+    EmacInterrupts,
+    EdmaInterrupt,
+    I2cInterrupt,
+    UtopiaInterrupt,
+    TransferControllerErrors,
+    ReleaseBootedCores,
+    PowerTransitions,
+    PrefetchFlush,
+    InterProcessorInterrupts,
+}
+
+impl Port {
+    /// A read's follow-up. Only the three ports whose reads can raise something answer with
+    /// one: UTOPIA's empty receive queue sets its starvation flag, and the EDMA3 and its
+    /// transfer controllers report a refused or misaligned access by asserting an error. The
+    /// rest are level sources the idle refresh recomputes, so a read that only clears a flag
+    /// needs nothing here.
+    fn after_read(self) -> Follow {
+        match self {
+            Port::Edma => Follow::EdmaInterrupt,
+            Port::Utopia => Follow::UtopiaInterrupt,
+            Port::TransferController(_) => Follow::TransferControllerErrors,
+            _ => Follow::Nothing,
+        }
+    }
+
+    /// A write's follow-up: the interrupt a register change may have asserted, or the
+    /// device-level effect the write asked for.
+    fn after_write(self) -> Follow {
+        match self {
+            Port::Emac(_) | Port::Emic(_) => Follow::EmacInterrupts,
+            Port::Edma => Follow::EdmaInterrupt,
+            Port::I2c => Follow::I2cInterrupt,
+            Port::Utopia => Follow::UtopiaInterrupt,
+            Port::TransferController(_) => Follow::TransferControllerErrors,
+            Port::BootController => Follow::ReleaseBootedCores,
+            Port::Psc => Follow::PowerTransitions,
+            Port::Smc => Follow::PrefetchFlush,
+            Port::ChipConfig => Follow::InterProcessorInterrupts,
+            Port::Timer(_)
+            | Port::Gpio
+            | Port::Pll
+            | Port::Hpi
+            | Port::Ddr2
+            | Port::Emifa
+            | Port::Mcbsp(_)
+            | Port::Devcfg
+            | Port::Pll2
+            | Port::Mdio
+            | Port::SmcProfiler(_) => Follow::Nothing,
+        }
+    }
+}
+
+/// The peripherals and memory the device shares between its megamodules.
+pub(crate) struct Shared {
+    /// Every megamodule's SRAM, the shared L2, the DDR2 window and everything sparse.
+    backing: Backing,
+    mdio: Mdio,
+    // Boxes make the temporary ownership transfer pointer-sized while the rest of the fabric
+    // serves DMA accesses.
+    emac: Vec<Option<Box<Emac>>>,
+    /// The per-core interrupt-control module in front of each MAC, on a device that has them.
+    emic: Vec<EmacInterruptControl>,
+    edma: Option<Box<Edma>>,
+    timers: Vec<Timer>,
+    gpio: Gpio,
+    i2c: I2c,
+    pll: Pll,
+    transfer_controllers: [TransferController; 4],
+    hpi: Hpi,
+    ddr2: Ddr2,
+    emifa: Option<Emifa>,
+    utopia: Option<Utopia>,
+    mcbsp: Vec<Mcbsp>,
+    devcfg: Option<DeviceConfig>,
+    pll2: Pll2,
+    /// The C6472's device-level blocks.
+    chipcfg: Option<ChipConfig>,
+    bootctl: Option<BootController>,
+    psc: Option<PowerSleep>,
+    smc: Option<SharedMemory>,
+    smc_profilers: Vec<SharedMemoryProfiler>,
+    /// Whether the last ask of the device was a short tick: the peripherals did not move, so
+    /// a core reads the interrupt lines the last full tick selected. Recorded rather than
+    /// answered per core, because every core asks once per cycle of its own and the first ask
+    /// of a cycle is the one that decides.
+    last_tick_short: bool,
+    /// What this device is made of, decided once. The tick runs every emulated cycle, so it
+    /// must not re-derive the device's shape from its `Option`s and `Vec`s each time.
+    emacs: usize,
+    /// Whether this device has the device-level blocks `tick_device_blocks` advances - the
+    /// interrupt-control modules in front of the MACs, the power/sleep controller, the
+    /// shared-memory controller and its profilers. Cached from the profile rather than read
+    /// through it, because the tick runs every emulated cycle and each block is behind an
+    /// `Option` or an empty `Vec` that it must not interrogate to find out.
+    device_level_blocks: bool,
+    sysclk3_divide: u8,
+    /// No cycle-driven peripheral can change state before the next SYSCLK3 edge or host/MMIO
+    /// action. Level interrupt sources are still relatched on the short path.
+    dynamic_idle: bool,
+    /// Devices that were active after the previous full tick. MMIO wakes all bits once.
+    dynamic_active: u8,
+    /// Whether anything since the last full tick could have armed a transfer or changed a
+    /// level-triggered interrupt source: an access that left the memory windows, a frame
+    /// arriving, or a peripheral that actually ticked. While it is clear the tick replays the
+    /// two cached answers below instead of interrogating every peripheral again.
+    peripheral_dirty: bool,
+    /// Whether any level-triggered source was asserting at the last interrogation. A level
+    /// has to be relatched every cycle, so the cached "nothing is asserted" is the only
+    /// answer the tick may act on without asking again.
+    levels_asserted: bool,
+    /// The privilege the EDMA3 was last told a CPU access carried, so the seam every load and
+    /// store crosses does not restate it.
+    edma_user_privilege: bool,
+    /// Whether any megamodule's interrupt selector reads a combiner output, which the latched
+    /// flags a pulse sets can change without any level source moving.
+    combiner_in_use: bool,
+    /// The ports this device has, in consult order, decided once from the profile.
+    ///
+    /// This is the device's peripheral address ownership: which ports exist, and who gets asked
+    /// first. It used to be three hand-written lists - the read chain, the write chain and the
+    /// no-two-ports-claim-one-address proof - that could only agree by someone remembering to
+    /// edit all three.
+    ports: Vec<Port>,
+}
+
+impl Shared {
+    /// Which ports a device with this shape has, in consult order.
+    fn port_order(profile: &'static DeviceProfile) -> Vec<Port> {
+        let mut ports = Vec::with_capacity(32);
+        ports.extend((0..profile.emac_bases.len()).map(Port::Emac));
+        ports.extend((0..profile.emic_bases.len()).map(Port::Emic));
+        ports.push(Port::Edma);
+        ports.extend((0..profile.timer_bases.len()).map(Port::Timer));
+        ports.extend([Port::Gpio, Port::I2c, Port::Pll, Port::Hpi, Port::Ddr2]);
+        if profile.has_emifa {
+            ports.push(Port::Emifa);
+        }
+        if profile.has_mcbsp {
+            ports.extend((0..2).map(Port::Mcbsp));
+        }
+        if profile.has_utopia {
+            ports.push(Port::Utopia);
+        }
+        if profile.has_device_config {
+            ports.push(Port::Devcfg);
+        }
+        ports.push(Port::Pll2);
+        ports.extend((0..4).map(Port::TransferController));
+        ports.push(Port::Mdio);
+        if profile.has_boot_controller {
+            ports.extend([Port::BootController, Port::Psc, Port::Smc]);
+            ports.extend((0..profile.cores()).map(Port::SmcProfiler));
+            // The chip-level registers claim a whole window, so they answer last.
+            ports.push(Port::ChipConfig);
+        }
+        ports
+    }
+
+    /// The port a name refers to, or `None` when the device does not have it - or has it but
+    /// the fabric has lent it out: the EMAC and the EDMA3 are moved out of their slots for the
+    /// duration of a DMA callback, and an access arriving then finds the slot empty.
+    ///
+    /// A trait object here rather than a match returning values, which is not the obvious
+    /// choice and was measured both ways: a 21-arm match inlined into each walk costs 2.2% of
+    /// the emulator's throughput against 1.0% for the virtual call, inlined or outlined. The
+    /// register path probes ports in a loop, so the match's code size hurts more than the
+    /// indirect call does.
+    fn port(&mut self, which: Port) -> Option<&mut dyn SlavePort> {
+        Some(match which {
+            Port::Emac(index) => self.emac[index].as_deref_mut()? as &mut dyn SlavePort,
+            Port::Emic(index) => &mut self.emic[index],
+            Port::Edma => self.edma.as_deref_mut()?,
+            Port::Timer(index) => &mut self.timers[index],
+            Port::Gpio => &mut self.gpio,
+            Port::I2c => &mut self.i2c,
+            Port::Pll => &mut self.pll,
+            Port::Hpi => &mut self.hpi,
+            Port::Ddr2 => &mut self.ddr2,
+            Port::Emifa => self.emifa.as_mut()?,
+            Port::Mcbsp(index) => &mut self.mcbsp[index],
+            Port::Utopia => self.utopia.as_mut()?,
+            Port::Devcfg => self.devcfg.as_mut()?,
+            Port::Pll2 => &mut self.pll2,
+            Port::TransferController(index) => &mut self.transfer_controllers[index],
+            Port::Mdio => &mut self.mdio,
+            Port::BootController => self.bootctl.as_mut()?,
+            Port::Psc => self.psc.as_mut()?,
+            Port::Smc => self.smc.as_mut()?,
+            Port::SmcProfiler(index) => &mut self.smc_profilers[index],
+            Port::ChipConfig => self.chipcfg.as_mut()?,
+        })
+    }
+
+    /// An access left the memory windows, or a host delivered something: the next device tick
+    /// re-derives the activity summary and the level sources instead of trusting the cache.
+    #[inline(always)]
+    fn touched(&mut self) {
+        self.dynamic_idle = false;
+        self.dynamic_active = u8::MAX;
+        self.peripheral_dirty = true;
+    }
+
+    fn new(profile: &'static DeviceProfile, endian: Endian, boot_mode: u8) -> Self {
+        Self {
+            backing: Backing::new(profile.map, endian),
+            mdio: Mdio::with_version(profile.mdio_version),
+            emac: profile
+                .emac_bases
+                .iter()
+                .map(|base| Some(Box::new(Emac::new(*base, profile.emic_bases.is_empty()))))
+                .collect(),
+            emic: profile
+                .emic_bases
+                .iter()
+                .map(|base| EmacInterruptControl::new(*base, profile.cores()))
+                .collect(),
+            edma: Some(Box::new(Edma::default())),
+            timers: profile
+                .timer_bases
+                .iter()
+                .map(|base| Timer::new(*base))
+                .collect(),
+            gpio: Gpio::default(),
+            i2c: I2c::default(),
+            pll: Pll::default(),
+            transfer_controllers: [
+                TransferController::new(0, 0x02a2_0000),
+                TransferController::new(1, 0x02a2_8000),
+                TransferController::new(2, 0x02a3_0000),
+                TransferController::new(3, 0x02a3_8000),
+            ],
+            hpi: Hpi::new(),
+            ddr2: Ddr2::default(),
+            emifa: profile.has_emifa.then(Emifa::default),
+            utopia: profile.has_utopia.then(Utopia::default),
+            mcbsp: if profile.has_mcbsp {
+                vec![
+                    Mcbsp::new(0x028c_0000, 0x3000_0000, 0x3000_0010),
+                    Mcbsp::new(0x0290_0000, 0x3400_0000, 0x3400_0010),
+                ]
+            } else {
+                Vec::new()
+            },
+            devcfg: profile.has_device_config.then(DeviceConfig::default),
+            pll2: Pll2::default(),
+            chipcfg: profile.has_boot_controller.then(|| {
+                ChipConfig::new(
+                    match endian {
+                        Endian::Little => DEVSTAT_LITTLE_ENDIAN,
+                        Endian::Big => 0,
+                    } | u32::from(boot_mode & 0xf),
+                    profile.jtag_id,
+                )
+            }),
+            // The BOOTMODE pins decide which cores start: immediate boot releases them all,
+            // and every ROM boot mode runs core 0 and leaves cores 1-5 for it to release
+            // (SPRS612G section 2.4.1).
+            bootctl: profile
+                .has_boot_controller
+                .then(|| BootController::new(boot_mode, profile.cores())),
+            psc: profile.has_boot_controller.then(PowerSleep::booted),
+            smc: profile.has_boot_controller.then(SharedMemory::default),
+            smc_profilers: if profile.has_boot_controller {
+                (0..profile.cores())
+                    .map(SharedMemoryProfiler::new)
+                    .collect()
+            } else {
+                Vec::new()
+            },
+            emacs: profile.emac_bases.len(),
+            device_level_blocks: profile.has_boot_controller,
+            sysclk3_divide: 0,
+            last_tick_short: false,
+            dynamic_idle: false,
+            dynamic_active: u8::MAX,
+            peripheral_dirty: true,
+            levels_asserted: true,
+            edma_user_privilege: false,
+            combiner_in_use: true,
+            ports: Self::port_order(profile),
+        }
+    }
+}
+
+/// The whole device: its megamodules and the peripherals they share.
+pub struct Fabric {
+    profile: &'static DeviceProfile,
+    /// One box per megamodule: indexing a slice of the struct itself makes every access
+    /// multiply by its size, and the access path runs several times per emulated cycle.
+    mm: Box<[Box<Megamodule>]>,
+    /// How many megamodules there are, so the per-cycle paths index rather than iterate.
+    cores: usize,
+    shared: Shared,
+    /// The device cycle the shared peripherals have been advanced to. Each core asks the
+    /// fabric to tick as it finishes its own cycle, and the first ask of a cycle is the one
+    /// that runs: peripherals advance once per device cycle however many cores are running.
+    ticked_cycle: Option<u64>,
+    /// Cores whose NMI pin the chip-level registers have driven, and cores the boot controller
+    /// or the power/sleep controller has released, each consumed once by the device that owns
+    /// the CPUs (SPRS612G sections 3.7.1 and 2.4.1).
+    pending_nmi: u32,
+    pending_release: u32,
+}
+
+impl Default for Fabric {
+    fn default() -> Self {
+        Self::new(&crate::device::C6455)
+    }
+}
+
+impl Fabric {
+    pub(crate) fn new(profile: &'static DeviceProfile) -> Self {
+        Self::with_boot_mode(profile, 0)
+    }
+
+    /// A device strapped to a boot mode, which is what decides how many cores start.
+    pub(crate) fn with_boot_mode(profile: &'static DeviceProfile, boot_mode: u8) -> Self {
+        Self {
+            profile,
+            mm: (0..profile.cores())
+                .map(|core| Box::new(Megamodule::new(core, profile)))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            cores: profile.cores(),
+            shared: Shared::new(profile, Endian::Little, boot_mode),
+            ticked_cycle: None,
+            pending_nmi: 0,
+            pending_release: 0,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn megamodule(&self, core: usize) -> &Megamodule {
+        &self.mm[core]
+    }
+
+    /// A view of the fabric from one core, which is what the CPU holds while it runs.
+    #[cfg(test)]
+    pub(crate) fn core(&mut self, core: usize) -> CoreBus<'_> {
+        CoreBus { core, fabric: self }
+    }
+
+    pub(crate) fn set_endian(&mut self, endian: Endian) {
+        self.shared.backing.set_endian(endian);
+    }
+
+    pub(crate) fn endian(&self) -> Endian {
+        self.shared.backing.endian()
+    }
+
+    /// Which cores the boot controller is holding in reset, as a bitmask. A held core does not
+    /// execute, but every one of its memories still answers (SPRUEC6G section 4.3.2).
+    pub(crate) fn held_in_reset(&self, core: usize) -> bool {
+        self.mm[core].held_in_reset
+    }
+
+    pub(crate) fn set_held_in_reset(&mut self, core: usize, held: bool) {
+        self.mm[core].held_in_reset = held;
+    }
+
+    /// The address the boot controller starts a core at, when the device has one.
+    pub(crate) fn boot_address(&self, core: usize) -> Option<u32> {
+        Some(self.shared.bootctl.as_ref()?.boot_address(core))
+    }
+
+    // ------------------------------------------------------------------
+    // The routing surface: a CPU access from one core.
+    // ------------------------------------------------------------------
+
+    #[inline(always)]
+    fn port_context(&self) -> PortContext {
+        PortContext {
+            endian: if self.shared.backing.endian_big() {
+                Endian::Big
+            } else {
+                Endian::Little
+            },
+        }
+    }
+
+    /// One core's memory hierarchy bound to the storage every master shares.
+    ///
+    /// This is where the device's ownership split is expressed: the caches belong to the
+    /// megamodule, the bytes belong to the device, and the fabric is the only thing that holds
+    /// both. Every access below binds them here instead of naming the store again.
+    #[inline(always)]
+    fn memory(&mut self, core: usize) -> BoundHierarchy<'_> {
+        self.mm[core].memory.bind(&mut self.shared.backing)
+    }
+
+    #[inline(always)]
+    pub(crate) fn read32(&mut self, core: usize, address: u32) -> u32 {
+        if directly_routed_memory(address) {
+            return self.memory(core).read_u32(address);
+        }
+        self.shared.touched();
+        let context = self.port_context();
+        if let Some(value) = self.peripheral_read(address, context) {
+            return value;
+        }
+        if let Some(value) = self.mm[core].cfg_read(address, self.profile, context) {
+            return value;
+        }
+        self.memory(core).read_u32(address)
+    }
+
+    #[inline(always)]
+    pub(crate) fn write32(&mut self, core: usize, address: u32, value: u32) {
+        if directly_routed_memory(address) {
+            self.memory(core).write_u32(address, value);
+            return;
+        }
+        self.shared.touched();
+        let context = self.port_context();
+        if self.peripheral_write(address, value, context) {
+            return;
+        }
+        let written = {
+            let (mm, shared) = (&mut self.mm[core], &mut self.shared);
+            mm.cfg_write(&mut shared.backing, address, value, self.profile, context)
+        };
+        match written {
+            Some(CfgWrite::Done) => return,
+            Some(CfgWrite::Event(event)) => {
+                self.mm[core].raise_event(event);
+                return;
+            }
+            None => {}
+        }
+        self.memory(core).write_u32(address, value);
+    }
+
+    /// The MDIO interrupts an EMAC's MACINVECTOR reports alongside its own.
+    ///
+    /// The one shared register the router decodes itself, because it is the one no port can
+    /// answer: it sits in the EMAC's register map but reports the MDIO's interrupts too, since
+    /// only the control module sees both (SPRU975E section 2.16.4).
+    fn mac_input_vector(&mut self, address: u32) -> Option<u32> {
+        let index = self
+            .profile
+            .emac_bases
+            .iter()
+            .position(|base| address == base + 0x90)?;
+        let mut vector = self.shared.emac[index]
+            .as_mut()
+            .map_or(0, |emac| emac.input_vector());
+        if self.shared.mdio.link_interrupt_pending() {
+            vector |= 1 << 30;
+        }
+        if self.shared.mdio.user_interrupt_pending() {
+            vector |= 1 << 31;
+        }
+        Some(vector)
+    }
+
+    /// The shared peripherals' slave ports, in the order the router consults them.
+    ///
+    /// One walk of one list. Which ports exist and who answers first is the device's, decided
+    /// once from its profile; what the router owes the megamodules afterwards belongs to the
+    /// port that was hit rather than to a position in a chain.
+    fn peripheral_read(&mut self, address: u32, context: PortContext) -> Option<u32> {
+        if let Some(vector) = self.mac_input_vector(address) {
+            return Some(vector);
+        }
+        for index in 0..self.shared.ports.len() {
+            let which = self.shared.ports[index];
+            let Some(port) = self.shared.port(which) else {
+                continue;
+            };
+            if let Some(value) = port.read(address, context) {
+                self.follow(which.after_read());
+                return Some(value);
+            }
+        }
+        None
+    }
+
+    /// Which port answers for this address, without performing the access's follow-up.
+    ///
+    /// Peripheral address ownership is a device property, and this is how a case asks about it:
+    /// what a C6472 puts at an address is not what a C6455 puts there, and before the ports
+    /// were one list the only way to find out was to boot a device and infer it from what the
+    /// register did.
+    #[cfg(test)]
+    fn owner_of(&mut self, address: u32) -> Option<Port> {
+        let context = self.port_context();
+        for index in 0..self.shared.ports.len() {
+            let which = self.shared.ports[index];
+            let Some(port) = self.shared.port(which) else {
+                continue;
+            };
+            if port.read(address, context).is_some() {
+                return Some(which);
+            }
+        }
+        None
+    }
+
+    fn peripheral_write(&mut self, address: u32, value: u32, context: PortContext) -> bool {
+        for index in 0..self.shared.ports.len() {
+            let which = self.shared.ports[index];
+            let Some(port) = self.shared.port(which) else {
+                continue;
+            };
+            if port.write(address, value, context) != PortWrite::Unhandled {
+                self.follow(which.after_write());
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Perform what a port's access left for the router.
+    fn follow(&mut self, follow: Follow) {
+        match follow {
+            Follow::Nothing => {}
+            Follow::EmacInterrupts => {
+                self.latch_emac_interrupts();
+            }
+            Follow::EdmaInterrupt => {
+                self.latch_edma_interrupt();
+            }
+            Follow::I2cInterrupt => self.latch_i2c_interrupt(),
+            Follow::UtopiaInterrupt => {
+                self.latch_utopia_interrupt();
+            }
+            Follow::TransferControllerErrors => self.latch_transfer_controller_errors(),
+            Follow::ReleaseBootedCores => self.release_booted_cores(),
+            Follow::PowerTransitions => self.apply_power_transitions(),
+            // The model holds no prefetched data, so a flush has nothing to discard; consuming
+            // the edge keeps the register's write-one-shot semantics honest (SPRUEG5D 2.8).
+            Follow::PrefetchFlush => {
+                if let Some(smc) = self.shared.smc.as_mut() {
+                    let _ = smc.take_prefetch_flush();
+                }
+            }
+            Follow::InterProcessorInterrupts => self.deliver_inter_processor_interrupts(),
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Device-level effects of a peripheral write.
+    // ------------------------------------------------------------------
+
+    /// An IPCGR write raises system event 84 in the core it names, and an NMIGR write drives
+    /// that core's NMI pin (SPRS612G section 3.7).
+    fn deliver_inter_processor_interrupts(&mut self) {
+        let Some(chip) = self.shared.chipcfg.as_mut() else {
+            return;
+        };
+        let pulses = chip.take_ipc_pulse();
+        let nmi = chip.take_nmi_pulse();
+        if pulses == 0 && nmi == 0 {
+            return;
+        }
+        let Some(event) = self.profile.events.ipc else {
+            return;
+        };
+        for core in 0..self.mm.len() {
+            if pulses & (1 << core) != 0 {
+                self.mm[core].raise_event(event);
+            }
+        }
+        // The NMI is a pin, not an event: the device raises it on the core's CPU, which the
+        // machine reads back through `take_nmi_requests`.
+        self.pending_nmi |= nmi;
+    }
+
+    /// Cores the boot controller has just released start executing at their DSP_BOOT_ADDR.
+    fn release_booted_cores(&mut self) {
+        let released = self
+            .shared
+            .bootctl
+            .as_mut()
+            .map_or(0, BootController::take_released_cores);
+        self.pending_release |= released;
+    }
+
+    /// A local reset the power/sleep controller asserted or released.
+    fn apply_power_transitions(&mut self) {
+        let Some(psc) = self.shared.psc.as_mut() else {
+            return;
+        };
+        for (module, asserted) in psc.take_local_reset_edges() {
+            if module < self.mm.len() {
+                self.mm[module].held_in_reset = asserted;
+                if !asserted {
+                    self.pending_release |= 1 << module;
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // The device tick.
+    // ------------------------------------------------------------------
+
+    /// Advance every cycle-driven peripheral by one CPU cycle, once per device cycle however
+    /// many cores are running.
+    ///
+    /// Each core asks as it finishes a cycle of its own, stalls included, and the first ask of
+    /// a cycle is the one that runs. Cores that stall drift behind the others and simply skip
+    /// their ask until they catch up, so the peripherals advance at the rate of the fastest
+    /// core rather than six times per cycle.
+    /// Answers whether this was a *short* tick: the peripherals did not move, so the asking
+    /// core reads the interrupt lines the last full tick selected instead of fresh ones.
+    #[inline(always)]
+    pub(crate) fn tick(&mut self, cycle: u64) -> bool {
+        if self.ticked_cycle.is_some_and(|last| cycle <= last) {
+            // Another core already advanced the device this cycle; this core sees whatever
+            // that ask decided.
+            return self.shared.last_tick_short;
+        }
+        self.ticked_cycle = Some(cycle);
+        self.shared.sysclk3_divide += 1;
+        let sysclk3 = self.shared.sysclk3_divide == SYSCLK3_DIVIDER;
+        if !sysclk3 && self.shared.dynamic_idle {
+            self.shared.last_tick_short = true;
+            return true;
+        }
+        if sysclk3 {
+            self.shared.sysclk3_divide = 0;
+        }
+        self.shared.last_tick_short = false;
+        self.tick_device(sysclk3);
+        false
+    }
+
+    /// Advance the device by one cycle for a driver that has no CPU of its own - the
+    /// conformance vectors and the unit tests - which therefore has no cycle number to ask
+    /// with.
+    #[cfg(test)]
+    pub(crate) fn tick_once(&mut self) {
+        let next = self.ticked_cycle.map_or(0, |last| last.wrapping_add(1));
+        self.tick(next);
+    }
+
+    /// Lend a bus master out for the duration of one of its own transfers.
+    ///
+    /// A master that moves data - either Ethernet MAC, the EDMA3, the HPI's host side - reaches
+    /// memory *and registers* through the whole fabric, because a DMA access inside a peripheral
+    /// aperture goes to that peripheral's slave port with every side effect a CPU access would
+    /// have. So the callback needs `&mut Fabric`, which cannot be held while a borrow of the
+    /// master living inside it is also held. The master is moved out of its slot for the call
+    /// and moved back after.
+    ///
+    /// It is pointer-sized while it travels, which is the whole reason for the box: `Emac` is
+    /// 840 bytes and `Edma` a thousand. The protocol costs two pointer writes per active master
+    /// per device cycle.
+    ///
+    /// The consequence worth knowing is that the slot is empty while the callback runs, so a
+    /// master is not addressable by its own transfer: an access to its register block finds no
+    /// port and falls through to the memory behind the aperture.
+    /// `a_lent_out_master_does_not_answer_its_own_transfer` pins that.
+    ///
+    /// Splitting the borrow instead - handing the callback only the parts it needs - would mean
+    /// moving the whole router onto a view over borrowed parts: both dispatch walks, the port
+    /// map, the follow-ups and the latchers, because Rust cannot express "all of the fabric
+    /// except this one slot". That is a larger change than the protocol it would remove, it
+    /// would cost the router the locality it has, and it would recover two pointer writes.
+    #[inline(always)]
+    fn lend_emac<T>(&mut self, index: usize, call: impl FnOnce(&mut Emac, &mut Self) -> T) -> T {
+        let mut emac = self.shared.emac[index].take().unwrap();
+        let result = call(&mut emac, self);
+        self.shared.emac[index] = Some(emac);
+        result
+    }
+
+    /// Lend the EDMA3 out for one of its transfers; see `lend_emac` for why.
+    #[inline(always)]
+    fn lend_edma<T>(&mut self, call: impl FnOnce(&mut Edma, &mut Self) -> T) -> T {
+        let mut edma = self.shared.edma.take().unwrap();
+        let result = call(&mut edma, self);
+        self.shared.edma = Some(edma);
+        result
+    }
+
+    /// Lend the HPI's host side out for one host cycle; see `lend_emac` for why. The HPI is not
+    /// boxed because a host cycle is polled rather than per-cycle work.
+    fn lend_hpi<T>(&mut self, call: impl FnOnce(&mut Hpi, &mut Self) -> T) -> T {
+        let mut hpi = std::mem::take(&mut self.shared.hpi);
+        let result = call(&mut hpi, self);
+        self.shared.hpi = hpi;
+        result
+    }
+
+    /// One full device cycle: everything a peripheral does, and the two summaries the short
+    /// tick above trusts. Deliberately out of line, so the dormant path does not build its
+    /// frame.
+    #[inline(never)]
+    fn tick_device(&mut self, sysclk3: bool) {
+        // Whether any cycle-driven peripheral actually moved. Together with `peripheral_dirty`
+        // - set by every access that left the memory windows and by every frame a host
+        // delivered - it decides whether the level-triggered sources have to be interrogated
+        // again, or whether last cycle's answer still holds. A dormant device answers "nothing
+        // asserted" for millions of cycles, and asking six peripherals to confirm it costs
+        // more than the tick it guards.
+        //
+        // The activity summary is maintained the same way, one bit at a time: a peripheral
+        // whose bit is clear was inactive and only a register write can arm it, and a write
+        // sets every bit through `Shared::touched`. So each branch below recomputes its own
+        // bit whenever it was considered, and nothing scans the peripherals it did not touch.
+        let entered_dirty = std::mem::take(&mut self.shared.peripheral_dirty);
+        let previous = self.shared.dynamic_active;
+        let mut active = previous & ACTIVE_ALL;
+        let mut moved = false;
+        if previous & ACTIVE_IDMA != 0 {
+            self.tick_idma();
+            let mut idma = false;
+            for core in 0..self.cores {
+                idma |= self.mm[core].idma.active();
+            }
+            active = (active & !ACTIVE_IDMA) | (u8::from(idma) * ACTIVE_IDMA);
+            moved = true;
+        }
+        if previous & ACTIVE_EMAC != 0 {
+            let mut emac_active = false;
+            for index in 0..self.shared.emacs {
+                if self.shared.emac[index].as_ref().unwrap().active() {
+                    self.lend_emac(index, |emac, fabric| emac.tick(fabric));
+                    moved = true;
+                }
+                emac_active |= self.shared.emac[index].as_ref().unwrap().active();
+            }
+            active = (active & !ACTIVE_EMAC) | (u8::from(emac_active) * ACTIVE_EMAC);
+        }
+        if previous & ACTIVE_EDMA != 0 {
+            if self.shared.edma.as_ref().unwrap().active() {
+                self.lend_edma(|edma, fabric| edma.tick(fabric));
+                self.latch_transfer_controller_errors();
+                moved = true;
+            }
+            let edma_active = self.shared.edma.as_ref().unwrap().active();
+            active = (active & !ACTIVE_EDMA) | (u8::from(edma_active) * ACTIVE_EDMA);
+        }
+        if sysclk3 {
+            moved |= self.tick_timers();
+            moved |= self.tick_gpio();
+        }
+        if previous & ACTIVE_I2C != 0 {
+            if self.shared.i2c.active() {
+                self.tick_i2c();
+                moved = true;
+            }
+            let i2c_active = self.shared.i2c.transfer_active();
+            active = (active & !ACTIVE_I2C) | (u8::from(i2c_active) * ACTIVE_I2C);
+        }
+        if sysclk3 && self.tick_utopia() {
+            moved = true;
+        }
+        if previous & ACTIVE_MCBSP != 0 {
+            if self.shared.mcbsp.iter().any(Mcbsp::active) {
+                self.tick_mcbsp();
+                moved = true;
+            }
+            let mcbsp_active = self.shared.mcbsp.iter().any(Mcbsp::active);
+            active = (active & !ACTIVE_MCBSP) | (u8::from(mcbsp_active) * ACTIVE_MCBSP);
+        }
+        if sysclk3 {
+            if let Some(devcfg) = self.shared.devcfg.as_mut() {
+                devcfg.tick_sysclk3();
+            }
+        }
+        if previous & ACTIVE_MDIO != 0 {
+            if self.shared.mdio.active() {
+                self.shared.mdio.tick();
+                moved = true;
+            }
+            let mdio_active = self.shared.mdio.active();
+            active = (active & !ACTIVE_MDIO) | (u8::from(mdio_active) * ACTIVE_MDIO);
+        }
+        if self.shared.device_level_blocks {
+            self.tick_device_blocks();
+            moved = true;
+        }
+        // A timer, the GPIO pins, the I2C, a McBSP or the UTOPIA port arms an EDMA channel by
+        // triggering its synchronisation event, so a tick that moved anything has to ask the
+        // channel controller again - it is the one peripheral another peripheral can wake.
+        if moved {
+            active |= u8::from(self.shared.edma.as_ref().unwrap().active()) * ACTIVE_EDMA;
+        }
+        // A transfer this tick performed may itself have reached a peripheral register, which
+        // wakes every bit through `Shared::touched`. The flag was cleared before the branches
+        // ran, so finding it set again means the per-branch answers are stale and everything
+        // has to be considered next cycle.
+        let woken = self.shared.peripheral_dirty;
+        self.shared.peripheral_dirty = false;
+        self.shared.dynamic_active = if woken { ACTIVE_ALL } else { active };
+        self.shared.dynamic_idle = self.shared.dynamic_active == 0;
+        let dirty = moved || entered_dirty || woken;
+        // A level has to be relatched every cycle it asserts, and a combiner-routed selector
+        // reads the latched flags a pulse may have just set, so both keep the interrogation
+        // running even when nothing moved. Each latcher reports whether it raised anything,
+        // which is the same question as "must this run again next cycle" and costs nothing
+        // beyond the interrogation it already did.
+        if dirty || self.shared.levels_asserted || self.shared.combiner_in_use {
+            let mut asserted = self.latch_utopia_interrupt();
+            asserted |= self.latch_edma_interrupt();
+            asserted |= self.latch_emac_interrupts();
+            asserted |= self.refresh_idle_level_events();
+            self.shared.levels_asserted = asserted;
+            self.shared.combiner_in_use =
+                (0..self.cores).any(|core| self.mm[core].selector_uses_combiner);
+        }
+    }
+
+    /// The blocks only the C6472 has: the interrupt-control modules, the power/sleep
+    /// controller and the shared-memory controller with its per-core profilers.
+    fn tick_device_blocks(&mut self) {
+        for index in 0..self.shared.emic.len() {
+            self.shared.emic[index].tick();
+        }
+        if let Some(psc) = self.shared.psc.as_mut() {
+            psc.tick();
+            if psc.interrupt_pending() {
+                if let Some(event) = self.profile.events.psc {
+                    self.raise(Destination::All, event);
+                }
+            }
+            self.apply_power_transitions();
+        }
+        if self
+            .shared
+            .smc
+            .as_ref()
+            .is_some_and(SharedMemory::fault_pending)
+        {
+            if let Some(event) = self.profile.events.smc_fault {
+                self.raise(Destination::All, event);
+            }
+        }
+        for core in 0..self.shared.smc_profilers.len() {
+            if self.shared.smc_profilers[core].take_event() {
+                if let Some(event) = self.profile.events.smc_event {
+                    self.raise(Destination::Core(core), event);
+                }
+            }
+        }
+    }
+
+    /// Each megamodule's own IDMA moves data between its local memories.
+    fn tick_idma(&mut self) {
+        for core in 0..self.cores {
+            if !self.mm[core].idma.active() {
+                continue;
+            }
+            let steps = self.mm[core].idma.tick();
+            for step in steps.into_iter().flatten() {
+                let value = match step.source {
+                    Some(IdmaSource::Address(address)) => self.dma_read32(address),
+                    Some(IdmaSource::Fill(value)) => Some(value),
+                    None => None,
+                };
+                if let Some(value) = value {
+                    self.dma_write32(step.destination, value);
+                }
+                if let Some(event) = step.completion_event {
+                    self.mm[core].raise_event(event);
+                }
+            }
+        }
+    }
+
+    /// Raise a system event in whichever megamodules the device map says can see it.
+    fn raise(&mut self, destination: Destination, event: usize) {
+        match destination {
+            Destination::Core(core) => {
+                if let Some(mm) = self.mm.get_mut(core) {
+                    mm.raise_event(event);
+                }
+            }
+            Destination::All => {
+                for core in 0..self.cores {
+                    self.mm[core].raise_event(event);
+                }
+            }
+        }
+    }
+
+    /// Recompute the level-triggered event set the dormant short tick replays, and answer
+    /// whether anything is in it.
+    fn refresh_idle_level_events(&mut self) -> bool {
+        let mut shared_events = [0u32; 4];
+        let mut steered: Vec<(usize, usize)> = Vec::new();
+        {
+            let mut note = |event: usize| shared_events[event / 32] |= 1 << (event % 32);
+            for index in 0..self.shared.emac.len() {
+                let emac = self.shared.emac[index].as_ref().unwrap();
+                if emac.interrupt_pending() || self.shared.mdio.interrupt_pending() {
+                    note(self.profile.events.emac[index].common);
+                }
+            }
+            if self.shared.edma.as_ref().unwrap().interrupt_pending() {
+                note(self.profile.events.edma_global);
+            }
+            if self
+                .shared
+                .utopia
+                .as_ref()
+                .is_some_and(Utopia::interrupt_pending)
+            {
+                note(self.profile.events.utopia);
+            }
+            if self.shared.i2c.interrupt_pending() {
+                note(self.profile.events.i2c);
+            }
+        }
+        if self.shared.edma.as_ref().unwrap().interrupt_pending() {
+            for region in 0..8 {
+                if !self
+                    .shared
+                    .edma
+                    .as_mut()
+                    .unwrap()
+                    .region_interrupt_pending(region)
+                {
+                    continue;
+                }
+                match self.profile.events.edma_region_completion(region) {
+                    Some((Destination::All, event)) => {
+                        shared_events[event / 32] |= 1 << (event % 32);
+                    }
+                    Some((Destination::Core(core), event)) => steered.push((core, event)),
+                    None => {}
+                }
+            }
+        }
+        let asserted = shared_events != [0; 4] || !steered.is_empty();
+        if self.cores == 1 && steered.is_empty() {
+            let mm = &mut self.mm[0];
+            mm.idle_level_events = shared_events;
+            mm.idle_cpu_lines = if shared_events == [0; 4] && !mm.selector_uses_combiner {
+                0
+            } else {
+                mm.selected_cpu_interrupts(&shared_events)
+            };
+            return asserted;
+        }
+        for core in 0..self.cores {
+            let mut events = shared_events;
+            if !steered.is_empty() {
+                for (target, event) in &steered {
+                    if *target == core {
+                        events[event / 32] |= 1 << (event % 32);
+                    }
+                }
+            }
+            let mm = &mut self.mm[core];
+            mm.idle_level_events = events;
+            // With no level events and no combiner-routed event, the selected line set is empty
+            // without walking the twelve mux slots (SPRU871K 7.2.2, 7.4.2).
+            mm.idle_cpu_lines = if events == [0; 4] && !mm.selector_uses_combiner {
+                0
+            } else {
+                mm.selected_cpu_interrupts(&events)
+            };
+        }
+        asserted
+    }
+
+    /// The Ethernet interrupts.
+    ///
+    /// On a device with no interrupt-control module the MAC and the MDIO share one event, gated
+    /// by EWCTL inside the MAC itself (SPRU975E section 2.16.4). On the C6472 each MAC has an
+    /// EMIC that gates its eighteen sources per core and drives three events - receive,
+    /// transmit and common (SPRUEF8F section 3.1) - so the same sources reach different cores
+    /// depending on what each core enabled.
+    /// Answers whether it asserted anything, which is the same question as whether it has to
+    /// run again next cycle.
+    fn latch_emac_interrupts(&mut self) -> bool {
+        if self.shared.emic.is_empty() {
+            // One MAC, one event, gated inside the MAC itself.
+            let pending = self.shared.emac[0].as_ref().unwrap().interrupt_pending()
+                || self.shared.mdio.interrupt_pending();
+            if pending {
+                self.raise(Destination::All, self.profile.events.emac[0].common);
+            }
+            return pending;
+        }
+        let mdio_link = self.shared.mdio.link_interrupt_pending();
+        let mdio_user = self.shared.mdio.user_interrupt_pending();
+        let mdio = mdio_link || mdio_user;
+        let mut asserted = false;
+        for index in 0..self.shared.emacs {
+            let events = self.profile.events.emac[index];
+            if self.shared.emic.is_empty() {
+                let pending = self.shared.emac[index]
+                    .as_ref()
+                    .unwrap()
+                    .interrupt_pending()
+                    || mdio;
+                if pending {
+                    self.raise(Destination::All, events.common);
+                    asserted = true;
+                }
+                continue;
+            }
+            let (rx, tx, stat, host) = self.shared.emac[index].as_ref().unwrap().masked_sources();
+            let sources = EmacSources {
+                rx,
+                tx,
+                stat,
+                host,
+                mdio_link,
+                mdio_user,
+            };
+            self.shared.emic[index].update(sources);
+            for core in 0..self.mm.len() {
+                let lines = self.shared.emic[index].lines(core);
+                if lines.rx {
+                    asserted = true;
+                    if let Some(event) = events.receive {
+                        self.mm[core].raise_event(event);
+                    }
+                }
+                if lines.tx {
+                    asserted = true;
+                    if let Some(event) = events.transmit {
+                        self.mm[core].raise_event(event);
+                    }
+                }
+                if lines.common {
+                    asserted = true;
+                    self.mm[core].raise_event(events.common);
+                }
+            }
+        }
+        asserted
+    }
+
+    /// The EDMA3 channel controller's global completion, its per-region completions, its error
+    /// interrupt and its memory protection interrupt (SPRU966C Tables 2-10 and 2-11; SPRS612G
+    /// Table 7-10 for the C6472's numbers and per-core steering).
+    ///
+    /// Answers whether the level-triggered half of that - the completions - is still asserting.
+    fn latch_edma_interrupt(&mut self) -> bool {
+        let pending = self.shared.edma.as_mut().unwrap().interrupt_pending();
+        if pending {
+            self.raise(Destination::All, self.profile.events.edma_global);
+            for region in 0..8 {
+                if self
+                    .shared
+                    .edma
+                    .as_mut()
+                    .unwrap()
+                    .region_interrupt_pending(region)
+                {
+                    if let Some((destination, event)) =
+                        self.profile.events.edma_region_completion(region)
+                    {
+                        self.raise(destination, event);
+                    }
+                }
+            }
+        }
+        if self.shared.edma.as_mut().unwrap().take_error_pulse() {
+            self.raise(Destination::All, self.profile.events.edma_error);
+        }
+        if self.shared.edma.as_mut().unwrap().take_fault_pulse() {
+            self.raise(Destination::All, self.profile.events.edma_mp);
+        }
+        pending
+    }
+
+    /// Advance both timers by one SYSCLK3 edge, reporting whether either period match fired:
+    /// a match raises a CPU event and may arm an EDMA channel, so the tick has to look at the
+    /// device again afterwards.
+    fn tick_timers(&mut self) -> bool {
+        let mut fired = false;
+        for index in 0..self.shared.timers.len() {
+            let raised = self.shared.timers[index].tick_sysclk3();
+            fired |= raised[0] || raised[1];
+            for (half, raised) in raised.into_iter().enumerate() {
+                if !raised {
+                    continue;
+                }
+                let Some((destination, event, channel)) = self.profile.events.timer(index, half)
+                else {
+                    continue;
+                };
+                self.raise(destination, event);
+                if let Some(channel) = channel {
+                    self.shared.edma.as_mut().unwrap().trigger_event(channel);
+                }
+            }
+        }
+        fired
+    }
+
+    /// Sample the GPIO pins, reporting whether any edge was detected.
+    fn tick_gpio(&mut self) -> bool {
+        let raised = self.shared.gpio.tick_sysclk3();
+        if raised == 0 {
+            return false;
+        }
+        for pin in 0..16 {
+            if raised & (1 << pin) == 0 {
+                continue;
+            }
+            let Some((destination, event, channel)) = self.profile.events.gpio(pin) else {
+                continue;
+            };
+            self.raise(destination, event);
+            if let Some(channel) = channel {
+                self.shared.edma.as_mut().unwrap().trigger_event(channel);
+            }
+        }
+        true
+    }
+
+    /// Put a serial EEPROM on the I2C bus, which is what a board does for the ROM's I2C boot
+    /// (SPRUEC6G section 2.3.4).
+    pub(crate) fn attach_i2c_eeprom(&mut self, address: u32, contents: Vec<u8>) {
+        self.shared.i2c.attach_eeprom(address, contents);
+    }
+
+    fn tick_i2c(&mut self) {
+        let events = self.shared.i2c.tick();
+        let (receive, transmit) = self.profile.events.i2c_channels;
+        if events.receive {
+            self.shared.edma.as_mut().unwrap().trigger_event(receive);
+        }
+        if events.transmit {
+            self.shared.edma.as_mut().unwrap().trigger_event(transmit);
+        }
+        self.latch_i2c_interrupt();
+    }
+
+    fn tick_mcbsp(&mut self) {
+        for index in 0..self.shared.mcbsp.len() {
+            let events = self.shared.mcbsp[index].tick();
+            let Some([receive, transmit]) = self.profile.events.mcbsp(index) else {
+                continue;
+            };
+            if events.receive {
+                self.shared.edma.as_mut().unwrap().trigger_event(receive.1);
+            }
+            if events.transmit {
+                self.shared.edma.as_mut().unwrap().trigger_event(transmit.1);
+            }
+            if events.receive_interrupt {
+                self.raise(Destination::All, receive.0);
+            }
+            if events.transmit_interrupt {
+                self.raise(Destination::All, transmit.0);
+            }
+        }
+    }
+
+    /// One SYSCLK3 edge of the UTOPIA port, reporting whether it moved: a clock-detect section
+    /// that failed latches an error the interrupt is a level on, and a cell either way arms an
+    /// EDMA channel. A port with both directions disabled cannot do either.
+    fn tick_utopia(&mut self) -> bool {
+        let Some(utopia) = self.shared.utopia.as_mut() else {
+            return false;
+        };
+        let events = utopia.tick_sysclk3();
+        let moved = events.receive || events.transmit || utopia.interrupt_pending();
+        let Some((receive, transmit)) = self.profile.events.utopia_channels else {
+            return moved;
+        };
+        if events.receive {
+            self.shared.edma.as_mut().unwrap().trigger_event(receive);
+        }
+        if events.transmit {
+            self.shared.edma.as_mut().unwrap().trigger_event(transmit);
+        }
+        moved
+    }
+
+    /// The UTOPIA error interrupt, which is a level, so it answers whether it is asserting.
+    fn latch_utopia_interrupt(&mut self) -> bool {
+        let pending = self
+            .shared
+            .utopia
+            .as_ref()
+            .is_some_and(Utopia::interrupt_pending);
+        if pending {
+            self.raise(Destination::All, self.profile.events.utopia);
+        }
+        pending
+    }
+
+    fn latch_transfer_controller_errors(&mut self) {
+        if let Some((controller, detail)) = self.shared.edma.as_mut().unwrap().take_transfer_error()
+        {
+            if let Some(controller) = self.shared.transfer_controllers.get_mut(controller) {
+                controller.report_transfer_error(detail);
+            }
+        }
+        // A serviced request stays visible in the controller's debug windows.
+        if let Some((controller, request)) =
+            self.shared.edma.as_mut().unwrap().take_serviced_request()
+        {
+            if let Some(controller) = self.shared.transfer_controllers.get_mut(controller) {
+                controller.record_request(request);
+            }
+        }
+        for index in 0..self.shared.transfer_controllers.len() {
+            if self.shared.transfer_controllers[index].take_error_pulse() {
+                let (destination, event) = self.profile.events.transfer_controller_error(index);
+                self.raise(destination, event);
+            }
+        }
+    }
+
+    fn latch_i2c_interrupt(&mut self) {
+        if self.shared.i2c.interrupt_pending() {
+            self.raise(Destination::All, self.profile.events.i2c);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // The host side.
+    // ------------------------------------------------------------------
+
+    /// An external host's read cycle on the HPI. The transfer goes through the same DMA path
+    /// every other master uses, so the snoop rules apply to it too.
+    pub fn hpi_host_read(&mut self, port: HostPort) -> Option<u32> {
+        self.lend_hpi(|hpi, fabric| hpi.host_read(port, fabric))
+    }
+
+    /// One halfword of a 16-bit multiplexed host cycle.
+    #[cfg(test)]
+    pub fn hpi_host_read_halfword(&mut self, port: HostPort, second: bool) -> Option<u16> {
+        self.lend_hpi(|hpi, fabric| hpi.host_read_halfword(port, second, fabric))
+    }
+
+    #[cfg(test)]
+    pub fn hpi_host_write_halfword(&mut self, port: HostPort, value: u16, second: bool) {
+        let interrupt =
+            self.lend_hpi(|hpi, fabric| hpi.host_write_halfword(port, value, second, fabric));
+        if interrupt {
+            self.raise(Destination::All, self.profile.events.hpi);
+        }
+    }
+
+    /// An external host's write cycle. A zero-to-one transition on DSPINT is the host-to-CPU
+    /// interrupt (SPRS276M Table 7-9, SPRS612G Table 7-10 for the C6472's event number).
+    pub fn hpi_host_write(&mut self, port: HostPort, value: u32) {
+        let interrupt = self.lend_hpi(|hpi, fabric| hpi.host_write(port, value, fabric));
+        if interrupt {
+            self.raise(Destination::All, self.profile.events.hpi);
+        }
+    }
+
+    /// Deliver a received frame to one of the device's MACs. A C6472 module has one Ethernet
+    /// connection, which is EMAC0 unless a front end says otherwise.
+    pub(crate) fn inject_frame_on(&mut self, port: usize, frame: Vec<u8>) {
+        self.shared.touched();
+        if let Some(Some(emac)) = self.shared.emac.get_mut(port) {
+            emac.inject_frame(frame);
+        }
+    }
+
+    /// Whether the named MAC's receive FIFO has room for a frame of this length, which a host
+    /// backend asks before delivering one.
+    pub(crate) fn emac_rx_has_room(&self, port: usize, length: usize) -> bool {
+        match self.shared.emac.get(port) {
+            Some(Some(emac)) => emac.rx_fifo_has_room(length),
+            _ => true,
+        }
+    }
+
+    /// Drive the PHY's link state, which latches the MDIO link-change interrupt.
+    #[cfg(test)]
+    pub(crate) fn mdio_set_link(&mut self, up: bool) {
+        self.shared.mdio.set_link(up);
+    }
+
+    /// Fuse the device's Ethernet address, which the ROM bootloader's Ethernet boot reads out of
+    /// the MAC ID words. A device without a chip-level register file has nowhere to hold one.
+    pub(crate) fn fuse_mac_id(&mut self, mac: [u8; 6]) {
+        if let Some(chip) = self.shared.chipcfg.as_mut() {
+            chip.fuse_mac_id(mac);
+        }
+    }
+
+    pub(crate) fn take_tx_frames(&mut self) -> Vec<Vec<u8>> {
+        let mut frames = Vec::new();
+        for emac in self.shared.emac.iter_mut().flatten() {
+            frames.extend(emac.take_transmitted());
+        }
+        frames
+    }
+
+    // ------------------------------------------------------------------
+    // Memory protection.
+    // ------------------------------------------------------------------
+
+    /// Check a CPU access against the page attributes of whichever local memory holds it
+    /// (SPRU871K chapter 8). A violation latches the address and the attempted permission in
+    /// that unit's MPFAR and MPFSR, raises the unit's system event so the exception combiner
+    /// can turn it into `EXCEP`, and denies the access.
+    ///
+    /// The AID fields are not consulted: they gate DMA masters by requester id, and the CPU
+    /// is the local requester, which `LOCAL` covers.
+    #[inline(always)]
+    pub(crate) fn check_access(
+        &mut self,
+        core: usize,
+        address: u32,
+        permission: Permission,
+        user: bool,
+    ) -> bool {
+        // The bus carries the requesting privilege, which the EDMA3's active memory protection
+        // filters on (SPRU966C section 2.10.1). Every load and store crosses this seam, and the
+        // channel controller is a cold allocation away, so the privilege is pushed into it only
+        // when it changes rather than restated on every access.
+        if self.shared.edma_user_privilege != user {
+            self.set_edma_privilege(user);
+        }
+        // Every page grants the CPU everything until software narrows one, which is the reset
+        // state and the state the whole of this project's firmware runs in.
+        if !self.mm[core].mpu_restrictive {
+            return true;
+        }
+        self.check_restricted_access(core, address, permission, user)
+    }
+
+    #[inline(never)]
+    fn set_edma_privilege(&mut self, user: bool) {
+        self.shared.edma_user_privilege = user;
+        self.shared
+            .edma
+            .as_mut()
+            .unwrap()
+            .set_requestor_privilege(user);
+    }
+
+    /// The check itself, once some page has stopped granting everything.
+    #[inline(never)]
+    fn check_restricted_access(
+        &mut self,
+        core: usize,
+        address: u32,
+        permission: Permission,
+        user: bool,
+    ) -> bool {
+        let Some((unit, page)) = mpu_page(self.profile.mpu_regions, address) else {
+            return true;
+        };
+        let attributes = self.mm[core].mpu_pages[unit][page];
+        let bit = permission_bit(permission, user);
+        if attributes & bit != 0 && attributes & 0x100 != 0 {
+            return true;
+        }
+        self.mm[core].record_mpu_fault(unit, address, MPFSR_LOCAL | bit, self.profile.events);
+        false
+    }
+
+    /// DMA accesses carry a requestor PrivID rather than LOCAL. Direct CPU programming of
+    /// IDMA uses ID 0; external masters such as EMAC map through AIDX (IDs >= 6). The unit
+    /// consulted belongs to whichever megamodule owns the memory, which on a multicore device
+    /// is decided by the global address the master used.
+    fn check_dma_access(&mut self, address: u32, permission: Permission, id: u8) -> bool {
+        if !(0..self.cores).any(|core| self.mm[core].mpu_dma_restrictive) {
+            return true;
+        }
+        let Some((core, unit, page)) = self.dma_mpu_page(address) else {
+            return true;
+        };
+        let attributes = self.mm[core].mpu_pages[unit][page];
+        let permission_bit = permission_bit(permission, false);
+        let allowed_id = if id < 6 {
+            1 << (10 + u32::from(id))
+        } else {
+            1 << 9
+        };
+        if attributes & allowed_id != 0 && attributes & permission_bit != 0 {
+            return true;
+        }
+        let status = (u32::from(id) << 9) | permission_bit;
+        self.mm[core].record_mpu_fault(unit, address, status, self.profile.events);
+        false
+    }
+
+    /// The megamodule, unit and page a DMA address protects, resolving a global alias back to
+    /// the local address the protection registers are written in terms of.
+    fn dma_mpu_page(&self, address: u32) -> Option<(usize, usize, usize)> {
+        let map = self.profile.map;
+        let (core, local) = match map.local_of_global(address) {
+            Some(pair) => pair,
+            // Without global aliases a DMA master addresses the only megamodule's local
+            // windows directly.
+            None if !map.has_global_aliases() => (0, address),
+            None => return None,
+        };
+        let (unit, page) = mpu_page(self.profile.mpu_regions, local)?;
+        (core < self.mm.len()).then_some((core, unit, page))
+    }
+
+    // ------------------------------------------------------------------
+    // The memory surface.
+    // ------------------------------------------------------------------
+
+    #[inline(always)]
+    pub(crate) fn read_u8(&mut self, core: usize, address: u32) -> u8 {
+        self.memory(core).read_u8(address)
+    }
+
+    #[inline(always)]
+    pub(crate) fn write_u8(&mut self, core: usize, address: u32, value: u8) {
+        self.memory(core).write_u8(address, value);
+    }
+
+    #[inline(always)]
+    pub(crate) fn read_u16(&mut self, core: usize, address: u32) -> u16 {
+        self.memory(core).read_u16(address)
+    }
+
+    #[inline(always)]
+    pub(crate) fn write_u16(&mut self, core: usize, address: u32, value: u16) {
+        self.memory(core).write_u16(address, value);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fetch32(&mut self, core: usize, address: u32) -> u32 {
+        self.memory(core).fetch32(address)
+    }
+
+    #[inline(always)]
+    pub(crate) fn fetch_packet(&mut self, core: usize, address: u32) -> [u8; 32] {
+        self.memory(core).fetch_packet(address)
+    }
+
+    pub(crate) fn read_bytes(&mut self, core: usize, address: u32, length: usize) -> Vec<u8> {
+        self.memory(core).read_bytes(address, length)
+    }
+
+    /// Load an image segment the way a host or the boot ROM does.
+    ///
+    /// A segment that lands in a megamodule's local window is loaded into *every* core's copy of
+    /// that memory: the local addresses name six different memories on a C6472, each core fetches
+    /// its reset vector from its own L2 (SPRS612G Table 2-4), and a host boot writes the same
+    /// program into each of them (SPRUEC6G section 4.3.2). Anything else - shared L2, DDR2,
+    /// external memory - is one memory and is written once.
+    pub(crate) fn load_image_bytes(&mut self, address: u32, bytes: &[u8]) {
+        let local = matches!(
+            self.profile.map.placement(Requester::Core(0), address),
+            Placement::CoreL2 { .. } | Placement::CoreL1P { .. } | Placement::CoreL1D { .. }
+        );
+        if local {
+            for core in 0..self.cores {
+                self.load_bytes(core, address, bytes);
+            }
+        } else {
+            self.load_bytes(self.profile.reset_core, address, bytes);
+        }
+    }
+
+    /// Load memory the way an image loader or a boot table does: straight into the storage,
+    /// behind every cache.
+    pub(crate) fn load_bytes(&mut self, core: usize, address: u32, bytes: &[u8]) {
+        self.shared.backing.note_memory_write(address, bytes.len());
+        self.shared
+            .backing
+            .write_bytes(Requester::Core(core), address, bytes);
+    }
+
+    /// A host read is the debug port, and the debug port sees what the CPU wrote: a line still
+    /// held dirty in L1D or in the L2 cache has not reached memory yet.
+    pub(crate) fn host_read_bytes(&self, core: usize, address: u32, length: usize) -> Vec<u8> {
+        let mut data = self
+            .shared
+            .backing
+            .read_bytes(Requester::Core(core), address, length);
+        self.mm[core].memory.host_snoop_read(address, &mut data);
+        // A line another core holds dirty is just as unwritten, and on a multicore device the
+        // address the debugger is looking at may be that core's memory.
+        if let Some((owner, local)) = self.owning_core(Requester::Core(core), address) {
+            if owner != core {
+                self.mm[owner].memory.host_snoop_read(local, &mut data);
+                self.mm[owner].memory.host_snoop_read(address, &mut data);
+            }
+        }
+        data
+    }
+
+    pub(crate) fn host_write_bytes(&mut self, core: usize, address: u32, bytes: &[u8]) {
+        let length = bytes.len().min(u32::MAX as usize) as u32;
+        let owner = self.owning_core(Requester::Core(core), address);
+        {
+            let (mm, backing) = (&mut self.mm[core], &mut self.shared.backing);
+            mm.memory.bind(backing).host_invalidate(address, length);
+        }
+        if let Some((owner, local)) = owner {
+            if owner != core {
+                let (mm, backing) = (&mut self.mm[owner], &mut self.shared.backing);
+                mm.memory.bind(backing).host_invalidate(local, length);
+                mm.memory.bind(backing).host_invalidate(address, length);
+            }
+        }
+        self.load_bytes(core, address, bytes);
+    }
+
+    /// Which megamodule's memory an address belongs to, and what that core calls it locally.
+    /// Resolved through the storage rather than the static map, so memory a core has converted
+    /// into cache belongs to nobody.
+    fn owning_core(&self, requester: Requester, address: u32) -> Option<(usize, u32)> {
+        let map = self.profile.map;
+        match self.shared.backing.placement(requester, address) {
+            Placement::CoreL2 { core, offset } => Some((core, map.local_l2().0 + offset)),
+            Placement::CoreL1P { core, offset } => Some((core, 0x00e0_0000 + offset)),
+            Placement::CoreL1D { core, offset } => Some((core, 0x00f0_0000 + offset)),
+            _ => None,
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // DMA masters.
+    // ------------------------------------------------------------------
+
+    /// One word for a DMA master. Peripheral registers answer through their slave port; memory
+    /// follows the snoop protocol the hierarchy owns.
+    fn dma_read32(&mut self, address: u32) -> Option<u32> {
+        if !is_memory(address) {
+            return Some(self.read32(self.profile.reset_core, address));
+        }
+        if !self.check_dma_access(address, Permission::Read, 0) {
+            return None;
+        }
+        let bytes: [u8; 4] = self.dma_bytes(address, 4).try_into().unwrap();
+        Some(match self.shared.backing.endian() {
+            Endian::Little => u32::from_le_bytes(bytes),
+            Endian::Big => u32::from_be_bytes(bytes),
+        })
+    }
+
+    fn dma_write32(&mut self, address: u32, value: u32) {
+        if !is_memory(address) {
+            self.write32(self.profile.reset_core, address, value);
+            return;
+        }
+        if !self.check_dma_access(address, Permission::Write, 0) {
+            return;
+        }
+        let bytes = match self.shared.backing.endian() {
+            Endian::Little => value.to_le_bytes(),
+            Endian::Big => value.to_be_bytes(),
+        };
+        self.dma_store(address, &bytes);
+    }
+
+    /// A DMA read of memory: the stored bytes with the L2 SRAM snoop applied.
+    ///
+    /// The L2 controller serves a DMA read of L2 SRAM from L1D when the CPU holds that line
+    /// dirty, so a buffer the CPU has only written into its cache still goes out correctly
+    /// (SPRU862B section 2.4.2). External memory is not snooped at all. On a multicore device
+    /// the line may be tagged with either the local or the global address, depending on which
+    /// the core used, so both are looked for.
+    fn dma_bytes(&mut self, address: u32, length: usize) -> Vec<u8> {
+        let mut data = self
+            .shared
+            .backing
+            .read_bytes(Requester::Dma, address, length);
+        if let Some((core, local)) = self.snooped_l2(address) {
+            self.mm[core].memory.snoop_read(local, &mut data);
+            if local != address {
+                self.mm[core].memory.snoop_read(address, &mut data);
+            }
+        }
+        data
+    }
+
+    /// A DMA write to L2 SRAM is snoop-written into L1D, so the CPU sees it without any cache
+    /// operation. Outside L2 SRAM the CPU keeps its stale line, and maintaining that is the
+    /// firmware's job (SPRU862B sections 2.4 and 2.6).
+    fn dma_store(&mut self, address: u32, bytes: &[u8]) {
+        self.shared.backing.note_memory_write(address, bytes.len());
+        self.shared
+            .backing
+            .write_bytes(Requester::Dma, address, bytes);
+        if let Some((core, local)) = self.snooped_l2(address) {
+            self.mm[core].memory.snoop_write(local, bytes);
+            if local != address {
+                self.mm[core].memory.snoop_write(address, bytes);
+            }
+        }
+    }
+
+    /// The megamodule whose L2 SRAM a DMA address lands in, and the local address that core
+    /// would have used - the only memory the coherence protocol snoops. Memory the core has
+    /// converted into cache is not L2 SRAM and is not snooped.
+    fn snooped_l2(&self, address: u32) -> Option<(usize, u32)> {
+        let map = self.profile.map;
+        match self.shared.backing.placement(Requester::Dma, address) {
+            Placement::CoreL2 { core, offset } => Some((core, map.local_l2().0 + offset)),
+            _ => None,
+        }
+    }
+
+    fn dma_register_read(&mut self, address: u32, length: usize) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(length);
+        while bytes.len() < length {
+            let byte_address = address.wrapping_add(bytes.len() as u32);
+            let word = self.read32(self.profile.reset_core, byte_address & !3);
+            let word = if self.shared.backing.endian_big() {
+                word.to_be_bytes()
+            } else {
+                word.to_le_bytes()
+            };
+            for byte in word.into_iter().skip((byte_address & 3) as usize) {
+                if bytes.len() == length {
+                    break;
+                }
+                bytes.push(byte);
+            }
+        }
+        bytes
+    }
+
+    /// Write a peripheral register aperture for a DMA master, assembling whole words around
+    /// the bytes the transfer supplies.
+    fn dma_register_write(&mut self, address: u32, bytes: &[u8]) {
+        let mut written = 0usize;
+        while written < bytes.len() {
+            let byte_address = address.wrapping_add(written as u32);
+            let word_address = byte_address & !3;
+            let current = self.read32(self.profile.reset_core, word_address);
+            let mut word = if self.shared.backing.endian_big() {
+                current.to_be_bytes()
+            } else {
+                current.to_le_bytes()
+            };
+            for slot in word.iter_mut().skip((byte_address & 3) as usize) {
+                if written == bytes.len() {
+                    break;
+                }
+                *slot = bytes[written];
+                written += 1;
+            }
+            let value = if self.shared.backing.endian_big() {
+                u32::from_be_bytes(word)
+            } else {
+                u32::from_le_bytes(word)
+            };
+            self.write32(self.profile.reset_core, word_address, value);
+        }
+    }
+}
+
+impl EmacDmaMemory for Fabric {
+    fn dma_read_bytes(&mut self, address: u32, length: usize) -> Vec<u8> {
+        // A DMA access inside a peripheral aperture reaches that peripheral's register through
+        // its slave port, with all the side effects a CPU read would have, rather than the
+        // memory map behind it.
+        if !is_memory(address) {
+            return self.dma_register_read(address, length);
+        }
+        for offset in 0..length {
+            let byte_address = address.wrapping_add(offset as u32);
+            if !self.check_dma_access(byte_address, Permission::Read, 6) {
+                return vec![0; length];
+            }
+        }
+        self.dma_bytes(address, length)
+    }
+
+    fn dma_write_bytes(&mut self, address: u32, bytes: &[u8]) {
+        if !is_memory(address) {
+            self.dma_register_write(address, bytes);
+            return;
+        }
+        for offset in 0..bytes.len() {
+            if !self.check_dma_access(address.wrapping_add(offset as u32), Permission::Write, 6) {
+                return;
+            }
+        }
+        self.dma_store(address, bytes);
+    }
+
+    fn dma_read_u32(&mut self, address: u32) -> u32 {
+        let bytes: [u8; 4] = self.dma_bytes(address, 4).try_into().unwrap();
+        match self.shared.backing.endian() {
+            Endian::Little => u32::from_le_bytes(bytes),
+            Endian::Big => u32::from_be_bytes(bytes),
+        }
+    }
+
+    fn dma_write_u32(&mut self, address: u32, value: u32) {
+        let bytes = match self.shared.backing.endian() {
+            Endian::Little => value.to_le_bytes(),
+            Endian::Big => value.to_be_bytes(),
+        };
+        self.dma_store(address, &bytes);
+    }
+}
+
+/// The fabric as one core sees it: the seam the CPU crosses for every access it makes.
+pub(crate) struct CoreBus<'a> {
+    core: usize,
+    fabric: &'a mut Fabric,
+}
+
+impl<'a> CoreBus<'a> {
+    pub(crate) fn new(core: usize, fabric: &'a mut Fabric) -> Self {
+        Self { core, fabric }
+    }
+
+    pub(crate) fn endian(&self) -> Endian {
+        self.fabric.endian()
+    }
+
+    #[inline(always)]
+    pub(crate) fn read32(&mut self, address: u32) -> u32 {
+        self.fabric.read32(self.core, address)
+    }
+
+    #[inline(always)]
+    pub(crate) fn write32(&mut self, address: u32, value: u32) {
+        self.fabric.write32(self.core, address, value);
+    }
+
+    #[inline(always)]
+    pub(crate) fn read_u8(&mut self, address: u32) -> u8 {
+        self.fabric.read_u8(self.core, address)
+    }
+
+    #[inline(always)]
+    pub(crate) fn write_u8(&mut self, address: u32, value: u8) {
+        self.fabric.write_u8(self.core, address, value);
+    }
+
+    #[inline(always)]
+    pub(crate) fn read_u16(&mut self, address: u32) -> u16 {
+        self.fabric.read_u16(self.core, address)
+    }
+
+    #[inline(always)]
+    pub(crate) fn write_u16(&mut self, address: u32, value: u16) {
+        self.fabric.write_u16(self.core, address, value);
+    }
+
+    pub(crate) fn read_bytes(&mut self, address: u32, length: usize) -> Vec<u8> {
+        self.fabric.read_bytes(self.core, address, length)
+    }
+
+    pub(crate) fn load_bytes(&mut self, address: u32, bytes: &[u8]) {
+        self.fabric.load_bytes(self.core, address, bytes);
+    }
+
+    pub(crate) fn host_read_bytes(&self, address: u32, length: usize) -> Vec<u8> {
+        self.fabric.host_read_bytes(self.core, address, length)
+    }
+
+    pub(crate) fn host_write_bytes(&mut self, address: u32, bytes: &[u8]) {
+        self.fabric.host_write_bytes(self.core, address, bytes);
+    }
+
+    #[inline(always)]
+    pub(crate) fn fetch_packet(&mut self, address: u32) -> [u8; 32] {
+        self.fabric.fetch_packet(self.core, address)
+    }
+
+    #[inline(always)]
+    pub(crate) fn fetch_reusable(&self, address: u32) -> bool {
+        self.fabric.mm[self.core].memory.fetch_reusable(address)
+    }
+
+    #[inline(always)]
+    pub(crate) fn l1p_epoch(&self) -> u64 {
+        self.fabric.mm[self.core].memory.l1p_epoch()
+    }
+
+    pub(crate) fn memory_version(&self, address: u32) -> u64 {
+        self.fabric.shared.backing.memory_version(address)
+    }
+
+    pub(crate) fn track_memory_version(&mut self, address: u32) -> u64 {
+        self.fabric.shared.backing.track_memory_version(address)
+    }
+
+    /// Everything one data access tells the timing model - residency, whether a read would need
+    /// a fill, and where the line comes from - in one answer, because the data access path
+    /// charges all three of every access.
+    #[inline(always)]
+    pub(crate) fn access_timing(&self, address: u32) -> AccessTiming {
+        self.fabric.mm[self.core].memory.access_timing(address)
+    }
+
+    /// The interrupt lines to take this cycle and whether the exception combiner is asserting,
+    /// which `finish_cycle` needs together. `short_tick` is what this core's own ask of the
+    /// device answered: on a cycle the peripherals did not move, the lines the last full tick
+    /// selected are the ones still asserted.
+    #[inline(always)]
+    pub(crate) fn take_interrupt_state(&mut self, short_tick: bool) -> (u16, bool) {
+        let mm = &mut self.fabric.mm[self.core];
+        (
+            mm.take_pending_cpu_interrupts(short_tick),
+            mm.pending_exception_event(),
+        )
+    }
+
+    #[inline(always)]
+    pub(crate) fn take_l1d_victim_flush(&mut self) -> bool {
+        self.fabric.mm[self.core].memory.take_l1d_victim_flush()
+    }
+
+    pub(crate) fn drain_l1p_fills(&mut self) -> std::vec::Drain<'_, LineFill> {
+        self.fabric.mm[self.core].memory.drain_l1p_fills()
+    }
+
+    pub(crate) fn check_access(
+        &mut self,
+        address: u32,
+        permission: Permission,
+        user: bool,
+    ) -> bool {
+        self.fabric
+            .check_access(self.core, address, permission, user)
+    }
+
+    /// Advance the shared peripherals, once per device cycle, and answer whether this ask was
+    /// a short tick.
+    #[inline(always)]
+    pub(crate) fn tick(&mut self, cycle: u64) -> bool {
+        self.fabric.tick(cycle)
+    }
+
+    pub(crate) fn record_dropped_interrupt(&mut self, interrupt: u8) {
+        self.fabric.mm[self.core].record_dropped_interrupt(interrupt);
+    }
+
+    pub(crate) fn cache_views(&self) -> [CacheView; 3] {
+        self.fabric.mm[self.core].cache_views()
+    }
+
+    pub(crate) fn cache_line_data(&self, level: usize, address: u32) -> Option<&[u8]> {
+        self.fabric.mm[self.core].cache_line_data(level, address)
+    }
+
+    pub(crate) fn event_flag_registers(&self) -> [u32; 4] {
+        self.fabric.mm[self.core].event_flag_registers()
+    }
+
+    pub(crate) fn interrupt_selectors(&self) -> [u32; 3] {
+        self.fabric.mm[self.core].interrupt_selectors()
+    }
+
+    /// The host port, the Ethernet backend and the PHY are the device's, not this core's, but
+    /// a front end reaches them through whichever core it is driving.
+    pub(crate) fn hpi_host_read(&mut self, port: HostPort) -> Option<u32> {
+        self.fabric.hpi_host_read(port)
+    }
+
+    pub(crate) fn hpi_host_write(&mut self, port: HostPort, value: u32) {
+        self.fabric.hpi_host_write(port, value);
+    }
+
+    pub(crate) fn take_tx_frames(&mut self) -> Vec<Vec<u8>> {
+        self.fabric.take_tx_frames()
+    }
+
+    /// Deliver a received frame to one of the device's MACs, which is the port the front end's
+    /// Ethernet backend is wired to.
+    pub(crate) fn inject_frame_on(&mut self, port: usize, frame: Vec<u8>) {
+        self.fabric.inject_frame_on(port, frame);
+    }
+
+    /// Whether the MAC the backend is wired to can take a frame of this length now.
+    pub(crate) fn emac_rx_has_room(&self, port: usize, length: usize) -> bool {
+        self.fabric.emac_rx_has_room(port, length)
+    }
+
+    /// Drive one conformance-vector operation at the device through this core.
+    #[cfg(test)]
+    pub(crate) fn apply(&mut self, operation: &Value) -> Result<Option<Value>, String> {
+        self.fabric.apply(operation)
+    }
+
+    pub(crate) fn mar_registers(&self) -> [u32; 256] {
+        self.fabric.mm[self.core].mar_registers()
+    }
+}
+
+/// The ROM bootloader runs on the CPU, so its reads and writes are ordinary CPU accesses and
+/// reach peripheral registers the way a boot configuration table expects (SPRUEC6G section 6.2.3).
+impl BootMemory for CoreBus<'_> {
+    fn boot_read_word(&mut self, address: u32) -> u32 {
+        self.read32(address)
+    }
+
+    fn boot_read_bytes(&mut self, address: u32, length: usize) -> Vec<u8> {
+        self.read_bytes(address, length)
+    }
+
+    fn boot_write_word(&mut self, address: u32, value: u32) {
+        self.write32(address, value);
+    }
+
+    /// Section data is copied a word at a time wherever the destination allows, with only a
+    /// ragged head or tail written a byte at a time. That is what the ROM's own copy loop does,
+    /// and it is what makes a section whose destination is a register work - which SPRUEC6G
+    /// section 4.3.3 relies on when it sets DSP_BOOT_ADDR*n* and BOOT_COMPLETE_STAT from a
+    /// standard boot table - because a byte access in this model reaches memory only.
+    fn boot_write_bytes(&mut self, address: u32, bytes: &[u8]) {
+        let endian = self.endian();
+        let mut cursor = address;
+        let mut rest = bytes;
+        while let Some(byte) = rest.first().copied() {
+            if cursor % 4 == 0 && rest.len() >= 4 {
+                let word: [u8; 4] = rest[..4].try_into().expect("four bytes");
+                self.write32(
+                    cursor,
+                    match endian {
+                        Endian::Little => u32::from_le_bytes(word),
+                        Endian::Big => u32::from_be_bytes(word),
+                    },
+                );
+                cursor = cursor.wrapping_add(4);
+                rest = &rest[4..];
+            } else {
+                self.write_u8(cursor, byte);
+                cursor = cursor.wrapping_add(1);
+                rest = &rest[1..];
+            }
+        }
+    }
+}
+
+/// The megamodule's four flag/mask register kinds, by base address.
+#[derive(Clone, Copy)]
+enum IntcRegister {
+    Flag,
+    Mask,
+    MaskedFlag,
+    ExceptionMask,
+    MaskedExceptionFlag,
+}
+
+fn mpu_page(regions: &'static [MpuRegion], address: u32) -> Option<(usize, usize)> {
+    regions.iter().find_map(|region| {
+        let offset = address.checked_sub(region.base)?;
+        let page = (offset / region.page_bytes) as usize;
+        (page < region.pages).then_some((region.unit, region.first_index + page))
+    })
+}
+
+/// The MPPA bit an access needs: SR SW SX for Supervisor, UR UW UX for User (SPRU871K 8.2).
+fn permission_bit(permission: Permission, user: bool) -> u32 {
+    match (permission, user) {
+        (Permission::Read, false) => 1 << 5,
+        (Permission::Write, false) => 1 << 4,
+        (Permission::Execute, false) => 1 << 3,
+        (Permission::Read, true) => 1 << 2,
+        (Permission::Write, true) => 1 << 1,
+        (Permission::Execute, true) => 1 << 0,
+    }
+}
+
+/// One of the per-page attribute registers of a unit.
+fn page_index(address: u32, base: u32) -> Option<usize> {
+    let offset = address.checked_sub(base)?;
+    (offset < MPU_PAGES as u32 * 4 && offset % 4 == 0).then_some((offset / 4) as usize)
+}
+
+fn intc_register(address: u32) -> Option<(usize, IntcRegister)> {
+    bank_index(address, EVTFLAG0)
+        .map(|bank| (bank, IntcRegister::Flag))
+        .or_else(|| bank_index(address, EVTMASK0).map(|bank| (bank, IntcRegister::Mask)))
+        .or_else(|| bank_index(address, MEVTFLAG0).map(|bank| (bank, IntcRegister::MaskedFlag)))
+        .or_else(|| bank_index(address, EXPMASK0).map(|bank| (bank, IntcRegister::ExceptionMask)))
+        .or_else(|| {
+            bank_index(address, MEXPFLAG0).map(|bank| (bank, IntcRegister::MaskedExceptionFlag))
+        })
+}
+
+fn bandwidth_register(address: u32) -> Option<usize> {
+    BWM_REGISTERS
+        .iter()
+        .position(|(register, _, _)| *register == address)
+}
+
+fn bank_index(address: u32, base: u32) -> Option<usize> {
+    let offset = address.checked_sub(base)?;
+    (offset < 16 && offset % 4 == 0).then_some((offset / 4) as usize)
+}
+
+impl Fabric {
+    /// Cores whose NMI pin the chip-level registers drove since this was last called
+    /// (SPRS612G section 3.7.1). The device delivers them to the matching CPUs.
+    pub(crate) fn take_nmi_requests(&mut self) -> u32 {
+        std::mem::take(&mut self.pending_nmi)
+    }
+
+    /// Cores released from reset since this was last called, by the boot controller or by the
+    /// power/sleep controller.
+    pub(crate) fn take_release_requests(&mut self) -> u32 {
+        std::mem::take(&mut self.pending_release)
+    }
+
+    /// Whether this core's megamodule has a running clock. A core whose LPSC module the
+    /// power/sleep controller has taken out of Enable does not execute (SPRUEG3B section
+    /// 4.1.2); a device without a PSC always runs.
+    pub(crate) fn core_clocked(&self, core: usize) -> bool {
+        match self.shared.psc.as_ref() {
+            Some(psc) => psc.module_enabled(crate::psc::MODULE_GEM0 + core),
+            None => true,
+        }
+    }
+
+    /// Whether a core is held in reset at power-up: with a boot controller, every core but the
+    /// one the boot mode starts (SPRS612G section 2.4.1).
+    pub(crate) fn apply_reset_holds(&mut self) {
+        let Some(boot) = self.shared.bootctl.as_ref() else {
+            return;
+        };
+        let held: Vec<bool> = (0..self.mm.len())
+            .map(|core| boot.held_in_reset(core))
+            .collect();
+        for (core, held) in held.into_iter().enumerate() {
+            self.mm[core].held_in_reset = held;
+        }
+    }
+
+    /// The shared L2 ROM image, which is where the boot controller starts core 0 for every ROM
+    /// boot mode (SPRS612G Table 2-4).
+    #[cfg(test)]
+    pub fn apply(&mut self, operation: &Value) -> Result<Option<Value>, String> {
+        self.shared.touched();
+        // Every operation acts for one core; a vector that says nothing means core 0, which is
+        // the only core a single-core device has.
+        let core = operation
+            .get("core")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            .min(self.mm.len() as u64 - 1) as usize;
+        let op = string_field(operation, "op")?;
+        match op {
+            "write32" => {
+                let address = u32_field(operation, "address")?;
+                let value = u32_field(operation, "value")?;
+                self.write32(core, address, value);
+                Ok(None)
+            }
+            "read32" => {
+                let address = u32_field(operation, "address")?;
+                Ok(Some(json!(self.read32(core, address))))
+            }
+            "write_bytes" => {
+                let address = u32_field(operation, "address")?;
+                let bytes = decode_hex(string_field(operation, "hex")?)?;
+                self.load_bytes(core, address, &bytes);
+                Ok(None)
+            }
+            "read_bytes" => {
+                let address = u32_field(operation, "address")?;
+                let length = usize_field(operation, "length")?;
+                Ok(Some(json!(encode_hex(
+                    &self.read_bytes(core, address, length)
+                ))))
+            }
+            // A load, store or fetch as the core issues it: checked against the page the
+            // address falls in, where `write32` and `read32` above are the debug port and are
+            // never checked. It answers whether the access was granted.
+            "cpu_access" => {
+                let address = u32_field(operation, "address")?;
+                let permission = match string_field(operation, "permission")? {
+                    "read" => Permission::Read,
+                    "write" => Permission::Write,
+                    "execute" => Permission::Execute,
+                    other => return Err(format!("unsupported permission {other}")),
+                };
+                let user = operation
+                    .get("user")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                Ok(Some(json!(
+                    self.check_access(core, address, permission, user)
+                )))
+            }
+            "tick" => {
+                let cycles = usize_field(operation, "cycles")?;
+                for _ in 0..cycles {
+                    self.tick_once();
+                }
+                Ok(None)
+            }
+            // The ROM bootloader's two table formats (SPRUEC6G sections 6.2.2 and 6.2.3).
+            "boot_table" => {
+                let address = u32_field(operation, "address")?;
+                let entry = crate::boot::load_boot_table(&mut self.core(core), address)?;
+                Ok(Some(json!(entry)))
+            }
+            "boot_config" => {
+                let address = u32_field(operation, "address")?;
+                let calls = crate::boot::apply_boot_configuration(&mut self.core(core), address)?;
+                Ok(Some(json!(calls)))
+            }
+            "take_tx_frames" => {
+                let frames = self
+                    .take_tx_frames()
+                    .into_iter()
+                    .map(|frame| encode_hex(&frame))
+                    .collect::<Vec<_>>();
+                Ok(Some(json!(frames)))
+            }
+            "set_link" => {
+                // Drive the PHY's link state, which latches the MDIO link-change interrupt.
+                let value = u32_field(operation, "value")?;
+                self.mdio_set_link(value != 0);
+                Ok(None)
+            }
+            // The four host access types the HCNTL pins select (SPRU969B Table 4).
+            "hpi_read" => {
+                let port = host_port(string_field(operation, "port")?)?;
+                Ok(Some(json!(self.hpi_host_read(port))))
+            }
+            // The 16-bit multiplexed mode: one datagram per halfword, HHWIL as `second`.
+            "hpi_read16" => {
+                let port = host_port(string_field(operation, "port")?)?;
+                let second = operation
+                    .get("second")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                Ok(Some(json!(self.hpi_host_read_halfword(port, second))))
+            }
+            "hpi_write16" => {
+                let port = host_port(string_field(operation, "port")?)?;
+                let value = u32_field(operation, "value")? as u16;
+                let second = operation
+                    .get("second")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                self.hpi_host_write_halfword(port, value, second);
+                Ok(None)
+            }
+            "hpi_write" => {
+                let port = host_port(string_field(operation, "port")?)?;
+                let value = u32_field(operation, "value")?;
+                self.hpi_host_write(port, value);
+                Ok(None)
+            }
+            // The external ATM master on the UTOPIA pins: it polls the transmit queue for a
+            // cell and offers cells to the receive queue.
+            "utopia_master_read" => {
+                let cell = self
+                    .shared
+                    .utopia
+                    .as_mut()
+                    .and_then(|utopia| utopia.master_take_cell());
+                self.latch_utopia_interrupt();
+                Ok(Some(match cell {
+                    Some(bytes) => json!(encode_hex(&bytes)),
+                    None => Value::Null,
+                }))
+            }
+            "utopia_master_write" => {
+                let bytes = decode_hex(string_field(operation, "hex")?)?;
+                let accepted = self
+                    .shared
+                    .utopia
+                    .as_mut()
+                    .is_some_and(|utopia| utopia.master_send_cell(&bytes));
+                self.latch_utopia_interrupt();
+                Ok(Some(json!(accepted)))
+            }
+            // A device on the I2C bus at one address, with the bytes it answers a read with.
+            "i2c_slave" => {
+                let address = u32_field(operation, "address")?;
+                let bytes = match operation.get("hex") {
+                    Some(_) => decode_hex(string_field(operation, "hex")?)?,
+                    None => Vec::new(),
+                };
+                self.shared.i2c.attach_slave(address, bytes);
+                Ok(None)
+            }
+            // What that device has been sent.
+            "i2c_slave_received" => Ok(Some(json!(encode_hex(&self.shared.i2c.slave_received())))),
+            // An external driver on the GPIO input pins, which nothing on the device model
+            // would otherwise hold at any level.
+            "gpio_input" => {
+                let value = u32_field(operation, "value")?;
+                self.shared.gpio.drive_inputs(value);
+                Ok(None)
+            }
+            "inject_frame" => {
+                let frame = decode_hex(string_field(operation, "hex")?)?;
+                let port = operation.get("port").and_then(Value::as_u64).unwrap_or(0) as usize;
+                // A frame may arrive with the wire errors the receiver cannot make itself.
+                let mut errors = 0;
+                if let Some(names) = operation.get("errors").and_then(Value::as_array) {
+                    for name in names {
+                        errors |= match name.as_str().unwrap_or_default() {
+                            "crc" => crate::emac::RX_ERROR_CRC,
+                            "align" => crate::emac::RX_ERROR_ALIGN,
+                            "code" => crate::emac::RX_ERROR_CODE,
+                            other => return Err(format!("unknown frame error {other:?}")),
+                        };
+                    }
+                }
+                self.shared.touched();
+                if let Some(Some(emac)) = self.shared.emac.get_mut(port) {
+                    emac.inject_frame_with_errors(frame, errors);
+                }
+                Ok(None)
+            }
+            other => Err(format!("unsupported system operation {other}")),
+        }
+    }
+}
+
+/// The host access type a case names, matching the HCNTL encoding in SPRU969B Table 4.
+#[cfg(test)]
+fn host_port(name: &str) -> Result<HostPort, String> {
+    match name {
+        "hpic" => Ok(HostPort::Control),
+        "hpia" => Ok(HostPort::Address),
+        "hpid" => Ok(HostPort::Data),
+        "hpid_auto" => Ok(HostPort::DataAutoIncrement),
+        other => Err(format!("unknown HPI host port {other}")),
+    }
+}
+
+#[cfg(test)]
+fn string_field<'a>(value: &'a Value, key: &str) -> Result<&'a str, String> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("missing string field {key}"))
+}
+
+#[cfg(test)]
+fn u32_field(value: &Value, key: &str) -> Result<u32, String> {
+    value
+        .get(key)
+        .and_then(Value::as_u64)
+        .and_then(|number| u32::try_from(number).ok())
+        .ok_or_else(|| format!("missing u32 field {key}"))
+}
+
+#[cfg(test)]
+fn usize_field(value: &Value, key: &str) -> Result<usize, String> {
+    value
+        .get(key)
+        .and_then(Value::as_u64)
+        .and_then(|number| usize::try_from(number).ok())
+        .ok_or_else(|| format!("missing usize field {key}"))
+}
+
+#[cfg(test)]
+fn decode_hex(text: &str) -> Result<Vec<u8>, String> {
+    if text.len() % 2 != 0 {
+        return Err("hex string has odd length".into());
+    }
+    text.as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let text = std::str::from_utf8(pair).map_err(|_| "invalid hex")?;
+            u8::from_str_radix(text, 16).map_err(|_| "invalid hex".into())
+        })
+        .collect()
+}
+
+#[cfg(test)]
+fn encode_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0xf) as usize] as char);
+    }
+    output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::emac::DmaMemory;
+    use crate::memory::{L1DCFG, L1DINV, L1PCFG, L2CFG, L2WB, L2WBAR, L2WWC, MAR_BASE};
+    use crate::port::SlavePort;
+
+    #[test]
+    fn cache_size_registers_follow_the_c6455_encodings() {
+        let mut fabric = Fabric::default();
+        for (mode, l1_bytes, l2_bytes) in [
+            (0, 0, 0),
+            (1, 4 * 1024, 32 * 1024),
+            (2, 8 * 1024, 64 * 1024),
+            (3, 16 * 1024, 128 * 1024),
+            (4, 32 * 1024, 256 * 1024),
+            // Encodings above 4 select the maximum; TI's kernel writes 7 to all three registers.
+            (7, 32 * 1024, 256 * 1024),
+        ] {
+            fabric.write32(0, L1PCFG, mode);
+            fabric.write32(0, L1DCFG, mode);
+            fabric.write32(0, L2CFG, mode);
+            let [l1p, l1d, l2] = fabric.megamodule(0).cache_views();
+            assert_eq!(l1p.capacity_lines * l1p.line_size as usize, l1_bytes);
+            assert_eq!(l1d.capacity_lines * l1d.line_size as usize, l1_bytes);
+            assert_eq!(l2.capacity_lines * l2.line_size as usize, l2_bytes);
+        }
+    }
+
+    /// The other half of what a cache size decides: how much SRAM is left, and where.
+    ///
+    /// SPRU862B Figure 2-1 draws it for the C6455's 2048 KB L2 - the four cache sizes sit at
+    /// 009F 8000h, 009F 0000h, 009E 0000h and 009C 0000h - and the C6472's 608 KB L2 follows
+    /// the same rule from a different top (SPRS612G Table 2-2 ends its local L2 at 0089 7FFFh).
+    /// L1P is here rather than in a suite case because no case can read it: "the CPU cannot
+    /// read from L1P, even if L1P is memory-mapped" (SPRU871K section 2.3.1.2), so a DMA master
+    /// is the only requester that can ask, which is how firmware writes L1P too.
+    #[test]
+    fn a_cache_size_moves_the_end_of_the_sram_it_came_out_of() {
+        // The four documented sizes, then the "maximal cache" encoding that repeats the last
+        // (SPRU871K Tables 2-2, 3-2 and 4-4).
+        const MODES: [u32; 6] = [0, 1, 2, 3, 4, 7];
+        const L2_SIZES: [u32; 6] = [0, 32 << 10, 64 << 10, 128 << 10, 256 << 10, 256 << 10];
+        const L1_SIZES: [u32; 6] = [0, 4 << 10, 8 << 10, 16 << 10, 32 << 10, 32 << 10];
+        for profile in [&crate::device::C6455, &crate::device::C6472] {
+            let map = profile.map;
+            // A DMA master's address is global wherever the device has global addresses
+            // (SPRS612G Table 2-2), and a DMA master is the only requester that can ask about
+            // L1P at all.
+            let alias = map.global_alias_base(0).unwrap_or(0);
+            let [l1p, l1d] = map.local_l1();
+            let windows = [
+                (L2CFG, alias + map.local_l2().0, map.l2_bytes(), L2_SIZES),
+                (L1PCFG, alias + l1p.0, l1p.1, L1_SIZES),
+                (L1DCFG, alias + l1d.0, l1d.1, L1_SIZES),
+            ];
+            for (register, base, bytes, sizes) in windows {
+                for (index, mode) in MODES.into_iter().enumerate() {
+                    let cache = sizes[index];
+                    let mut fabric = Fabric::new(profile);
+                    // Where the SRAM ends once this much of the window has become cache.
+                    let split = base + bytes - cache;
+                    if cache > 0 {
+                        fabric.dma_write32(split, 0xfeed_face);
+                    }
+                    if cache < bytes {
+                        fabric.dma_write32(split - 4, 0xfeed_face);
+                    }
+                    fabric.write32(0, register, mode);
+                    if cache > 0 {
+                        // The first word the cache took holds nothing and keeps nothing.
+                        assert_eq!(fabric.dma_read32(split), Some(0), "{register:#x} {mode}");
+                        fabric.dma_write32(split, 0x0bad_c0de);
+                        assert_eq!(fabric.dma_read32(split), Some(0), "{register:#x} {mode}");
+                    }
+                    if cache < bytes {
+                        // The last word below it is still the SRAM it always was.
+                        assert_eq!(
+                            fabric.dma_read32(split - 4),
+                            Some(0xfeed_face),
+                            "{register:#x} {mode}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The same policy where it actually bites: a dirty L1D line whose L2 line has already been
+    /// evicted, so the victim arrives at an L2 that no longer has anywhere to put it.
+    ///
+    /// Two rules meet here and each is right on its own. L1D evicts dirty lines and writes them
+    /// back; L2 allocates a line on a write that misses it. Composing them made a late victim
+    /// allocate an L2 line the hardware never allocates - SPRU871K section 4.3.8.3: "L1D victim
+    /// writebacks do not trigger line allocations in L2. L1D victims are written directly to
+    /// external memory if they miss L2."
+    ///
+    /// Reaching that state takes the geometry rather than a big loop, because a linear sweep
+    /// never gets there: the L1D victim trails the read pointer by an L1D capacity, which is far
+    /// less than L2's, so its line is always still resident. What separates the two caches is
+    /// that an L2 set spans two L1D sets - the L2 set field is address bits 12:7 and the L1D set
+    /// field is bits 10:6, so within one L2 set only bit 6 is free, and the two halves of a
+    /// 128-byte L2 line fall in different L1D sets. Conflicting in L2 through the *far* half of
+    /// each line therefore evicts the victim's L2 line while leaving its L1D line alone.
+    #[test]
+    fn an_l1d_victim_that_misses_l2_does_not_allocate_a_line_there() {
+        const DDR2: u32 = 0xe000_0000;
+        const MAR224: u32 = MAR_BASE + 224 * 4;
+        /// 32 KB of L2 cache over four ways: the stride that indexes one set.
+        const L2_WAY_STRIDE: u32 = 8 * 1024;
+        /// 4 KB of L1D cache over two ways.
+        const L1D_WAY_STRIDE: u32 = 2 * 1024;
+        const L2_LINE: u32 = 128;
+
+        let mut fabric = Fabric::default();
+        // Without the MAR's permit-copies bit nothing external is cached at all (SPRU871K
+        // section 4.3.7.1), so there would be neither a fill nor a victim.
+        fabric.write32(0, MAR224, 1);
+        fabric.write32(0, L1DCFG, 1);
+        fabric.write32(0, L2CFG, 1);
+
+        // The victim: read to allocate the L1D line, then write to dirty it. L1D is
+        // read-allocate, so this is the only way a line becomes dirty.
+        let victim = DDR2;
+        let seen = fabric.read32(0, victim);
+        fabric.write32(0, victim, seen ^ 0xa5a5_5a5a);
+
+        // Evict the victim's L2 line: four more lines in the same L2 set, addressed through the
+        // far half of each so they land in the other L1D set and cannot touch the victim's L1D
+        // line. Four is the associativity, so the set is turned over completely.
+        for way in 1..=4 {
+            fabric.read32(0, victim + way * L2_WAY_STRIDE + L2_LINE / 2);
+        }
+        let [_, _, l2] = fabric.megamodule(0).cache_views();
+        assert!(
+            !l2.lines.iter().any(|line| line.address == victim),
+            "the conflicting reads have to evict the victim's own L2 line first"
+        );
+
+        // Now evict the victim from L1D, which is what sends it down. Two more lines in its L1D
+        // set fill both ways; they sit in other L2 sets, so nothing else moves.
+        for way in 1..=2 {
+            fabric.read32(0, victim + way * L1D_WAY_STRIDE);
+        }
+
+        let [_, l1d, l2] = fabric.megamodule(0).cache_views();
+        assert!(
+            l1d.stats.dirty_evictions > 0,
+            "the victim has to have left L1D dirty for there to be a writeback at all"
+        );
+        assert!(
+            !l1d.lines.iter().any(|line| line.address == victim),
+            "the victim is out of L1D"
+        );
+        // The whole point: the victim missed L2 and went past it to memory, rather than
+        // allocating a line there and evicting something the hardware would have kept.
+        assert!(
+            !l2.lines.iter().any(|line| line.address == victim),
+            "an L1D victim that misses L2 must not allocate a line in it"
+        );
+        // And the data reached memory: reading it back refills from the backing store.
+        assert_eq!(fabric.read32(0, victim), 0xa5a5_5a5a);
+    }
+
+    /// Which ports a device has comes from its profile and nothing else, so the two devices
+    /// differ by exactly the blocks the data manuals say they differ by: the C6472 adds an
+    /// interrupt-control module in front of each of its two MACs, a boot controller, a
+    /// power/sleep controller, a shared-memory controller with a profiler per core, and the
+    /// chip-level registers; the C6455 adds the EMIFA, UTOPIA, the two McBSPs and the device
+    /// configuration block.
+    #[test]
+    fn the_profile_decides_which_ports_a_device_has() {
+        let ports = |profile| Fabric::new(profile).shared.ports.clone();
+        let c6455 = ports(&crate::device::C6455);
+        let c6472 = ports(&crate::device::C6472);
+
+        // Every device has one EDMA3 with four transfer controllers, both PLLs, and the
+        // peripherals that are not device-specific.
+        for list in [&c6455, &c6472] {
+            assert!(list.contains(&Port::Edma));
+            assert!(list.contains(&Port::Mdio));
+            assert!(list.contains(&Port::Pll));
+            assert!(list.contains(&Port::Pll2));
+            for index in 0..4 {
+                assert!(list.contains(&Port::TransferController(index)));
+            }
+            // The chip-level registers claim a whole window, so nothing may be asked after
+            // them.
+            if let Some(position) = list.iter().position(|port| *port == Port::ChipConfig) {
+                assert_eq!(position, list.len() - 1);
+            }
+        }
+
+        assert_eq!(
+            c6455
+                .iter()
+                .filter(|port| matches!(port, Port::Emac(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            c6472
+                .iter()
+                .filter(|port| matches!(port, Port::Emac(_)))
+                .count(),
+            2
+        );
+
+        for only_c6472 in [
+            Port::Emic(0),
+            Port::BootController,
+            Port::Psc,
+            Port::Smc,
+            Port::SmcProfiler(0),
+            Port::ChipConfig,
+        ] {
+            assert!(!c6455.contains(&only_c6472), "C6455 has {only_c6472:?}");
+            assert!(c6472.contains(&only_c6472), "C6472 lacks {only_c6472:?}");
+        }
+        for only_c6455 in [Port::Emifa, Port::Mcbsp(0), Port::Devcfg] {
+            assert!(c6455.contains(&only_c6455), "C6455 lacks {only_c6455:?}");
+            assert!(!c6472.contains(&only_c6455), "C6472 has {only_c6455:?}");
+        }
+        // UTOPIA is on both: the C6472 carries the same ATM interface (SPRS612G Table 2-2).
+        assert!(c6455.contains(&Port::Utopia) && c6472.contains(&Port::Utopia));
+        // One profiler per core.
+        assert_eq!(
+            c6472
+                .iter()
+                .filter(|port| matches!(port, Port::SmcProfiler(_)))
+                .count(),
+            6
+        );
+    }
+
+    /// A master lent out for its own transfer is not addressable by that transfer.
+    ///
+    /// This is a consequence of how the fabric hands a master to itself rather than a rule any
+    /// document states: the slot is empty for the duration, so no port claims the master's
+    /// register block and the access falls through to the memory behind the aperture. Nothing
+    /// asserted it before, which meant a change to the lending protocol could alter it silently.
+    #[test]
+    fn a_lent_out_master_does_not_answer_its_own_transfer() {
+        const TXIDVER: u32 = 0x02c8_0000;
+        let mut fabric = Fabric::default();
+
+        // In its slot, the MAC owns its register block and identifies itself.
+        assert_eq!(fabric.owner_of(TXIDVER), Some(Port::Emac(0)));
+        assert_eq!(fabric.read32(0, TXIDVER), 0x000c_0a08);
+
+        // Lent out, nothing claims it.
+        fabric.lend_emac(0, |_emac, fabric| {
+            assert_eq!(fabric.owner_of(TXIDVER), None);
+            assert_eq!(fabric.read32(0, TXIDVER), 0);
+        });
+
+        // Back in its slot, it answers again.
+        assert_eq!(fabric.owner_of(TXIDVER), Some(Port::Emac(0)));
+        assert_eq!(fabric.read32(0, TXIDVER), 0x000c_0a08);
+
+        // The other masters stay reachable while one is lent out, which is what lets the EDMA3
+        // transfer to and from a peripheral register during its own tick.
+        fabric.lend_emac(0, |_emac, fabric| {
+            assert_eq!(fabric.owner_of(0x02a0_0000), Some(Port::Edma));
+        });
+        fabric.lend_edma(|_edma, fabric| {
+            assert_eq!(fabric.owner_of(TXIDVER), Some(Port::Emac(0)));
+            assert_eq!(
+                fabric.owner_of(0x02a0_0000),
+                None,
+                "the EDMA3 itself is out"
+            );
+        });
+    }
+
+    /// Every shared port answers at the base its data manual gives it, on the device that has
+    /// it, and the lowest address in its window that is a register rather than a hole.
+    ///
+    /// Asserting *which* port owns an address, not only that some port does, is what catches a
+    /// window that has drifted onto a neighbour's: `no_two_slave_ports_claim_one_address` would
+    /// still pass if two ports swapped windows. Addresses come from SPRS276M Tables 7-13 to
+    /// 7-38 for the C6455 and SPRS612G Tables 7-98 to 7-116 for the C6472.
+    #[test]
+    fn each_port_answers_at_its_documented_base() {
+        let mut c6455 = Fabric::new(&crate::device::C6455);
+        for (address, expected) in [
+            (0x02a0_0000, Port::Edma),
+            (0x02a2_0000, Port::TransferController(0)),
+            (0x02a2_8000, Port::TransferController(1)),
+            (0x02a3_0000, Port::TransferController(2)),
+            (0x02a3_8000, Port::TransferController(3)),
+            // The C6455's two timers sit 0x40000 apart (SPRS276M section 7.16).
+            (0x0294_0000, Port::Timer(0)),
+            (0x0298_0000, Port::Timer(1)),
+            (0x02b0_0008, Port::Gpio),
+            (0x02b0_4000, Port::I2c),
+            // Both PLL controllers keep their registers well into their windows.
+            (0x029a_00e4, Port::Pll),
+            (0x029c_0118, Port::Pll2),
+            (0x0288_0004, Port::Hpi),
+            (0x7800_0000, Port::Ddr2),
+            (0x7000_0000, Port::Emifa),
+            (0x02b4_0000, Port::Utopia),
+            (0x028c_0000, Port::Mcbsp(0)),
+            (0x0290_0000, Port::Mcbsp(1)),
+            // The device configuration block owns two windows.
+            (0x02a8_0000, Port::Devcfg),
+            (0x02ac_0004, Port::Devcfg),
+            (0x02c8_0000, Port::Emac(0)),
+            (0x02c8_1800, Port::Mdio),
+        ] {
+            assert_eq!(
+                c6455.owner_of(address),
+                Some(expected),
+                "C6455 {address:#010x}"
+            );
+        }
+
+        let mut c6472 = Fabric::new(&crate::device::C6472);
+        for (address, expected) in [
+            (0x02a0_0000, Port::Edma),
+            (0x02a2_0000, Port::TransferController(0)),
+            (0x02a3_8000, Port::TransferController(3)),
+            (0x02b0_0008, Port::Gpio),
+            (0x02b0_4000, Port::I2c),
+            (0x029a_00e4, Port::Pll),
+            (0x029c_0118, Port::Pll2),
+            (0x0288_0004, Port::Hpi),
+            (0x7800_0000, Port::Ddr2),
+            (0x02b4_0000, Port::Utopia),
+            // Two MACs 0x40000 apart, each with its own interrupt-control module in front, and
+            // one MDIO they share (SPRS612G Tables 7-101 and 7-103).
+            (0x02c8_0000, Port::Emac(0)),
+            (0x02cc_0000, Port::Emac(1)),
+            (0x02c8_1000, Port::Emic(0)),
+            (0x02cc_1000, Port::Emic(1)),
+            (0x02c8_1800, Port::Mdio),
+            // Twelve timers on 64 KB boundaries from 0x025E 0000: 0-5 belong to the
+            // megamodules, 6-11 are shared (SPRS612G section 7.16.2).
+            (0x025e_0000, Port::Timer(0)),
+            (0x0263_0000, Port::Timer(5)),
+            (0x0264_0000, Port::Timer(6)),
+            (0x0269_0000, Port::Timer(11)),
+            // The device-level blocks a C6455 does not have.
+            (0x02ab_0000, Port::BootController),
+            (0x02ae_0000, Port::Psc),
+            (0x02aa_8000, Port::Smc),
+            (0x02a8_0000, Port::ChipConfig),
+        ] {
+            assert_eq!(
+                c6472.owner_of(address),
+                Some(expected),
+                "C6472 {address:#010x}"
+            );
+        }
+    }
+
+    /// The identification registers are profile data, not something derived from a capability.
+    ///
+    /// MM_REVID used to pick its value from `has_boot_controller`, which happened to give the
+    /// right answer for the two modelled devices and would have given a wrong one for any
+    /// device whose revision moved without its block set changing. It is a field now, and
+    /// nothing pinned it before this case.
+    #[test]
+    fn each_device_reports_its_own_identification_registers() {
+        // MM_REVID: VERSION 1 in the upper half, the silicon revision in the lower. SPRS612G
+        // Table 2-1 gives 0003h for the C6472; the C6455's megamodule is revision 0.
+        let mut c6455 = Fabric::new(&crate::device::C6455);
+        assert_eq!(c6455.read32(0, MM_REVID), 0x0001_0000);
+        let mut c6472 = Fabric::new(&crate::device::C6472);
+        assert_eq!(c6472.read32(0, MM_REVID), 0x0001_0003);
+
+        // Every megamodule of a multicore device reports the same revision: it is the core's
+        // design, not its instance.
+        for core in 0..6 {
+            assert_eq!(c6472.read32(core, MM_REVID), 0x0001_0003, "core {core}");
+        }
+
+        // The register is read-only: a write is accepted and discarded rather than refused.
+        c6472.write32(0, MM_REVID, 0xffff_ffff);
+        assert_eq!(c6472.read32(0, MM_REVID), 0x0001_0003);
+    }
+
+    /// The same address names a different block on each device, which is why peripheral
+    /// ownership has to come from the profile rather than from one table for the family.
+    ///
+    /// 0x02A8 0000 is the C6455's device configuration block and the C6472's chip-level
+    /// registers; 0x02C8 1004 is EWCTL inside the C6455's own MAC and EMIC0's PSCFG on the
+    /// C6472 (SPRS276M sections 7.15 and 7.19; SPRS612G Tables 7-98 and 7-105).
+    #[test]
+    fn one_address_names_a_different_block_on_each_device() {
+        let mut c6455 = Fabric::new(&crate::device::C6455);
+        let mut c6472 = Fabric::new(&crate::device::C6472);
+        assert_eq!(c6455.owner_of(0x02a8_0000), Some(Port::Devcfg));
+        assert_eq!(c6472.owner_of(0x02a8_0000), Some(Port::ChipConfig));
+        assert_eq!(c6455.owner_of(0x02c8_1004), Some(Port::Emac(0)));
+        assert_eq!(c6472.owner_of(0x02c8_1004), Some(Port::Emic(0)));
+    }
+
+    /// A window belonging to a block the device does not have is claimed by nobody, so the
+    /// access falls through to memory instead of being answered by whichever port sits nearby.
+    /// The timers are the sharpest case: both devices have them, at different addresses.
+    #[test]
+    fn a_block_a_device_lacks_claims_nothing() {
+        let mut c6455 = Fabric::new(&crate::device::C6455);
+        for absent in [
+            0x02cc_0000, // the second MAC
+            0x02cc_1000, // its interrupt-control module
+            0x02ab_0000, // the boot controller
+            0x02ae_0000, // the power/sleep controller
+            0x02aa_8000, // the shared-memory controller
+            0x02c2_0000, // its per-core profilers
+            0x025e_0000, // the C6472's timer 0
+        ] {
+            assert_eq!(c6455.owner_of(absent), None, "C6455 {absent:#010x}");
+        }
+        let mut c6472 = Fabric::new(&crate::device::C6472);
+        for absent in [
+            0x7000_0000, // the EMIFA
+            0x028c_0000, // McBSP 0
+            0x0290_0000, // McBSP 1
+            0x02ac_0004, // the device configuration block's second window
+            0x0294_0000, // the C6455's timer 0
+            0x0298_0000, // the C6455's timer 1
+        ] {
+            assert_eq!(c6472.owner_of(absent), None, "C6472 {absent:#010x}");
+        }
+    }
+
+    /// The C6472 gives every core its own shared-memory profiler, 16 KB apart from
+    /// 0x02C2 0000 (SPRUEG5D section 3). Each answers for its own core and no other.
+    #[test]
+    fn each_core_has_its_own_shared_memory_profiler() {
+        let mut fabric = Fabric::new(&crate::device::C6472);
+        for core in 0..6usize {
+            let base = 0x02c2_0000 + 0x4000 * core as u32;
+            assert_eq!(
+                fabric.owner_of(base),
+                Some(Port::SmcProfiler(core)),
+                "profiler {core}"
+            );
+        }
+        // The window stops after the sixth: a seventh core's address belongs to nobody.
+        assert_eq!(fabric.owner_of(0x02c2_0000 + 0x4000 * 6), None);
+    }
+
+    /// MACINVECTOR is the one shared register the router answers itself, because it reports the
+    /// MDIO's interrupts from inside an EMAC's register map and only the control module sees
+    /// both (SPRU975E section 2.16.4). On a C6472 there are two of them and one MDIO, so each
+    /// MAC's vector must carry that MAC's own interrupts and the shared MDIO's.
+    #[test]
+    fn each_mac_input_vector_composes_its_own_mac_with_the_shared_mdio() {
+        const MDIO_CONTROL: u32 = 0x02c8_1804;
+        const MDIO_USERINTMASKSET: u32 = 0x02c8_1828;
+        const MDIO_USERACCESS0: u32 = 0x02c8_1880;
+        const MDIO_ENABLE: u32 = 1 << 30;
+        const USER_BIT: u32 = 1 << 31;
+        const LINK_BIT: u32 = 1 << 30;
+
+        let mut fabric = Fabric::new(&crate::device::C6472);
+        for base in [0x02c8_0000u32, 0x02cc_0000] {
+            assert_eq!(fabric.read32(0, base + 0x90) & (LINK_BIT | USER_BIT), 0);
+        }
+
+        // Complete a user access on channel 0, which is what raises the interrupt: enable the
+        // module, unmask the channel, issue a read of the PHY, and let the transaction finish.
+        fabric.write32(0, MDIO_CONTROL, MDIO_ENABLE);
+        fabric.write32(0, MDIO_USERINTMASKSET, 1);
+        fabric.write32(0, MDIO_USERACCESS0, (1 << 31) | (1 << 16));
+        for _ in 0..32 {
+            fabric.tick_once();
+        }
+
+        // One module, two MACs: both vectors report the shared MDIO's interrupt.
+        for base in [0x02c8_0000u32, 0x02cc_0000] {
+            assert_eq!(
+                fabric.read32(0, base + 0x90) & USER_BIT,
+                USER_BIT,
+                "MACINVECTOR at {base:#010x} lost the shared MDIO's interrupt"
+            );
+        }
+        // No port owns the composed register: the router decodes it before the walk.
+        assert_eq!(fabric.owner_of(0x02c8_0090), None);
+    }
+
+    /// Reads are the only ownership probe that can be swept over a live device. Several ports
+    /// have write-only registers, while PSC reset requests and boot-release writes are destructive,
+    /// so probing write ownership would require rebuilding the device for every address.
+    #[test]
+    fn no_two_slave_ports_claim_one_address() {
+        for profile in [&crate::device::C6455, &crate::device::C6472] {
+            let mut fabric = Fabric::new(profile);
+            let context = fabric.port_context();
+            let mut windows = vec![
+                // The megamodule-local IDMA port is included once: every core has the same private
+                // address, and the fabric selects the requesting core before this dispatch.
+                (0x0182_0000, 0x114),
+                (0x02a0_0000, 0x3000),
+                (0x02a0_4000, 0x2000),
+                (0x02a2_0000, 0x8000),
+                (0x02a2_8000, 0x8000),
+                (0x02a3_0000, 0x8000),
+                (0x02a3_8000, 0x8000),
+                (0x02b0_0000, 0x34),
+                (0x02b0_4000, 0x50),
+                (0x029a_0000, 0x168),
+                (0x029c_0000, 0x154),
+                (0x0288_0000, 0x3c),
+                (0x7800_0000, 0xe8),
+                (0x02c8_1800, 0x90),
+            ];
+            windows.extend(
+                profile
+                    .emac_bases
+                    .iter()
+                    .copied()
+                    .map(|base| (base, 0x1000)),
+            );
+            windows.extend(profile.emic_bases.iter().copied().map(|base| (base, 0x800)));
+            windows.extend(profile.timer_bases.iter().copied().map(|base| (base, 0x2c)));
+            if profile.has_emifa {
+                windows.push((0x7000_0000, 0x100));
+            }
+            if profile.has_mcbsp {
+                windows.extend([
+                    (0x028c_0000, 0x100),
+                    (0x0290_0000, 0x100),
+                    (0x3000_0000, 4),
+                    (0x3000_0010, 4),
+                    (0x3400_0000, 4),
+                    (0x3400_0010, 4),
+                ]);
+            }
+            if profile.has_utopia {
+                windows.extend([
+                    (0x02b4_0000, 0x20),
+                    (0x3c00_0000, 0x400),
+                    (0x3c00_0400, 0x400),
+                ]);
+            }
+            if profile.has_device_config {
+                windows.extend([(0x02a8_0000, 0x0c), (0x02ac_0000, 0x58)]);
+            }
+            if profile.has_boot_controller {
+                windows.extend([
+                    (0x02a8_0000, 0x0002_0000),
+                    (0x02aa_8000, 0x8000),
+                    (0x02ab_0000, 0x8000),
+                    (0x02ae_0000, 0x1_0000),
+                ]);
+                windows.extend(
+                    (0..profile.cores()).map(|core| (0x02c2_0000 + 0x4000 * core as u32, 0x4000)),
+                );
+            }
+
+            // Walk the same list the router walks, so the proof cannot name a set of ports the
+            // dispatch does not have. The megamodule-local IDMA port is checked alongside them:
+            // every core has it at the same private address, and the fabric selects the
+            // requesting core before this dispatch.
+            for (base, size) in windows {
+                for address in (base..base + size).step_by(4) {
+                    let mut claimed_by: Option<String> = None;
+                    let mut claim = |name: String, taken: bool| {
+                        if !taken {
+                            return;
+                        }
+                        if let Some(first) = &claimed_by {
+                            panic!(
+                                "{} address {address:#010x} is claimed by {first} and {name}",
+                                profile.name
+                            );
+                        }
+                        claimed_by = Some(name);
+                    };
+                    let taken = SlavePort::read(&mut fabric.mm[0].idma, address, context).is_some();
+                    claim("IDMA".to_owned(), taken);
+                    for index in 0..fabric.shared.ports.len() {
+                        let which = fabric.shared.ports[index];
+                        let Some(port) = fabric.shared.port(which) else {
+                            continue;
+                        };
+                        let taken = port.read(address, context).is_some();
+                        claim(format!("{which:?}"), taken);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The C6455's EWCTL and the C6472's EMIC0 PSCFG share 0x02C8 1004, but they belong to
+    /// different device-specific control blocks (SPRS276M section 7.15; SPRS612G Table 7-105).
+    #[test]
+    fn the_c6472_emac_does_not_claim_the_interrupt_controller_window() {
+        let mut c6472 = Fabric::new(&crate::device::C6472);
+        c6472.write32(0, 0x02c8_1004, 0x1234);
+        assert_eq!(c6472.read32(0, 0x02c8_1004), 0x1234);
+
+        let mut c6455 = Fabric::new(&crate::device::C6455);
+        c6455.write32(0, 0x02c8_1004, 1);
+        assert_eq!(c6455.read32(0, 0x02c8_1004), 1);
+    }
+
+    #[test]
+    fn l2_writeback_controls_dma_visibility() {
+        const DDR: u32 = 0xe000_1000;
+        let mut fabric = Fabric::default();
+        fabric.load_bytes(0, DDR, &[0]);
+        fabric.write32(0, MAR_BASE + 224 * 4, 1);
+        fabric.write32(0, L2CFG, 1);
+        fabric.write_u8(0, DDR, 0xaa);
+        assert_eq!(
+            fabric.shared.backing.read_byte(Requester::Dma, DDR),
+            Some(0)
+        );
+        fabric.write32(0, L2WB, 1);
+        assert_eq!(
+            fabric.shared.backing.read_byte(Requester::Dma, DDR),
+            Some(0xaa)
+        );
+    }
+
+    #[test]
+    fn partial_host_write_preserves_dirty_neighbors() {
+        const DDR: u32 = 0xe000_1000;
+        let mut fabric = Fabric::default();
+        fabric.load_bytes(0, DDR, &[0; 8]);
+        fabric.write32(0, MAR_BASE + 224 * 4, 1);
+        fabric.write32(0, L2CFG, 1);
+
+        fabric.write_u8(0, DDR, 0xaa);
+        fabric.host_write_bytes(0, DDR + 4, &[0xbb]);
+
+        assert_eq!(fabric.read_u8(0, DDR), 0xaa);
+        assert_eq!(fabric.read_u8(0, DDR + 4), 0xbb);
+    }
+
+    #[test]
+    fn l1d_invalidate_discards_stale_dma_view() {
+        const BUFFER: u32 = 0x0080_1000;
+        let mut fabric = Fabric::default();
+        fabric.load_bytes(0, BUFFER, &[1]);
+        fabric.write32(0, L1DCFG, 1);
+        assert_eq!(fabric.read_u8(0, BUFFER), 1);
+        fabric.shared.backing.write_byte(Requester::Dma, BUFFER, 2);
+        assert_eq!(fabric.read_u8(0, BUFFER), 1);
+        fabric.write32(0, L1DINV, 1);
+        assert_eq!(fabric.read_u8(0, BUFFER), 2);
+    }
+
+    #[test]
+    fn l2_range_writeback_flushes_l1d_and_l2_without_invalidating() {
+        const DDR: u32 = 0xe000_1000;
+        let mut fabric = Fabric::default();
+        fabric.load_bytes(0, DDR, &[0]);
+        fabric.write32(0, MAR_BASE + 224 * 4, 1);
+        fabric.write32(0, L2CFG, 1);
+        fabric.write32(0, L1DCFG, 1);
+
+        assert_eq!(fabric.read_u8(0, DDR), 0);
+        fabric.write_u8(0, DDR, 0xaa);
+        assert_eq!(
+            fabric.shared.backing.read_byte(Requester::Dma, DDR),
+            Some(0)
+        );
+
+        fabric.write32(0, L2WBAR, DDR);
+        fabric.write32(0, L2WWC, 1);
+        assert_eq!(
+            fabric.shared.backing.read_byte(Requester::Dma, DDR),
+            Some(0xaa)
+        );
+
+        fabric.shared.backing.write_byte(Requester::Dma, DDR, 0xbb);
+        assert_eq!(fabric.read_u8(0, DDR), 0xaa);
+    }
+
+    /// A page that grants nothing to User mode refuses a User read, latches the address and
+    /// the permission it refused, and raises the L1D unit's event - while a Supervisor read
+    /// of the same page still goes through (SPRU871K chapter 8).
+    #[test]
+    fn a_page_refuses_the_permission_it_does_not_grant_and_reports_where() {
+        let mut fabric = Fabric::default();
+        // L1DMPPA0 covers the first kilobyte of L1D SRAM: supervisor everything, user nothing.
+        fabric.write32(0, 0x0184_ae00, 0x0000_0138);
+        let address = 0x00f0_0010;
+        assert!(fabric.check_access(0, address, Permission::Read, false));
+        assert!(!fabric.check_access(0, address, Permission::Read, true));
+        assert_eq!(fabric.read32(0, 0x0184_ac00), address); // L1DMPFAR
+        assert_eq!(fabric.read32(0, 0x0184_ac04), 0x104); // L1DMPFSR: LOCAL and UR
+        assert_eq!(
+            fabric.megamodule(0).event_flag_registers()[3] & (1 << 26),
+            1 << 26
+        ); // event 122
+
+        // The neighbouring page is untouched, and a fully open page never even looks.
+        assert!(fabric.check_access(0, 0x00f0_0400, Permission::Read, true));
+        // A write that misses the command bit leaves the fault standing; the command bit
+        // clears the address as well as the status.
+        fabric.write32(0, 0x0184_ac08, 0x104);
+        assert_eq!(fabric.read32(0, 0x0184_ac04), 0x104);
+        fabric.write32(0, 0x0184_ac08, 1);
+        assert_eq!(fabric.read32(0, 0x0184_ac04), 0);
+        assert_eq!(fabric.read32(0, 0x0184_ac00), 0);
+    }
+
+    /// Denying execute makes the fetch path deliver nothing, so an address in that page reads
+    /// as a NOP rather than as whatever the page happens to hold.
+    #[test]
+    fn a_page_without_execute_permission_yields_no_instruction() {
+        let mut fabric = Fabric::default();
+        fabric.load_bytes(0, 0x0080_0000, &0x0210_a358u32.to_le_bytes());
+        assert_eq!(fabric.fetch32(0, 0x0080_0000), 0x0210_a358);
+        // L2MPPA0 covers the first 64 KB of L2 SRAM: read and write, no execute.
+        fabric.write32(0, 0x0184_a200, 0x0000_0130);
+        assert!(fabric.check_access(0, 0x0080_0000, Permission::Read, false));
+        assert!(!fabric.check_access(0, 0x0080_0000, Permission::Execute, false));
+        assert_eq!(
+            fabric.megamodule(0).event_flag_registers()[3] & (1 << 28),
+            1 << 28
+        ); // event 124
+    }
+
+    /// A DMA master reading another core's L2 SRAM is served from that core's L1D when the CPU
+    /// holds the line dirty, whichever of the two addresses the CPU used for it (SPRU862B
+    /// section 2.4.2, SPRS612G Table 2-2).
+    #[test]
+    fn a_dma_read_of_a_peer_core_l2_is_snooped_against_that_core_l1d() {
+        let mut fabric = Fabric::new(&crate::device::C6472);
+        // Core 3 caches its own L2 in L1D and dirties a line through its local address.
+        fabric.write32(3, crate::memory::L1DCFG, 4);
+        fabric.load_bytes(3, 0x0080_2000, &[0; 64]);
+        // L1D allocates on a read miss, so the line has to be read before a store leaves it
+        // dirty in the cache (SPRU862B section 3.4).
+        assert_eq!(fabric.read32(3, 0x0080_2000), 0);
+        fabric.write32(3, 0x0080_2000, 0xdead_beef);
+        // The line is dirty in core 3's L1D and has not reached the SRAM.
+        assert_eq!(
+            fabric
+                .shared
+                .backing
+                .read_bytes(Requester::Dma, 0x1380_2000, 4),
+            vec![0, 0, 0, 0]
+        );
+        // The EMAC reads the buffer through the global alias and sees the CPU's data.
+        assert_eq!(fabric.dma_read_u32(0x1380_2000), 0xdead_beef);
+        // And a DMA write through the alias is snooped into that core's L1D, so the CPU sees
+        // it without any cache operation.
+        fabric.dma_write_u32(0x1380_2000, 0x0bad_c0de);
+        assert_eq!(fabric.read32(3, 0x0080_2000), 0x0bad_c0de);
+        // No other core's memory moved.
+        assert_eq!(fabric.read32(2, 0x0080_2000), 0);
+    }
+
+    /// The C6472 has two Ethernet MACs whose register blocks are 0x40000 apart, and one MDIO
+    /// they share (SPRS612G Tables 7-101 and 7-103).
+    #[test]
+    fn a_c6472_answers_for_both_macs_and_one_mdio() {
+        let mut fabric = Fabric::new(&crate::device::C6472);
+        // TXIDVER identifies each port.
+        assert_eq!(fabric.read32(0, 0x02c8_0000), 0x000c_0a08);
+        assert_eq!(fabric.read32(0, 0x02cc_0000), 0x000c_0a08);
+        // Each port keeps its own state: enabling receive on EMAC1 leaves EMAC0 alone.
+        fabric.write32(0, 0x02cc_0014, 1);
+        assert_eq!(fabric.read32(0, 0x02cc_0014), 1);
+        assert_eq!(fabric.read32(0, 0x02c8_0014), 0);
+        // The MDIO answers once, in EMAC0's control window (SPRUEF8F section 4.2).
+        assert_eq!(fabric.read32(0, 0x02c8_1800), 0x0007_0103);
+        // The C6455 has neither a second MAC nor an interrupt-control module.
+        let mut single = Fabric::default();
+        assert_eq!(single.read32(0, 0x02cc_0000), 0);
+    }
+
+    /// The whole point of a C6472 module: six cores, one Ethernet connection.
+    ///
+    /// One MAC receives a frame into a buffer that belongs to one particular core - reached by
+    /// the global address, because that is the only address the EMAC's DMA can use (SPRS612G
+    /// Table 2-2) - and the receive interrupt is delivered only to the core whose EW_INTCTL
+    /// enabled that channel (SPRUEF8F section 3.1). The other five cores see neither the data
+    /// nor the interrupt.
+    #[test]
+    fn one_ethernet_connection_delivers_a_frame_to_one_core_of_six() {
+        const EMAC0: u32 = 0x02c8_0000;
+        const RXCONTROL: u32 = EMAC0 + 0x14;
+        const RXINTMASKSET: u32 = EMAC0 + 0xa8;
+        const MACCONTROL: u32 = EMAC0 + 0x160;
+        const RXMBPENABLE: u32 = EMAC0 + 0x100;
+        const RX0HDP: u32 = EMAC0 + 0x620;
+        const RX0CP: u32 = EMAC0 + 0x660;
+        const EW_INTCTL0: u32 = 0x02c8_1020;
+        /// A descriptor and a packet buffer in core 4's L2 SRAM, named globally.
+        const DESCRIPTOR: u32 = 0x1480_1000;
+        const BUFFER: u32 = 0x1480_2000;
+        const OWNER: u32 = 1 << 29;
+
+        let mut fabric = Fabric::new(&crate::device::C6472);
+        // Core 4 owns the receive ring: it enables channel 0's interrupt in its own EW_INTCTL,
+        // and no other core enables anything.
+        fabric.write32(4, EW_INTCTL0 + 4 * 4, 1 << 16);
+        // The driver builds one empty receive descriptor: no next, a 256-byte buffer, owned by
+        // the MAC (SPRU975E section 2.5.5).
+        fabric.write32(4, DESCRIPTOR, 0);
+        fabric.write32(4, DESCRIPTOR + 4, BUFFER);
+        fabric.write32(4, DESCRIPTOR + 8, 256);
+        fabric.write32(4, DESCRIPTOR + 12, OWNER);
+        fabric.write32(4, RXINTMASKSET, 1);
+        // Copy every frame to channel 0, enable the receive DMA, and take the interface out of
+        // reset - the last one is GMIIEN, which TI's sequence writes after the DMA enables
+        // (SPRU975E section 2.15.4 step 17).
+        fabric.write32(4, RXMBPENABLE, 1 << 21);
+        fabric.write32(4, RXCONTROL, 1);
+        fabric.write32(4, MACCONTROL, 1 << 5);
+        fabric.write32(4, RX0HDP, DESCRIPTOR);
+
+        let mut frame = vec![0u8; 64];
+        frame[..6].copy_from_slice(&[0x02, 0x00, 0x00, 0x11, 0x22, 0x33]);
+        frame[12] = 0x08;
+        frame[14] = 0xc6;
+        frame[15] = 0x47;
+        fabric.inject_frame_on(0, frame.clone());
+        for _ in 0..256 {
+            fabric.tick_once();
+        }
+
+        // The frame landed in core 4's own L2 SRAM, reachable at its local address.
+        let received = fabric.read_bytes(4, 0x0080_2000, 16);
+        assert_eq!(received[..6], frame[..6]);
+        assert_eq!(&received[12..16], &[0x08, 0x00, 0xc6, 0x47]);
+        // The descriptor came back to software with the packet length recorded.
+        let flags_and_length = fabric.read32(4, 0x0080_100c);
+        assert_eq!(flags_and_length & 0xffff, 64, "packet length");
+        assert_eq!(flags_and_length & OWNER, 0, "the MAC released the buffer");
+
+        // MACRXINT0 is event 5, and only core 4 asked for it.
+        let flagged: Vec<usize> = (0..6)
+            .filter(|core| fabric.megamodule(*core).event_flag_registers()[0] & (1 << 5) != 0)
+            .collect();
+        assert_eq!(flagged, vec![4], "only the core that enabled the channel");
+        // No other core's memory was touched.
+        for core in [0, 3, 5] {
+            assert_eq!(fabric.read_bytes(core, 0x0080_2000, 4), vec![0, 0, 0, 0]);
+        }
+
+        // Another core can take the next frame by owning the ring itself: core 1 enables the
+        // channel, core 4 disables it, and the interrupt follows.
+        fabric.write32(4, EW_INTCTL0 + 4 * 4, 0);
+        fabric.write32(1, EW_INTCTL0 + 4, 1 << 16);
+        fabric.write32(4, RX0CP, DESCRIPTOR);
+        fabric.write32(1, 0x1180_1000, 0);
+        fabric.write32(1, 0x1180_1004, 0x1180_2000);
+        fabric.write32(1, 0x1180_1008, 256);
+        fabric.write32(1, 0x1180_100c, OWNER);
+        fabric.write32(1, RX0HDP, 0x1180_1000);
+        for core in 0..6 {
+            fabric.write32(core, 0x0180_0040, u32::MAX); // EVTCLR0
+        }
+        fabric.inject_frame_on(0, frame);
+        for _ in 0..256 {
+            fabric.tick_once();
+        }
+        let flagged: Vec<usize> = (0..6)
+            .filter(|core| fabric.megamodule(*core).event_flag_registers()[0] & (1 << 5) != 0)
+            .collect();
+        assert_eq!(flagged, vec![1], "the interrupt follows the enable");
+        assert_eq!(
+            fabric.read_bytes(1, 0x0080_2000, 6),
+            vec![0x02, 0, 0, 0x11, 0x22, 0x33]
+        );
+    }
+}
