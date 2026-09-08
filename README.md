@@ -79,6 +79,20 @@ launchers are dynamically linked — from the devenv shell the script runs both 
 `ti-tools-fhs` FHS environment, and on other distributions the 32-bit loader
 (`sudo apt install libc6-i386`) is required.
 
+### Published builds
+
+Pushing a `v*` tag runs `.github/workflows/release.yml`: it builds `c64xemu` for
+`x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, `x86_64-apple-darwin` and
+`aarch64-apple-darwin`, smoke-tests every binary it can execute on its runner, and publishes one
+`.tar.gz` per target (binary plus `README.md` and `LICENSE`) with a `SHA256SUMS` manifest as a
+GitHub release. Windows is not a supported target. The Linux builds are statically linked
+against musl — the dependency tree is pure Rust — so they carry no glibc baseline from the
+runner. The job refuses to publish when the tag does not match the `version` in `Cargo.toml`.
+
+Running the workflow manually (`workflow_dispatch`) builds and packages the same set from the
+selected ref and leaves the archives as workflow artifacts, named after the commit instead of a
+version, without touching releases.
+
 ## What is modelled
 
 **Instruction set and execution.** Fetch packets and execute packets, the header-based compact

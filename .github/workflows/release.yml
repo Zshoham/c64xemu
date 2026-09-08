@@ -1,0 +1,129 @@
+name: release
+
+# Tag pushes publish a GitHub release; a manual run builds the same archives and leaves them
+# as workflow artifacts, so the packaging path can be exercised without cutting a release.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # The published binaries carry no symbols; the conformance suite and local builds keep theirs.
+  RUSTFLAGS: -C strip=symbols
+
+jobs:
+  guard:
+    name: Check the tag against the crate version
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      # A mismatch is worth catching before the matrix spends its build minutes; manual runs
+      # publish nothing and are not held to a tag.
+      - name: Compare the tag with Cargo.toml
+        if: github.ref_type == 'tag'
+        run: |
+          manifest="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
+          if [ "$manifest" != "${GITHUB_REF_NAME#v}" ]; then
+            echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $manifest" >&2
+            exit 1
+          fi
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: guard
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The Linux artifacts are statically linked against musl: the emulator's dependency
+          # tree is pure Rust, so a static binary drops the runner's glibc baseline from the
+          # set of things a downloaded build depends on.
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+          - target: aarch64-apple-darwin
+            runner: macos-14
+          # Built on the arm64 macOS runner, which cannot execute the result; the smoke test
+          # below is skipped for this one target.
+          - target: x86_64-apple-darwin
+            runner: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Name the build
+        id: name
+        # A tag publishes as its version; a manual run is identified by the commit it built.
+        run: |
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="$(git rev-parse --short HEAD)"
+          fi
+          echo "version=$version" >>"$GITHUB_OUTPUT"
+          echo "stem=c64xemu-$version-${{ matrix.target }}" >>"$GITHUB_OUTPUT"
+
+      - name: Build the optimized emulator
+        run: cargo build --release --locked --bin c64xemu --target ${{ matrix.target }}
+
+      - name: Smoke-test the binary
+        if: matrix.target != 'x86_64-apple-darwin'
+        run: |
+          binary="target/${{ matrix.target }}/release/c64xemu"
+          "$binary" --version
+          "$binary" run --help >/dev/null
+
+      - name: Package the archive
+        run: |
+          stem='${{ steps.name.outputs.stem }}'
+          mkdir -p "dist/$stem"
+          cp 'target/${{ matrix.target }}/release/c64xemu' README.md LICENSE "dist/$stem/"
+          tar -czf "dist/$stem.tar.gz" -C dist "$stem"
+          rm -r "dist/$stem"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.name.outputs.stem }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish the GitHub release
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: c64xemu-*
+          merge-multiple: true
+
+      - name: Checksum the archives
+        working-directory: dist
+        run: sha256sum -- * | tee SHA256SUMS
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh release create "$GITHUB_REF_NAME"
+          --verify-tag --generate-notes --title "$GITHUB_REF_NAME"
+          dist/*
