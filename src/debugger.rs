@@ -8,7 +8,7 @@
 //! reads through the host view, so looking at memory neither fills a cache line nor moves a
 //! replacement clock.
 
-use crate::machine::{Machine, MachineArgs, StopCondition, StopReason};
+use crate::machine::{BreakpointHit, Machine, MachineArgs, StopCondition, StopReason};
 use crate::{gdb, ui};
 use clap::Args;
 use std::io::{self, Write};
@@ -115,18 +115,7 @@ impl Debugger {
             .iter()
             .map(|breakpoint| breakpoint.address)
             .collect();
-        self.machine.arm_halt(&breakpoints, false);
-    }
-
-    /// While stopped at a breakpoint, moving on must not re-hit the halt immediately: the
-    /// current address leaves the halt list until the next fetch boundary.
-    fn arm_step_over_current(&mut self) {
-        let breakpoints: Vec<u32> = self
-            .breakpoints
-            .iter()
-            .map(|breakpoint| breakpoint.address)
-            .collect();
-        self.machine.arm_halt(&breakpoints, true);
+        self.machine.arm_halt(&breakpoints);
     }
 
     fn repl(&mut self) {
@@ -166,14 +155,8 @@ impl Debugger {
             "mem" | "x" => self.mem(tokens)?,
             "disas" | "d" => self.disas(tokens)?,
             "syms" => self.syms(tokens.get(1).copied()),
-            "break" | "b" => {
-                self.break_command(tokens)?;
-                self.sync_halt_addresses();
-            }
-            "delete" => {
-                self.delete(tokens)?;
-                self.sync_halt_addresses();
-            }
+            "break" | "b" => self.break_command(tokens)?,
+            "delete" => self.delete(tokens)?,
             "watch" => self.watch(tokens)?,
             "unwatch" => self.unwatch(tokens)?,
             "continue" | "c" => self.continue_run(tokens)?,
@@ -183,7 +166,6 @@ impl Debugger {
             "state" => self.state(tokens)?,
             "reset" => {
                 self.machine.reload()?;
-                self.sync_halt_addresses();
                 self.where_now();
             }
             "trace" => self.trace_command(tokens)?,
@@ -208,7 +190,6 @@ impl Debugger {
                 ));
             }
             self.machine.set_focus(core);
-            self.sync_halt_addresses();
         }
         for core in self.machine.snapshot().cores {
             let marker = if core.focused { '*' } else { ' ' };
@@ -502,8 +483,11 @@ impl Debugger {
             }
             return Ok(());
         }
-        for token in &tokens[1..] {
-            let address = self.machine.resolve(token)?;
+        let addresses = tokens[1..]
+            .iter()
+            .map(|token| self.machine.resolve(token))
+            .collect::<Result<Vec<_>, _>>()?;
+        for address in addresses {
             let label = self.machine.symbol_at(address);
             self.breakpoints.push(Breakpoint { address, label });
             println!(
@@ -512,14 +496,19 @@ impl Debugger {
                 describe(self.breakpoints.last().unwrap())
             );
         }
+        self.sync_halt_addresses();
         Ok(())
     }
 
     fn delete(&mut self, tokens: &[&str]) -> Result<(), String> {
         let target = tokens.get(1).ok_or("usage: delete ID|all")?;
         if *target == "all" {
+            let changed = !self.breakpoints.is_empty();
             self.breakpoints.clear();
             println!("breakpoints cleared");
+            if changed {
+                self.sync_halt_addresses();
+            }
             return Ok(());
         }
         let id: usize = target.parse().map_err(|_| "invalid breakpoint id")?;
@@ -528,6 +517,7 @@ impl Debugger {
         }
         let removed = self.breakpoints.remove(id);
         println!("removed breakpoint at 0x{:08x}", removed.address);
+        self.sync_halt_addresses();
         Ok(())
     }
 
@@ -558,11 +548,6 @@ impl Debugger {
         println!("removed watchpoint {id}");
         Ok(())
     }
-    fn reached_breakpoint(&self) -> Option<usize> {
-        self.breakpoints
-            .iter()
-            .position(|breakpoint| self.machine.ready_to_fetch_at(breakpoint.address))
-    }
 
     /// A program that has reached its exit point is over; running on would execute whatever
     /// follows it. False means the command should not move the machine.
@@ -585,7 +570,6 @@ impl Debugger {
         if !self.still_running() {
             return Ok(());
         }
-        self.arm_step_over_current();
         let watch = &mut self.watchpoints;
         let mut conditions = [
             StopCondition::Budget(budget),
@@ -594,17 +578,7 @@ impl Debugger {
             }),
         ];
         match self.machine.resume(&mut conditions) {
-            Ok(StopReason::Breakpoint) => {
-                if let Some(id) = self.reached_breakpoint() {
-                    println!(
-                        "breakpoint {id} at {} (cycle {})",
-                        describe(&self.breakpoints[id]),
-                        self.machine.cycles()
-                    );
-                } else {
-                    println!("halted at pc=0x{:08x}", self.machine.pc());
-                }
-            }
+            Ok(StopReason::Breakpoint(hit)) => self.report_breakpoint(hit),
             Ok(StopReason::Exit) => println!(
                 "program exited with code {} (cycle {})",
                 self.machine.exit_code(),
@@ -621,7 +595,6 @@ impl Debugger {
             Ok(_) => println!("halted at pc=0x{:08x}", self.machine.pc()),
             Err(error) => return Err(error),
         }
-        self.sync_halt_addresses();
         self.where_now();
         Ok(())
     }
@@ -634,7 +607,6 @@ impl Debugger {
         if !self.still_running() {
             return Ok(());
         }
-        self.arm_step_over_current();
         let watch = &mut self.watchpoints;
         let mut conditions = [
             StopCondition::Budget(count),
@@ -642,12 +614,15 @@ impl Debugger {
                 hit_watchpoints(machine, watch).then_some(StopReason::Watchpoint)
             }),
         ];
-        if self.machine.resume(&mut conditions)? == StopReason::Fault {
-            if let Some(fault) = self.machine.fault() {
-                println!("fault: {fault}");
+        match self.machine.resume(&mut conditions)? {
+            StopReason::Breakpoint(hit) => self.report_breakpoint(hit),
+            StopReason::Fault => {
+                if let Some(fault) = self.machine.fault() {
+                    println!("fault: {fault}");
+                }
             }
+            _ => {}
         }
-        self.sync_halt_addresses();
         self.where_now();
         Ok(())
     }
@@ -660,11 +635,9 @@ impl Debugger {
         if !self.still_running() {
             return Ok(());
         }
-        self.arm_step_over_current();
         let mut conditions = [StopCondition::Packets(count)];
-        let reason = self.machine.resume(&mut conditions);
-        self.sync_halt_addresses();
-        match reason {
+        match self.machine.resume(&mut conditions) {
+            Ok(StopReason::Breakpoint(hit)) => self.report_breakpoint(hit),
             Ok(StopReason::Fault) => {
                 if let Some(fault) = self.machine.fault() {
                     println!("fault: {fault}");
@@ -676,6 +649,29 @@ impl Debugger {
         hit_watchpoints(&self.machine, &mut self.watchpoints);
         self.where_now();
         Ok(())
+    }
+
+    fn report_breakpoint(&self, hit: BreakpointHit) {
+        if let Some((id, breakpoint)) = self
+            .breakpoints
+            .iter()
+            .enumerate()
+            .find(|(_, breakpoint)| breakpoint.address == hit.address)
+        {
+            println!(
+                "breakpoint {id} on core {} at {} (cycle {})",
+                hit.core,
+                describe(breakpoint),
+                self.machine.cycles()
+            );
+        } else {
+            println!(
+                "breakpoint on core {} at 0x{:08x} (cycle {})",
+                hit.core,
+                hit.address,
+                self.machine.cycles()
+            );
+        }
     }
 
     fn where_now(&mut self) {

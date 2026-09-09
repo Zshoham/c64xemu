@@ -9,7 +9,7 @@
 //! and reaching the program's exit point is reported as an exited process rather than as a
 //! target that mysteriously stopped.
 
-use crate::machine::{Machine, StopCondition, StopReason};
+use crate::machine::{BreakpointHit, Machine, StopCondition, StopReason};
 use crate::system::Endian;
 use std::collections::BTreeSet;
 use std::io::{self, Read, Write};
@@ -50,6 +50,7 @@ pub fn serve(machine: Machine, listen: &str, max_cycles: u64) -> Result<u8, Stri
 pub struct Session {
     machine: Machine,
     breakpoints: BTreeSet<u32>,
+    last_stop: String,
     detached: bool,
     /// Cycle budget for one continue; 0 runs without a limit.
     max_cycles: u64,
@@ -63,6 +64,7 @@ impl Session {
         Self {
             machine,
             breakpoints: BTreeSet::new(),
+            last_stop: TRAP.into(),
             detached: false,
             max_cycles: IN_PROCESS_BUDGET,
             client: None,
@@ -71,7 +73,7 @@ impl Session {
 
     pub fn handle(&mut self, packet: &str) -> Result<String, String> {
         if packet == "?" {
-            return Ok(TRAP.into());
+            return Ok(self.last_stop.clone());
         }
         if packet == "g" {
             let endian = self.machine.endian();
@@ -148,8 +150,9 @@ impl Session {
             .or_else(|| packet.strip_prefix("Z1,"))
         {
             let address = parse_hex_u32(body.split(',').next().unwrap_or_default())?;
-            self.breakpoints.insert(address);
-            self.arm_breakpoints();
+            if self.breakpoints.insert(address) {
+                self.arm_breakpoints();
+            }
             return Ok("OK".into());
         }
         if let Some(body) = packet
@@ -157,8 +160,9 @@ impl Session {
             .or_else(|| packet.strip_prefix("z1,"))
         {
             let address = parse_hex_u32(body.split(',').next().unwrap_or_default())?;
-            self.breakpoints.remove(&address);
-            self.arm_breakpoints();
+            if self.breakpoints.remove(&address) {
+                self.arm_breakpoints();
+            }
             return Ok("OK".into());
         }
         if packet.starts_with("qSupported") {
@@ -234,7 +238,6 @@ impl Session {
                 return Ok("E01".into());
             }
             self.machine.set_focus(thread);
-            self.arm_breakpoints();
             return Ok("OK".into());
         }
         if packet.starts_with("Hc") || packet.starts_with("Hg") {
@@ -247,23 +250,14 @@ impl Session {
         Ok(String::new())
     }
 
-    /// Halt addresses for a stopped target: every breakpoint plus the exit point, so a caller
-    /// that asks `halted()` sees the stop and `info` reports it.
+    /// Installs the driver-owned breakpoint list after startup or an actual edit.
     fn arm_breakpoints(&mut self) {
         let breakpoints: Vec<u32> = self.breakpoints.iter().copied().collect();
-        self.machine.arm_halt(&breakpoints, false);
-    }
-
-    /// Halt addresses for a target about to move: everything except the address it is sitting
-    /// on, so continuing or stepping from a breakpoint makes progress.
-    fn arm_step_over_current(&mut self) {
-        let breakpoints: Vec<u32> = self.breakpoints.iter().copied().collect();
-        self.machine.arm_halt(&breakpoints, true);
+        self.machine.arm_halt(&breakpoints);
     }
 
     /// Runs until a breakpoint, the program's exit, a fault, the client's ^C, or the budget.
     fn resume(&mut self) -> String {
-        self.arm_step_over_current();
         let client = &mut self.client;
         let mut conditions = [
             StopCondition::Budget(self.max_cycles),
@@ -276,6 +270,7 @@ impl Session {
             }),
         ];
         let reply = match self.machine.resume(&mut conditions) {
+            Ok(StopReason::Breakpoint(hit)) => breakpoint_stop(hit, self.machine.endian()),
             Ok(StopReason::Fault) => ILLEGAL_INSTRUCTION.to_string(),
             Ok(StopReason::Exit) => self.exited(),
             Ok(StopReason::Interrupted) => INTERRUPT.to_string(),
@@ -285,18 +280,16 @@ impl Session {
                 TRAP.to_string()
             }
         };
-        self.arm_breakpoints();
+        self.last_stop = reply.clone();
         reply
     }
 
     /// Dispatches one execute packet. Stalls mean a cycle need not issue anything, so this
     /// steps cycles until the packet count moves - which is what a `stepi` should do.
     fn step_packet(&mut self) -> String {
-        self.arm_step_over_current();
         let mut conditions = [StopCondition::Packets(1)];
-        let reason = self.machine.resume(&mut conditions);
-        self.arm_breakpoints();
-        match reason {
+        let reply = match self.machine.resume(&mut conditions) {
+            Ok(StopReason::Breakpoint(hit)) => breakpoint_stop(hit, self.machine.endian()),
             Ok(StopReason::Fault) => ILLEGAL_INSTRUCTION.into(),
             Ok(StopReason::Exit) => self.exited(),
             Ok(_) => TRAP.into(),
@@ -304,7 +297,9 @@ impl Session {
                 eprintln!("c64xemu: gdb stub: {error}");
                 TRAP.into()
             }
-        }
+        };
+        self.last_stop = reply.clone();
+        reply
     }
 
     /// The program reached its exit point: report a process exit carrying A4, the EABI return
@@ -395,6 +390,14 @@ impl Session {
         }
         Ok(())
     }
+}
+
+fn breakpoint_stop(hit: BreakpointHit, endian: Endian) -> String {
+    format!(
+        "T05thread:{:x};21:{};",
+        hit.core + 1,
+        encode_u32(hit.address, endian)
+    )
 }
 
 /// True when the client sent ^C. Any other byte arriving while the target runs is protocol
@@ -540,4 +543,48 @@ fn target_xml() -> String {
     }
     xml.push_str("</feature><feature name=\"org.gnu.gdb.tic6x.c6xp\"><reg name=\"TSR\" bitsize=\"32\"/><reg name=\"ILC\" bitsize=\"32\"/><reg name=\"RILC\" bitsize=\"32\"/></feature></target>");
     xml
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cpu::Cpu;
+    use crate::device::{Device, C6472};
+
+    #[test]
+    fn breakpoint_reply_identifies_the_hit_without_selecting_its_core() {
+        for endian in [Endian::Little, Endian::Big] {
+            let mut machine = Machine::bare(Cpu::new(0));
+            machine.device = Device::with_boot_mode(&C6472, 0, endian, 0);
+            for core in 0..6 {
+                machine
+                    .device
+                    .with_core(core, |cpu| cpu.write_words(0, &[0; 16]));
+            }
+            machine.device.with_core(0, |cpu| cpu.set_pc(32));
+            let mut session = Session::new(machine);
+            session.handle("Z0,4,4").unwrap();
+            let stopped_pc = match endian {
+                Endian::Little => "04000000",
+                Endian::Big => "00000004",
+            };
+            let reply = format!("T05thread:2;21:{stopped_pc};");
+            assert_eq!(session.handle("c").unwrap(), reply);
+            assert_eq!(session.handle("?").unwrap(), reply);
+            assert_eq!(session.handle("qC").unwrap(), "QC1");
+            assert_eq!(
+                session.handle("p21").unwrap(),
+                match endian {
+                    Endian::Little => "24000000",
+                    Endian::Big => "00000024",
+                }
+            );
+            session.handle("Hg2").unwrap();
+            assert_eq!(session.handle("?").unwrap(), reply);
+            assert_eq!(session.handle("p21").unwrap(), stopped_pc);
+            assert_eq!(session.handle("s").unwrap(), "S05");
+            assert_eq!(session.handle("?").unwrap(), "S05");
+            assert_eq!(session.handle("qC").unwrap(), "QC2");
+        }
+    }
 }

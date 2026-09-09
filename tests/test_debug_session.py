@@ -228,12 +228,16 @@ class GdbSession(DebugSession):
         reply = self._packet("c")
         if reply.startswith("W"):
             return Stop("exit", pc=None, exit_code=int(reply[1:], 16))
-        assert reply in ("S05", "S02", "S04"), f"unexpected stop reply: {reply!r}"
+        assert reply in ("S05", "S02", "S04") or re.fullmatch(
+            r"T05thread:[0-9a-f]+;21:[0-9a-f]{8};", reply
+        ), f"unexpected stop reply: {reply!r}"
         return Stop("breakpoint", pc=self._pc(), exit_code=None)
 
     def step(self) -> int:
         reply = self._packet("s")
-        assert reply == "S05", f"unexpected step reply: {reply!r}"
+        assert reply == "S05" or re.fullmatch(
+            r"T05thread:[0-9a-f]+;21:[0-9a-f]{8};", reply
+        ), f"unexpected step reply: {reply!r}"
         return self._pc()
 
     def close(self) -> None:

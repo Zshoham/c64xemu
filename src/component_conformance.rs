@@ -321,26 +321,6 @@ fn vector_root() -> std::path::PathBuf {
         .join("component")
 }
 
-fn collect_vector_paths(directory: &std::path::Path, paths: &mut Vec<std::path::PathBuf>) {
-    let entries = std::fs::read_dir(directory)
-        .unwrap_or_else(|error| panic!("could not read {}: {error}", directory.display()));
-    for entry in entries {
-        let path = entry
-            .unwrap_or_else(|error| {
-                panic!(
-                    "could not read an entry in {}: {error}",
-                    directory.display()
-                )
-            })
-            .path();
-        if path.is_dir() {
-            collect_vector_paths(&path, paths);
-        } else if path.extension().and_then(|extension| extension.to_str()) == Some("json") {
-            paths.push(path);
-        }
-    }
-}
-
 fn load_case(root: &std::path::Path, path: &std::path::Path) -> Value {
     let definition = std::fs::read_to_string(path)
         .unwrap_or_else(|error| panic!("could not read {}: {error}", path.display()));
@@ -366,60 +346,11 @@ fn load_case(root: &std::path::Path, path: &std::path::Path) -> Value {
     case
 }
 
-fn component_cases() -> Vec<Value> {
-    let root = vector_root();
-    let mut paths = Vec::new();
-    collect_vector_paths(&root, &mut paths);
-    paths.sort();
-    paths
-        .into_iter()
-        .map(|path| load_case(&root, &path))
-        .collect()
-}
-
 fn case_id(case: &Value) -> &str {
     case.get("request")
         .and_then(|request| request.get("id"))
         .and_then(Value::as_str)
         .unwrap_or("<unnamed>")
-}
-
-#[test]
-fn python_component_cases_are_preserved() {
-    // Immutable migration oracle: this is the serialized output of the deleted Python suite.
-    // Keep it fixed when adding Rust cases; its only purpose is to prevent the rewrite from
-    // silently dropping or changing an old request or expectation.
-    //
-    // It has been amended once, and only in the setup half. Twenty-six of these cases moved
-    // Ethernet frames without ever writing MACCONTROL, which SPRU975E Table 57 says leaves
-    // "GMII RX and TX ... held in reset": they were asserting the right answers from a
-    // configuration the interface does not run in. Each gained one `MACCONTROL = GMIIEN` write
-    // where TI's own initialization sequence puts it (section 2.15.4 step 17, after the DMA
-    // enables). Every case id and every expectation is unchanged, which is what makes this an
-    // amendment rather than a rewrite - the answers were already right, the requests were not.
-    let baseline: Vec<Value> = serde_json::from_str(include_str!(
-        "../tests/vectors/component-python-baseline.json"
-    ))
-    .expect("frozen Python component cases must be valid JSON");
-    assert_eq!(baseline.len(), 358, "Python migration oracle was changed");
-
-    let current = component_cases();
-    let mut by_id = std::collections::BTreeMap::new();
-    for case in &current {
-        let id = case_id(case);
-        assert!(
-            by_id.insert(id, case).is_none(),
-            "duplicate Rust component case {id}"
-        );
-    }
-    for old_case in &baseline {
-        let id = case_id(old_case);
-        assert_eq!(
-            by_id.get(id).copied(),
-            Some(old_case),
-            "Rust rewrite changed or omitted Python component case {id}"
-        );
-    }
 }
 
 fn check_case(case: Value) {

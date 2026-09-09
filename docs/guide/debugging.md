@@ -7,6 +7,11 @@ a diagnosis.
 All three drive the same machine through the same seam, so a breakpoint, a step and a state dump
 mean the same thing in each. Option syntax and defaults are in [Command line](command-line.md).
 
+On a multicore device, breakpoint reports name the stopped core and address without changing
+the focused core. Register, memory and disassembly views remain on the selected core; use
+`core N`, the dashboard core selector, or GDB's thread selection to inspect the stopped core.
+Reset retains the breakpoint list, and continue/step manages leaving the current halt itself.
+
 ## The console REPL
 
 `c64xemu debug IMAGE` with neither `--ui` nor `--gdb` starts the REPL in `src/debugger.rs`. The
@@ -48,7 +53,7 @@ csr=0x10000000 (gie=0) ierr=0x00000000 ifr=0x0000 ier=0x0000
 sploop inactive
 packets=0 retired=0 replays=0 branches=0 interrupts=0 stores=0 faults=0
 (c64xemu) breakpoint 0: 0x00802884 <main>
-(c64xemu) breakpoint 0 at 0x00802884 <main> (cycle 111098)
+(c64xemu) breakpoint 0 on core 0 at 0x00802884 <main> (cycle 111098)
 pc=0x00802884 <main> cycle=111098: addk .s2 -168,b15
 (c64xemu) pc=0x00802884 <main> cycle=111098 packets=110346 fault=None
 csr=0x10000000 (gie=0) ierr=0x00000000 ifr=0x0000 ier=0x0002
@@ -103,6 +108,10 @@ the machine's own step services the CIO handshake and the Ethernet and HPI backe
 printf-style or networked program behaves under GDB as it does under `run`. Reaching the
 program's exit point is reported as an exited process, not as a target that stopped for no
 reason.
+
+A breakpoint stop uses a `T05` reply containing `thread:` (the one-based core number) and the
+expedited PC register `21:` in target byte order. `?` repeats the last stop reply; it does not
+select that core. Other completed steps still use `S05`.
 
 ## Execution traces
 

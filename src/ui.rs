@@ -40,7 +40,7 @@ pub fn serve(mut machine: Machine, listen: &str) -> Result<u8, String> {
         breakpoints,
         previous: [[0; 32]; 2],
     };
-    session.sync_halt_addresses();
+    session.machine.arm_halt(&session.breakpoints);
     for stream in listener.incoming() {
         let mut stream = match stream {
             Ok(stream) => stream,
@@ -62,11 +62,6 @@ struct Session {
 }
 
 impl Session {
-    /// The user's breakpoints plus the program's exit point, so a run stops at the end.
-    fn sync_halt_addresses(&mut self) {
-        self.machine.arm_halt(&self.breakpoints, false);
-    }
-
     fn serve_connection(&mut self, stream: &mut TcpStream) -> Result<(), String> {
         let (method, target, body) = read_request(stream)?;
         let (path, query) = match target.split_once('?') {
@@ -151,7 +146,7 @@ impl Session {
                             .collect()
                     })
                     .unwrap_or_default();
-                self.sync_halt_addresses();
+                self.machine.arm_halt(&self.breakpoints);
                 let window = self.window(&query);
                 Response::json(self.snapshot(window))
             }
@@ -159,7 +154,6 @@ impl Session {
                 self.machine.reload()?;
                 self.machine.set_profiling(true);
                 self.previous = [[0; 32]; 2];
-                self.sync_halt_addresses();
                 let window = self.window(&query);
                 Response::json(self.snapshot(window))
             }
@@ -185,11 +179,8 @@ impl Session {
         }
         let snapshot = self.machine.snapshot();
         self.previous = [snapshot.core.a, snapshot.core.b];
-        // A stopped target must be able to move off its own breakpoint.
-        self.machine.arm_halt(&self.breakpoints, true);
         let mut conditions = [StopCondition::Budget(cycles)];
         self.machine.resume(&mut conditions)?;
-        self.sync_halt_addresses();
         Ok(())
     }
 
@@ -276,6 +267,12 @@ impl Session {
         let mar = self.machine.mar_registers().to_vec();
         let cio_output_bytes = self.machine.cio_output().len();
         let cio_output = String::from_utf8_lossy(self.machine.cio_output()).into_owned();
+        let breakpoint = cpu.breakpoint.map(|hit| {
+            json!({
+                "core": hit.core,
+                "address": format!("0x{:08x}", hit.address),
+            })
+        });
         json!({
             "pc": format!("0x{pc:08x}"),
             "pc_where": self.machine.symbol_at(pc),
@@ -284,7 +281,8 @@ impl Session {
             "cio_output": cio_output,
             "cio_output_bytes": cio_output_bytes,
             "halted": halted,
-            "at_breakpoint": halted && self.breakpoints.contains(&pc),
+            "at_breakpoint": breakpoint.is_some(),
+            "breakpoint": breakpoint,
             "reg_a": reg_a,
             "reg_b": reg_b,
             "control": control,

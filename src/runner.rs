@@ -55,15 +55,15 @@ pub fn run(args: RunArgs) -> Result<u8, String> {
     let loaded_ranges = machine.loaded_ranges();
     // A short history of executed packet addresses, so a fault can be traced back through the
     // call path that reached it. Only kept when asked for: it costs a push per cycle. The
-    // check closure runs once per cycle inside `resume`, so it records the trail and watches
+    // check closure runs once per cycle inside `run`, so it records the trail and watches
     // for a fetch leaving the image in the same hook.
     let mut pc_trail: VecDeque<u32> = VecDeque::new();
-    machine.arm_halt(&breakpoints, false);
+    machine.arm_halt(&breakpoints);
     let reason = if args.pc_trail == 0 && !args.trap_oob {
         // The normal batch path only has a cycle budget. Do not dispatch an inert diagnostic
         // closure on every emulated cycle.
         let mut conditions = [StopCondition::Budget(args.max_cycles)];
-        machine.resume(&mut conditions)?
+        machine.run(&mut conditions)?
     } else {
         let mut conditions = [
             StopCondition::Budget(args.max_cycles),
@@ -96,7 +96,7 @@ pub fn run(args: RunArgs) -> Result<u8, String> {
                 None
             }),
         ];
-        machine.resume(&mut conditions)?
+        machine.run(&mut conditions)?
     };
     for (address, length) in &args.dump {
         let bytes = machine.read_memory(*address, *length);
@@ -148,15 +148,11 @@ pub fn run(args: RunArgs) -> Result<u8, String> {
     if !halted {
         // The state dump is already written, so the message only has to say why it stopped.
         match reason {
-            StopReason::Breakpoint => {
-                let address = breakpoints
-                    .iter()
-                    .copied()
-                    .find(|address| machine.pc() == *address)
-                    .unwrap_or(machine.pc());
+            StopReason::Breakpoint(hit) => {
                 return Err(format!(
-                    "stopped at breakpoint {}",
-                    machine.describe(address)
+                    "stopped at breakpoint {} on core {}",
+                    machine.describe(hit.address),
+                    hit.core
                 ));
             }
             StopReason::OutOfBounds => {

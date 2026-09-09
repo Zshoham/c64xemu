@@ -266,7 +266,7 @@ expectation in each is TI's code's rather than this project's.
 | `src/trace.rs` | the execution trace: text or JSON Lines, whole-run or a post-mortem ring |
 | `build.rs` | generates one native `#[test]` per component-vector file for nextest |
 | `src/component_conformance.rs`, `tests/vectors/component/` | native low-level conformance executor and one JSON vector per migrated case |
-| `tests/vectors/component-python-baseline.json` | immutable migration oracle proving every former Python component case survived unchanged |
+| `tests/vectors/component-python-baseline.json` | historical record of the former Python conformance cases; current contracts are exercised by the per-case vectors |
 | `tests/conftest.py`, `tests/common.py`, `tests/target_programs.py` | shared pytest fixtures, case machinery, and the target-program build pipeline |
 | `tests/test_*.py` | target-program, RTOS, network, HPI and decoder-differential integration cases, one module per domain |
 | `justfile`, `devenv.nix`, `pyproject.toml` | reproducible tools, cross-language tasks, and pytest configuration |

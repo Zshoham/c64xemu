@@ -29,7 +29,7 @@ resolution, the SPLOOP buffer - belongs to [Execution and timing](execution.md).
 
 | Layer | Type | File | Seam it presents |
 |---|---|---|---|
-| machine | `Machine`, `MachineArgs` | `src/machine.rs` | `load`, `arm_halt`, `resume(&mut [StopCondition])`, `snapshot`, `state_json` |
+| machine | `Machine`, `MachineArgs` | `src/machine.rs` | `load`, `arm_halt`, `run`/`resume(&mut [StopCondition])`, `snapshot`, `state_json` |
 | device | `Device`, `DeviceProfile` | `src/device.rs` | `step_cycle`, `focus`/`set_focus`, `with_core`, `fabric` |
 | fabric | `Fabric`, `Megamodule`, `Shared` | `src/system.rs` | `read32`/`write32` per requesting core, `tick(cycle)`, `raise(destination, event)` |
 | core bus | `CoreBus<'a>` | `src/system.rs` | everything one core may ask of the device, with its core index already bound |
@@ -252,12 +252,23 @@ is running on.
 
 ## The halt rule and the stop conditions
 
-The halt rule is `Machine::arm_halt(breakpoints, exclude_current)`. It combines a driver's
-breakpoints with the program's exit point (`--stop-pc`, else `C$$EXIT`, else abort) into one
-fetch-halt set and installs it on every core with `Cpu::set_stop_on_fetch`, dropping the address
-a core currently sits on when `exclude_current` is set so a continue or a step can move off its
-own breakpoint - judged per core, because each core sits at its own address. The driver keeps its
-own breakpoint list; the machine owns the rule, so every front end stops at the same addresses.
+`Machine::arm_halt(breakpoints)` retains the driver's addresses and combines them with the
+program's exit point (`--stop-pc`, else `C$$EXIT`, else abort) into every core's fetch-halt set.
+The driver updates that list only at startup or when its breakpoints change; reload restores
+it and changing focus does not alter it.
+
+`Machine::run` respects a breakpoint at the current address, including the image's entry point.
+`Machine::resume` is the interactive continue/step operation: it excludes each core's current
+address for that call, then restores the full halt set before returning, including on host-I/O
+errors. The exclusion is per core, so moving one core off an address does not disable a halt
+at that address for another core. Drivers keep their own lists for labels and editing, but
+never manage exclusion or post-stop rearming.
+
+`StopReason::Breakpoint(BreakpointHit { core, address })` identifies the halt rather than asking
+each caller to infer it from the focused PC. Held cores are ignored; simultaneous hits choose
+the lowest core index. Reporting or inspecting the hit never changes focus. The console and
+dashboard name the stopped core and address, and GDB returns the stopped thread plus its PC
+in the stop reply while keeping subsequent register reads on the selected core.
 
 The CPU enforces it at the fetch boundary: `Cpu::stops_at` is checked with a clean pipeline, and
 when it fires the cycle is counted as a halt cycle and nothing is fetched. That path does not
@@ -268,15 +279,15 @@ the peripherals keep advancing while a core sits halted. What the halt leaves ob
 `ready_to_fetch_at` additionally requires the SPLOOP buffer to be empty, because a breakpoint
 inside a software-pipelined loop legitimately halts mid-buffer.
 
-`Machine::resume(&mut [StopCondition])` evaluates the whole stop-condition set once per cycle,
-before the cycle runs, so a driver check doubles as a per-cycle hook. The machine-native
-conditions are always members and are checked first, in this order:
+Both execution operations use the same stop-condition loop, evaluated once per cycle before
+the cycle runs, so a driver check doubles as a per-cycle hook. The machine-native conditions
+are always members and are checked first, in this order:
 
 | Order | Condition | `StopReason` |
 |---|---|---|
 | 1 | `Cpu::fault()` is set on the focused core | `Fault` |
 | 2 | `Machine::at_stop` - any core out of reset is about to fetch the exit point | `Exit` |
-| 3 | `Machine::any_core_halted` - any core out of reset stopped on an armed address | `Breakpoint` |
+| 3 | `Machine::halt_location` - any core out of reset stopped on an armed address | `Breakpoint(hit)` |
 | 4 | `StopCondition::Budget(cycles)`, zero meaning no limit | `Budget` |
 | 5 | `StopCondition::Packets(n)` | `Packets` |
 | 6 | `StopCondition::Check(&mut dyn FnMut(&Machine) -> Option<StopReason>)` | `Interrupted`, `Watchpoint`, `OutOfBounds` |
@@ -286,7 +297,7 @@ The budget is measured against `Machine::run_clock`: the focused core's cycle co
 device's own while a ROM boot is in the picture, because core 0 is held for the whole of that
 boot and its counter cannot pace a poll or end a budget.
 
-`resume` has a fast path. With only a `Budget` member and neither Ethernet history nor exception
+Both operations share a fast path. With only a `Budget` member and neither Ethernet history nor exception
 tracing on, `resume_budget` runs batches of up to 4096 cycles between service points instead of
 re-evaluating the set every cycle, clamping the batch to the next Ethernet poll, the next HPI
 poll and the deadline. Outside that path, one cycle is `Machine::step`: poll the Ethernet
@@ -319,10 +330,15 @@ prints the `--perf` report. [Command line](../guide/command-line.md) has the opt
 
 `Machine::snapshot` builds one `MachineSnapshot` at one instant: the focused core's `CpuSnapshot`
 (both 32-register files, the PC and the whole 32-entry control register file), its cycle count
-and packet count, `halted`, `at_stop`, `fault`, `loop_active`, the `StatsCounters`, the last
+and packet count, `halted`, `breakpoint`, `at_stop`, `fault`, `loop_active`, the `StatsCounters`, the last
 execute packet's unit issue, the SPLOOP dump, the exit code in A4, the device name, and a
 `CoreSummary` per core - core index, PC, cycles, halted, held in reset, fault, and whether it is
 the focused core.
+
+`breakpoint` is the current armed hit across all running cores, or `None` when no breakpoint
+is hit or the exit point takes precedence. It is separate from `halted`, which still describes
+the focused core. The batch JSON reports it as `{"core": N, "address": ADDRESS}` or `null`;
+the dashboard uses the same identity with a hexadecimal address.
 
 Four front ends consume it, and each is a projection of the same value, so none of them can
 report a different machine than the others:

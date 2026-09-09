@@ -1142,9 +1142,9 @@ answers from a configuration the interface does not run in. Each gained one `MAC
 write where TI's sequence puts it, after the DMA enables - and one of them needed a second, after
 its own SOFTRESET, because section 2.14.1 says "After a software reset operation, all the EMAC
 registers need to be re-initialized". All twenty-six are inside the frozen Python migration
-oracle, which is why this is written down: every case id and every expectation is unchanged, so
-the amendment is to the setup and not to an answer, and `python_component_cases_are_preserved`
-records that in the one place that would otherwise look like a rewrite.
+record, which is why this is written down: every case id and every expectation was unchanged,
+so the amendment was to the setup and not to an answer. That historical record remains in
+`tests/vectors/component-python-baseline.json`; the current per-case vectors are executable.
 
 **[-] PERCFG0 gating.** The registers are modelled and pinned - the lock sequence, PERSTAT0 and
 PERSTAT1 with the five documented states, the write-once EMIFACTL/DDR2CTL - and what the control

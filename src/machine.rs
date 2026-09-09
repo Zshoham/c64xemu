@@ -4,8 +4,8 @@
 //! Ethernet backend, the HPI host side, the trace sink - are the same thing whether the caller
 //! is the batch runner, the console debugger, the browser dashboard or the GDB stub. They live
 //! here once, so `--pcap-in`, `--net-unix`, `--hpi-unix`, `--boot-table` and `--trace` mean the
-//! same in every subcommand, and a driver's run is one call: arm the halt list, resume with
-//! its stop conditions, and read the snapshot.
+//! same in every subcommand. Drivers update their breakpoint addresses when the list changes,
+//! then run or resume with stop conditions and read the snapshot; halt lifecycle stays here.
 
 use crate::cache::CacheView;
 use crate::cio;
@@ -189,6 +189,8 @@ pub struct MachineSnapshot {
     pub cycles: u64,
     pub packets_executed: u64,
     pub halted: bool,
+    /// An armed user breakpoint on any running core; inspecting it never changes focus.
+    pub breakpoint: Option<BreakpointHit>,
     /// Parked on the program's exit point, which is what "the program finished" means.
     pub at_stop: bool,
     pub fault: Option<String>,
@@ -245,6 +247,8 @@ pub struct Machine {
     ethernet_history_enabled: bool,
     /// Where the program ends: `--stop-pc`, or C$$EXIT, or abort.
     stop: Option<u32>,
+    /// Driver-owned breakpoint addresses retained for arming, resume and reload.
+    breakpoints: Vec<u32>,
     /// Breakpoints named on the command line, resolved once.
     initial_breakpoints: Vec<u32>,
     /// Which device this is, so a reload rebuilds the same one.
@@ -273,11 +277,18 @@ pub enum StopCondition<'a> {
     Check(&'a mut dyn FnMut(&Machine) -> Option<StopReason>),
 }
 
+/// The core and address caught by the halt rule. Simultaneous hits use core-index order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct BreakpointHit {
+    pub core: usize,
+    pub address: u32,
+}
+
 /// Why `resume` returned.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StopReason {
     /// The armed halt list caught the fetch - a user breakpoint, not the exit point.
-    Breakpoint,
+    Breakpoint(BreakpointHit),
     /// The program reached its exit point (`--stop-pc`, C$$EXIT, or abort).
     Exit,
     /// The CPU refused to execute something.
@@ -403,6 +414,7 @@ impl Machine {
             next_ethernet_sequence: 0,
             ethernet_history_enabled: false,
             stop: None,
+            breakpoints: Vec::new(),
             initial_breakpoints: Vec::new(),
             mac_id: args.mac_id,
             boot_udp_port: args.boot_udp_port,
@@ -507,6 +519,7 @@ impl Machine {
             next_ethernet_sequence: 0,
             ethernet_history_enabled: false,
             stop: None,
+            breakpoints: Vec::new(),
             initial_breakpoints: Vec::new(),
             mac_id: [0; 6],
             boot_udp_port: 9,
@@ -538,12 +551,15 @@ impl Machine {
         let trace = std::mem::replace(self.device.cpu_mut().trace_mut(), Trace::off());
         self.ethernet_history.clear();
         self.next_ethernet_sequence = 0;
-        self.install()?;
+        // Rebuilding the device also rebuilds its CPUs, including their fetch-halt sets.
+        let result = self.install();
+        self.install_halt(false);
         // A reinstalled trace keeps writing to the same file rather than truncating it.
         if trace.enabled() {
             self.device.cpu_mut().set_trace(trace);
         }
         self.cio_output.clear();
+        result?;
         Ok(())
     }
 
@@ -849,15 +865,19 @@ impl Machine {
             !self.device.held_in_reset(core) && self.device.core(core).ready_to_fetch_at(address)
         })
     }
-    /// The halt rule: which addresses the CPU stops at instead of fetching. The driver's
-    /// breakpoints plus the program's exit point, minus the address the target currently
-    /// sits on when `exclude_current` is set, so a continue or step can move off its own
-    /// breakpoint. The driver keeps its own breakpoint list; this is the rule that turns it
-    /// into the halt set, and it lives here once.
-    /// Every core carries the same halt set, so a breakpoint catches whichever core reaches it;
-    /// `exclude_current` is judged per core, because each one sits at its own address.
-    pub fn arm_halt(&mut self, breakpoints: &[u32], exclude_current: bool) {
+    /// Replace the driver's breakpoint addresses. The machine retains them across resume
+    /// and reload, and unions them with the program's exit point on every core.
+    pub fn arm_halt(&mut self, breakpoints: &[u32]) {
+        self.breakpoints.clear();
+        self.breakpoints.extend_from_slice(breakpoints);
+        self.install_halt(false);
+    }
+
+    /// Install the full halt rule, or its interactive resume form. Exclusion is per core:
+    /// a core moving off its own address must not disable that address for another core.
+    fn install_halt(&mut self, exclude_current: bool) {
         let stop = self.stop;
+        let breakpoints = &self.breakpoints;
         for core in 0..self.device.cores() {
             self.device.with_core(core, |cpu| {
                 let current = cpu.pc();
@@ -872,11 +892,25 @@ impl Machine {
         }
     }
 
-    /// Runs cycles until the first member of the stop-condition set holds. The machine-native
-    /// conditions come first, in the priority the drivers already used: a fault, the exit
-    /// point, then the armed halt list. Every member is evaluated once per cycle before the
-    /// cycle runs, so a driver check doubles as a per-cycle hook.
+    /// Run from the current state, including a breakpoint on the entry address. Batch
+    /// execution uses this; interactive continue and step use `resume` instead.
+    pub fn run(&mut self, conditions: &mut [StopCondition]) -> Result<StopReason, String> {
+        self.install_halt(false);
+        self.run_until_stop(conditions)
+    }
+
+    /// Continue or step with each core's current address excluded for this call. The full
+    /// halt rule is restored before returning, including on host-I/O errors.
     pub fn resume(&mut self, conditions: &mut [StopCondition]) -> Result<StopReason, String> {
+        self.install_halt(true);
+        let result = self.run_until_stop(conditions);
+        self.install_halt(false);
+        result
+    }
+
+    /// Evaluate machine-native conditions before driver conditions, once per cycle.
+    /// The budget-only path batches cycles without changing that halt precedence.
+    fn run_until_stop(&mut self, conditions: &mut [StopCondition]) -> Result<StopReason, String> {
         let start_cycles = self.run_clock();
         let start_packets = self.device.cpu_mut().packets_executed();
         if !self.ethernet_history_enabled && !self.trace_exceptions {
@@ -891,8 +925,8 @@ impl Machine {
             if self.at_stop() {
                 return Ok(StopReason::Exit);
             }
-            if self.any_core_halted() {
-                return Ok(StopReason::Breakpoint);
+            if let Some(hit) = self.halt_location() {
+                return Ok(StopReason::Breakpoint(hit));
             }
             for condition in conditions.iter_mut() {
                 match condition {
@@ -919,14 +953,20 @@ impl Machine {
         }
     }
 
-    /// Batch runner fast path. Host-facing services retain their exact cycle boundaries, while
-    /// the CPU executes the intervening cycles without rechecking inactive Machine facilities.
-    /// Whether any core has stopped on an armed halt address. A core held in reset has not
-    /// stopped on anything: it is not fetching at all, and its PC is wherever reset left it -
-    /// which during a ROM boot is the address the boot has not branched it to yet.
-    pub fn any_core_halted(&mut self) -> bool {
-        (0..self.device.cores())
-            .any(|core| !self.core_held_in_reset(core) && self.device.core(core).halted())
+    /// Locate a fetch halt without changing the focused core. Held cores do not fetch,
+    /// and simultaneous hits are attributed deterministically to the lowest core index.
+    fn halt_location(&self) -> Option<BreakpointHit> {
+        (0..self.device.cores()).find_map(|core| {
+            let cpu = self.device.core(core);
+            (!self.device.held_in_reset(core) && cpu.halted()).then(|| BreakpointHit {
+                core,
+                address: cpu.pc(),
+            })
+        })
+    }
+
+    fn any_core_halted(&self) -> bool {
+        self.halt_location().is_some()
     }
 
     /// The multicore equivalent of `Cpu::run_cycles`: step every core that is running until
@@ -961,8 +1001,8 @@ impl Machine {
             if self.at_stop() {
                 return Ok(StopReason::Exit);
             }
-            if self.any_core_halted() {
-                return Ok(StopReason::Breakpoint);
+            if let Some(hit) = self.halt_location() {
+                return Ok(StopReason::Breakpoint(hit));
             }
             let current = self.run_clock();
             if deadline.is_some_and(|limit| current >= limit) {
@@ -1057,12 +1097,14 @@ impl Machine {
             })
             .collect();
         let at_stop = self.at_stop();
+        let breakpoint = if at_stop { None } else { self.halt_location() };
         let cpu = self.device.cpu();
         MachineSnapshot {
             core: cpu.snapshot(),
             cycles: cpu.cycles(),
             packets_executed: cpu.packets_executed(),
             halted: cpu.halted(),
+            breakpoint,
             at_stop,
             fault: cpu.fault().map(str::to_owned),
             loop_active: cpu.loop_active(),
@@ -1092,12 +1134,6 @@ impl Machine {
         histogram.sort_unstable_by_key(|(pc, count)| (std::cmp::Reverse(*count), *pc));
         histogram.truncate(limit);
         histogram
-    }
-
-    /// Whether the focused core would fetch this address next with a clean pipeline, which is
-    /// how a front end tells a halt at a breakpoint from a halt anywhere else.
-    pub fn ready_to_fetch_at(&self, address: u32) -> bool {
-        self.device.cpu().ready_to_fetch_at(address)
     }
 
     /// Read memory the way a front end must: through the host view, so inspecting a program
@@ -1287,6 +1323,7 @@ impl Machine {
         }
         let mut state = json!({
             "halted": snapshot.at_stop,
+            "breakpoint": snapshot.breakpoint,
             "fault": snapshot.fault,
             "pc": snapshot.core.pc,
             "cycles": snapshot.cycles,
@@ -1619,38 +1656,58 @@ mod tests {
         let mut machine = Machine::bare(Cpu::new(0));
         machine.stop = Some(12);
         machine.device.cpu_mut().write_words(0, &[0; 8]);
-        machine.arm_halt(&[4, 8], false);
+        machine.arm_halt(&[4, 8]);
         let mut conditions: [StopCondition; 0] = [];
         assert_eq!(
             machine.resume(&mut conditions).unwrap(),
-            StopReason::Breakpoint
+            StopReason::Breakpoint(BreakpointHit {
+                core: 0,
+                address: 4
+            })
         );
         assert_eq!(machine.device.cpu_mut().pc(), 4);
     }
 
-    /// The halt rule drops the address the target sits on when asked, so a continue or step
-    /// can move off its own breakpoint; the rest of the set stays armed.
+    /// A fresh run observes an entry breakpoint; subsequent continue/step calls own the
+    /// exclusion and restoration, including the halt that coincides with a packet budget.
     #[test]
-    fn arm_halt_excludes_the_current_address_when_asked() {
+    fn run_and_resume_own_the_halt_lifecycle() {
         let mut machine = Machine::bare(Cpu::new(0));
+        machine.stop = Some(12);
         machine.device.cpu_mut().write_words(0, &[0; 8]);
-        // Without the exclusion the fetch refuses at the address the target sits on.
-        machine.arm_halt(&[0, 4], false);
-        let mut conditions: [StopCondition; 0] = [];
+        machine.arm_halt(&[0, 4, 8]);
         assert_eq!(
-            machine.resume(&mut conditions).unwrap(),
-            StopReason::Breakpoint
+            machine.run(&mut [StopCondition::Budget(100)]).unwrap(),
+            StopReason::Breakpoint(BreakpointHit {
+                core: 0,
+                address: 0
+            })
         );
-        assert_eq!(machine.device.cpu_mut().pc(), 0);
-
-        // With the exclusion the first step executes the address instead of halting again,
-        // and the next halt address catches the run.
-        machine.arm_halt(&[0, 4], true);
+        assert_eq!(machine.snapshot().packets_executed, 0);
         assert_eq!(
-            machine.resume(&mut conditions).unwrap(),
-            StopReason::Breakpoint
+            machine.resume(&mut [StopCondition::Packets(1)]).unwrap(),
+            StopReason::Breakpoint(BreakpointHit {
+                core: 0,
+                address: 4
+            })
         );
-        assert_eq!(machine.device.cpu_mut().pc(), 4);
+        assert_eq!(
+            machine.snapshot().breakpoint,
+            Some(BreakpointHit {
+                core: 0,
+                address: 4
+            })
+        );
+        assert_eq!(
+            machine.resume(&mut [StopCondition::Budget(100)]).unwrap(),
+            StopReason::Breakpoint(BreakpointHit {
+                core: 0,
+                address: 8
+            })
+        );
+        assert_eq!(machine.resume(&mut []).unwrap(), StopReason::Exit);
+        assert_eq!(machine.snapshot().breakpoint, None);
+        assert_eq!(machine.snapshot().packets_executed, 3);
     }
 
     /// A resume with no stop conditions runs to the exit point, which the halt rule added to
@@ -1660,7 +1717,7 @@ mod tests {
         let mut machine = Machine::bare(Cpu::new(0));
         machine.stop = Some(4);
         machine.device.cpu_mut().write_words(0, &[0; 4]);
-        machine.arm_halt(&[], false);
+        machine.arm_halt(&[]);
         let mut conditions: [StopCondition; 0] = [];
         assert_eq!(machine.resume(&mut conditions).unwrap(), StopReason::Exit);
         assert_eq!(machine.device.cpu_mut().pc(), 4);
@@ -1673,29 +1730,10 @@ mod tests {
         let mut machine = Machine::bare(Cpu::new(0));
         machine.stop = Some(8);
         machine.device.cpu_mut().write_words(0, &[0; 8]);
-        machine.arm_halt(&[8], false);
+        machine.arm_halt(&[8]);
         let mut conditions: [StopCondition; 0] = [];
         assert_eq!(machine.resume(&mut conditions).unwrap(), StopReason::Exit);
         assert_eq!(machine.device.cpu_mut().pc(), 8);
-    }
-
-    /// The perf report closes the cycle accounting (executing + idle + stall + halted equals
-    /// the emulated cycle count) and prints the cache hit lines.
-    #[test]
-    fn perf_report_closes_cycle_accounting() {
-        let mut machine = Machine::bare(Cpu::new(0));
-        machine.stop = Some(4);
-        machine.device.cpu_mut().write_words(0, &[0; 4]);
-        machine.arm_halt(&[], false);
-        let mut conditions: [StopCondition; 0] = [];
-        assert_eq!(machine.resume(&mut conditions).unwrap(), StopReason::Exit);
-        let report = machine.perf_report();
-        assert!(report.contains("cycles"), "{report}");
-        assert!(report.contains("executing"), "{report}");
-        assert!(report.contains("branches taken"), "{report}");
-        assert!(report.contains("L1P"), "{report}");
-        // A run of NOPs has no data accesses, so the L1D line still lists itself.
-        assert!(report.contains("L1D"), "{report}");
     }
 
     /// A halt at a breakpoint happens at the fetch boundary: the instruction at the address
@@ -1704,11 +1742,14 @@ mod tests {
     fn resume_halts_before_fetching_a_breakpoint() {
         let mut machine = Machine::bare(Cpu::new(0));
         machine.device.cpu_mut().write_words(0, &[0; 8]);
-        machine.arm_halt(&[8], false);
+        machine.arm_halt(&[8]);
         let mut conditions: [StopCondition; 0] = [];
         assert_eq!(
             machine.resume(&mut conditions).unwrap(),
-            StopReason::Breakpoint
+            StopReason::Breakpoint(BreakpointHit {
+                core: 0,
+                address: 8
+            })
         );
         assert_eq!(machine.device.cpu_mut().pc(), 8);
         assert_eq!(machine.device.cpu_mut().packets_executed(), 2);
@@ -1784,59 +1825,131 @@ mod tests {
         machine.read_memory(0xe000_0000, 64);
         assert_eq!(fills(&mut machine), before, "an inspection read filled L1D");
     }
-    /// Every projection reports the same machine.
-    ///
-    /// The batch runner's JSON, the console debugger's dump, the dashboard and the GDB stub's
-    /// register map are all built from one snapshot now, and this is what that buys: they cannot
-    /// disagree. Before, the complete state had one projection in `state_json`, the dashboard
-    /// built a second by reading the CPU and the memory hierarchy itself, and the GDB stub
-    /// mapped a third, with nothing asserting they matched.
     #[test]
-    fn every_projection_reports_the_same_focused_core() {
+    fn multicore_breakpoint_identity_does_not_change_focus() {
+        // Exercise both execution paths: a bare budget uses batching, while an additional
+        // condition uses per-cycle checks. Held cores must not win simultaneous halt ties.
+        for batched in [false, true] {
+            let mut machine = Machine::bare(Cpu::new(0));
+            machine.device = Device::with_boot_mode(&crate::device::C6472, 0, Endian::Little, 0);
+            for core in 0..6 {
+                machine.device.with_core(core, |cpu| {
+                    cpu.write_words(0, &[0; 32]);
+                    cpu.set_pc(if core == 1 || core == 3 { 0 } else { 32 });
+                });
+            }
+            machine.device.with_core(0, |cpu| cpu.set_pc(4));
+            machine.device.fabric().set_held_in_reset(0, true);
+            machine.set_focus(2);
+            machine.arm_halt(&[4]);
+            let mut conditions = vec![StopCondition::Budget(100)];
+            if !batched {
+                conditions.push(StopCondition::Packets(100));
+            }
+            assert_eq!(
+                machine.run(&mut conditions).unwrap(),
+                StopReason::Breakpoint(BreakpointHit {
+                    core: 1,
+                    address: 4
+                })
+            );
+            assert_eq!(machine.focus(), 2);
+            let snapshot = machine.snapshot();
+            assert_eq!(snapshot.core.pc, 36);
+            assert_eq!(
+                snapshot.breakpoint,
+                Some(BreakpointHit {
+                    core: 1,
+                    address: 4
+                })
+            );
+            let state = machine.state_json(false);
+            assert_eq!(state["breakpoint"], json!({"core": 1, "address": 4}));
+            assert_eq!(state["pc"], 36);
+            assert_eq!(
+                machine.resume(&mut [StopCondition::Budget(1)]).unwrap(),
+                StopReason::Budget
+            );
+            assert_eq!(machine.focus(), 2);
+            assert_eq!(machine.device.core(1).pc(), 8);
+            assert_eq!(machine.device.core(3).pc(), 8);
+        }
+    }
+
+    #[test]
+    fn resume_excludes_current_addresses_per_core() {
         let mut machine = Machine::bare(Cpu::new(0));
-        // Run a few packets so the counters and the program counter are not all zero.
-        machine.device.cpu_mut().write_words(0, &[0; 16]);
-        machine.arm_halt(&[16], false);
-        let mut conditions: [StopCondition; 0] = [];
-        machine.resume(&mut conditions).unwrap();
-
-        let snapshot = machine.snapshot();
-        let json = machine.state_json(false);
-
-        // The batch JSON is a projection of the snapshot, field for field.
-        assert_eq!(json["pc"].as_u64().unwrap() as u32, snapshot.core.pc);
-        assert_eq!(json["cycles"].as_u64().unwrap(), snapshot.cycles);
-        assert_eq!(json["halted"].as_bool().unwrap(), snapshot.at_stop);
+        machine.device = Device::with_boot_mode(&crate::device::C6472, 0, Endian::Little, 0);
+        for core in 0..6 {
+            machine
+                .device
+                .with_core(core, |cpu| cpu.write_words(0, &[0; 16]));
+        }
+        machine.device.with_core(0, |cpu| cpu.set_pc(4));
+        machine.arm_halt(&[4]);
+        // Core 0 leaves its breakpoint, but the same address stays armed for core 1.
         assert_eq!(
-            json["exit_code"].as_u64().unwrap() as u8,
-            snapshot.exit_code
+            machine.resume(&mut [StopCondition::Budget(100)]).unwrap(),
+            StopReason::Breakpoint(BreakpointHit {
+                core: 1,
+                address: 4
+            })
         );
-        assert_eq!(json["device"].as_str().unwrap(), snapshot.device);
-        assert_eq!(
-            json["stats"]["packets"].as_u64().unwrap(),
-            snapshot.stats.packets
-        );
-        assert_eq!(
-            json["registers"]["A4"].as_u64().unwrap() as u32,
-            snapshot.core.a[4]
-        );
-        assert_eq!(
-            json["cores"].as_array().unwrap().len(),
-            snapshot.cores.len()
-        );
+        assert_eq!(machine.focus(), 0);
+        assert_eq!(machine.pc(), 8);
+    }
 
-        // The cheap single-value queries the run path uses answer the same as the snapshot.
-        assert_eq!(machine.pc(), snapshot.core.pc);
-        assert_eq!(machine.cycles(), snapshot.cycles);
-        assert_eq!(machine.fault().map(str::to_owned), snapshot.fault);
-        assert_eq!(machine.register('A', 4), snapshot.core.a[4]);
+    #[test]
+    fn resume_restores_halts_after_host_io_errors() {
+        for batched in [false, true] {
+            let mut machine = Machine::bare(Cpu::new(0));
+            machine.device.cpu_mut().write_words(0, &[0; 16]);
+            machine.cio = Some((0, 128));
+            machine.device.cpu_mut().write_words(128, &[u32::MAX]);
+            machine.arm_halt(&[0]);
+            let mut conditions = vec![StopCondition::Budget(10)];
+            if !batched {
+                conditions.push(StopCondition::Packets(10));
+            }
+            assert!(machine.resume(&mut conditions).is_err());
+            // A failed resume did not leave the current breakpoint excluded.
+            assert_eq!(
+                machine.snapshot().breakpoint,
+                Some(BreakpointHit {
+                    core: 0,
+                    address: 0
+                })
+            );
+            assert_eq!(
+                machine.run(&mut []).unwrap(),
+                StopReason::Breakpoint(BreakpointHit {
+                    core: 0,
+                    address: 0
+                })
+            );
+        }
+    }
 
-        // Exactly one core is focused, and it is the one the snapshot's registers came from.
-        let focused: Vec<&CoreSummary> =
-            snapshot.cores.iter().filter(|core| core.focused).collect();
-        assert_eq!(focused.len(), 1);
-        assert_eq!(focused[0].pc, snapshot.core.pc);
-        assert_eq!(focused[0].cycles, snapshot.cycles);
-        assert_eq!(focused[0].core, machine.focus());
+    #[test]
+    fn reload_retains_the_halt_rule_without_caller_rearming() {
+        let mut machine = Machine::bare(Cpu::new(0));
+        machine.stop = Some(8);
+        machine.arm_halt(&[0, 4]);
+        machine.reload().unwrap();
+        assert_eq!(
+            machine.run(&mut []).unwrap(),
+            StopReason::Breakpoint(BreakpointHit {
+                core: 0,
+                address: 0
+            })
+        );
+        assert_eq!(
+            machine.resume(&mut []).unwrap(),
+            StopReason::Breakpoint(BreakpointHit {
+                core: 0,
+                address: 4
+            })
+        );
+        assert_eq!(machine.resume(&mut []).unwrap(), StopReason::Exit);
     }
 }

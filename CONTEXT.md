@@ -52,7 +52,7 @@ What distinguishes one modelled device from another: core count, address map, ev
 _Avoid_: device config, variant
 
 **focused core**:
-The core every front end drives on a multicore device: the one whose registers `info` prints, whose memory `mem` dumps and which `stepi` advances. The fabric follows the focus, so a front end written for one core works unchanged.
+The core every front end drives on a multicore device: the one whose registers `info` prints, whose memory `mem` dumps and which `stepi` advances. The fabric follows the focus, so a front end written for one core works unchanged; a breakpoint hit on another core does not change the focused core.
 _Avoid_: current core, active core
 
 **device event map**:
@@ -87,14 +87,15 @@ _Avoid_: emulator, session, driver
 **halt rule**:
 The combination of a driver's breakpoints and the program's exit point into the fetch-halt
 set the CPU enforces, dropping the address the target sits on when it is about to move off
-it. The machine owns the rule, so every front end stops at the same addresses.
+it. The machine owns arming and restoration as well as the rule, so every front end stops at
+the same addresses without managing the halt lifecycle.
 _Avoid_: breakpoint logic, stop logic
 
 **stop condition**:
 One member of the set the machine's run loop evaluates on every cycle: a cycle budget, a
 packet count, or a driver-supplied check. The machine-native conditions — a fault, the
 exit point and the armed halt list — are always members and are checked first, and the
-reason a run stopped names the member that fired.
+reason a run stopped names the member that fired, including the core and address for a breakpoint.
 _Avoid_: stop event, run condition
 
 **compact instruction**:

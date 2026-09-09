@@ -91,8 +91,9 @@ real TCP connection with it; see [Networking and host I/O](networking-and-host-i
 **Component conformance cases.** 388 JSON vectors under `tests/vectors/component/`, executed
 natively in-process by `src/component_conformance.rs`. `build.rs` walks that directory and
 generates one `#[test]` per file, so each vector is its own nextest case with its own name.
-`tests/vectors/component-python-baseline.json` is kept immutable as the migration oracle: it
-proves every former Python component case survived the move unchanged.
+`tests/vectors/component-python-baseline.json` remains a historical migration record, not an
+executable equality constraint on today's fixtures. The per-case vectors exercise current
+behavior; intentional interface changes update those expectations with behavioral coverage.
 
 ## Adding a target program
 

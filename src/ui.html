@@ -736,7 +736,7 @@ async function runUntilStop() {
       followPc();
       state = await post("/api/run", {cycles: 200000});
       render();
-      if (state.fault || state.halted) break;
+      if (state.fault || state.halted || state.at_breakpoint) break;
     }
   } finally {
     busy = false; running = false;
@@ -760,7 +760,7 @@ async function pacedRun() {
     const tick = 100;
     const perTick = rate * tick / 1000;
     let cyclesPerInstruction = 1;
-    while (pacing && !state.halted && !state.fault) {
+    while (pacing && !state.halted && !state.at_breakpoint && !state.fault) {
       const budget = Math.min(500000, Math.max(1, Math.round(perTick * cyclesPerInstruction)));
       const retired = state.stats.retired;
       const cycle = state.cycle;
@@ -1111,8 +1111,11 @@ function render() {
   $("packets").textContent = state.stats.packets;
   $("retired").textContent = state.stats.retired;
   $("replays").textContent = state.stats.replay_packets;
-  $("halt").className = "pill " + (state.fault ? "bad" : (state.halted ? "good" : ""));
-  $("halt").textContent = state.fault ? "FAULT" : (state.halted ? (state.at_breakpoint ? "breakpoint" : "halted") : "ready");
+  const stopped = state.halted || state.at_breakpoint;
+  $("halt").className = "pill " + (state.fault ? "bad" : (stopped ? "good" : ""));
+  $("halt").textContent = state.fault ? "FAULT" :
+    (state.breakpoint ? `breakpoint core ${state.breakpoint.core} at ${state.breakpoint.address}` :
+      (state.halted ? "halted" : "ready"));
   const banner = $("faultbanner");
   banner.style.display = state.fault ? "inline" : "none";
   banner.textContent = state.fault || "";
@@ -1205,7 +1208,7 @@ $("stepp").onclick = async () => {
   const before = state.stats.packets + state.stats.replay_packets;
   for (let guard = 0; guard < 400; guard++) {
     await step(1);
-    if (!state || state.fault) break;
+    if (!state || state.fault || state.halted || state.at_breakpoint) break;
     if (state.stats.packets + state.stats.replay_packets > before) break;
   }
 };
