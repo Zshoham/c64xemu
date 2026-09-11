@@ -3334,14 +3334,19 @@ impl Cpu {
                     MpyOp::MpyLh => low(src1) * high(src2),
                     MpyOp::MpyHl => high(src1) * low(src2),
                 };
-                let value = if saturating {
+                let (value, clamped) = if saturating {
                     match product.checked_mul(2) {
-                        Some(doubled) => doubled as u32,
-                        None => 0x7fff_ffff,
+                        Some(doubled) => (doubled as u32, false),
+                        None => (0x7fff_ffff, true),
                     }
                 } else {
-                    product as u32
+                    (product as u32, false)
                 };
+                if clamped {
+                    // Same instruction, shorter encoding: SMPY reports through SSR and
+                    // CSR.SAT whichever way it was encoded.
+                    self.note_saturation(b'M', side);
+                }
                 self.schedule(side, dst, value, 1);
             }
             CompactOpcode::MvkWrite => {
@@ -3690,7 +3695,14 @@ impl Cpu {
                     ShiftKind::Shru => value.checked_shr(count).unwrap_or(0),
                     ShiftKind::Sshl => {
                         let shifted = i64::from(value as i32) << count.min(40);
-                        shifted.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as u32
+                        let (clamped, saturated) = saturate_i32(shifted);
+
+                        if saturated {
+                            // The compact shift is an S-unit instruction and reports its
+                            // saturation the same way `SSHL .S` does.
+                            self.note_saturation(b'S', side);
+                        }
+                        clamped
                     }
                 };
                 self.schedule(side, register, result, 0);
@@ -3831,12 +3843,20 @@ impl Cpu {
                 let x = word & (1 << 12) != 0;
                 let left = self.read_register(side, src1) as i32;
                 let right = self.read_register(if x { opposite(side) } else { side }, src2) as i32;
-                let value = match op {
-                    AluOp::Add => (left as u32).wrapping_add(right as u32),
-                    AluOp::Sub => (left as u32).wrapping_sub(right as u32),
-                    AluOp::Sadd => left.saturating_add(right) as u32,
-                    AluOp::Ssub => left.saturating_sub(right) as u32,
+                let (value, clamped) = match op {
+                    AluOp::Add => ((left as u32).wrapping_add(right as u32), false),
+                    AluOp::Sub => ((left as u32).wrapping_sub(right as u32), false),
+                    AluOp::Sadd => saturate_i32(i64::from(left) + i64::from(right)),
+                    AluOp::Ssub => saturate_i32(i64::from(left) - i64::from(right)),
                 };
+                if clamped {
+                    // A compact encoding is a re-encoding of the same instruction, so it
+                    // sets SSR and CSR.SAT exactly as the 32-bit form does. The L-unit
+                    // forms have bits 1-3 clear; everything else here is the S unit.
+                    let unit = if (word >> 1) & 7 == 0 { b'L' } else { b'S' };
+
+                    self.note_saturation(unit, side);
+                }
                 self.schedule(side, dst, value, 0);
             }
         }
@@ -5441,6 +5461,29 @@ mod tests {
         assert_ne!(cpu.control.read(0x01, 0) & (1 << 9), 0);
         cpu.control.write(0x01, 0);
         assert_eq!(cpu.control.read(0x01, 0) & (1 << 9), 0);
+    }
+
+    #[test]
+    fn a_compact_saturating_add_sets_the_saturation_flags() {
+        // SPRUFE8B 3.10: a compact instruction is a re-encoding of the 32-bit one, so the
+        // compact SADD the header's SAT bit selects has to set its unit's SSR bit and CSR.SAT
+        // one cycle later, exactly as `SADD .L1` does. Compiled Zephyr code reaches the
+        // saturating intrinsics through this encoding, and read CSR as clear before this.
+        let mut cpu = Cpu::new(0);
+        // src1 A4, src2 A5, dst A6, side A, bits 1-3 clear for the L unit.
+        let mut words = compact_packet(0x82e0, 1 << 14);
+
+        words[0] = (words[0] & 0x0000_ffff) | (0x0c6eu32 << 16);
+        cpu.write_words(0, &words);
+        cpu.set_register("A4", 0x7fff_ffff).unwrap();
+        cpu.set_register("A5", 1).unwrap();
+        cpu.step_cycle();
+        assert_eq!(cpu.register('A', 6), 0x7fff_ffff);
+        assert_eq!(cpu.control.read(0x15, 0), 0);
+        cpu.step_cycle();
+        assert_eq!(cpu.control.read(0x15, 0), 1);
+        assert_ne!(cpu.control.read(0x01, 0) & (1 << 9), 0);
+        assert_eq!(cpu.fault(), None);
     }
 
     #[test]
