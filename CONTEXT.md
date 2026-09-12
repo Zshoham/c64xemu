@@ -52,7 +52,7 @@ What distinguishes one modelled device from another: core count, address map, ev
 _Avoid_: device config, variant
 
 **focused core**:
-The core every front end drives on a multicore device: the one whose registers `info` prints, whose memory `mem` dumps and which `stepi` advances. The fabric follows the focus, so a front end written for one core works unchanged; a breakpoint hit on another core does not change the focused core.
+The core every front end drives on a multicore device: the one whose registers `info` prints, whose memory `mem` dumps and which `stepi` advances. The fabric follows the focus, so a front end written for one core works unchanged; a breakpoint hit on another core does not change the focused core, and the CIO handshake is answered on whichever core reached it rather than on the focused one.
 _Avoid_: current core, active core
 
 **device event map**:

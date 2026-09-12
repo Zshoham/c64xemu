@@ -741,29 +741,43 @@ impl Machine {
         }
     }
 
-    /// Answers the RTS library's CIO request when the program reaches the handshake
-    /// breakpoint, so `printf` output appears while it runs under any front end.
+    /// Answers the RTS library's CIO request on every core the program has parked on the
+    /// handshake, so `printf` output appears while it runs under any front end.
+    ///
+    /// The core that answers is the one that reached the trap, which is not always the focused
+    /// one: the handshake is per core while the buffer is a single address in the image.
+    /// Servicing only the focused core left every other core parked on the trap for good - the
+    /// run loop could not advance it, since the next batch found it due again at step 0, and
+    /// the guard that steps the focused core on the spot did not touch it.
     fn pump_cio(&mut self) -> Result<bool, String> {
         let Some((breakpoint, buffer)) = self.cio else {
             return Ok(false);
         };
-        if !self.device.cpu_mut().ready_to_fetch_at(breakpoint) {
-            return Ok(false);
+        let mut handled = false;
+        for core in 0..self.device.cores() {
+            if !self.device.core(core).ready_to_fetch_at(breakpoint) {
+                continue;
+            }
+            handled = true;
+            // The core stays where the program left it and the fabric comes back, so a
+            // request answered here is one the focused core never sees.
+            let output = self
+                .device
+                .with_core(core, |cpu| cio::handle(cpu, buffer))?;
+            if let Some(output) = output {
+                self.cio_output.extend_from_slice(&output.bytes);
+                let mut stream: Box<dyn Write> = if output.fd == 2 {
+                    Box::new(io::stderr())
+                } else {
+                    Box::new(io::stdout())
+                };
+                stream
+                    .write_all(&output.bytes)
+                    .and_then(|()| stream.flush())
+                    .map_err(|error| error.to_string())?;
+            }
         }
-        let output = cio::handle(self.device.cpu_mut(), buffer)?;
-        if let Some(output) = output {
-            self.cio_output.extend_from_slice(&output.bytes);
-            let mut stream: Box<dyn Write> = if output.fd == 2 {
-                Box::new(io::stderr())
-            } else {
-                Box::new(io::stdout())
-            };
-            stream
-                .write_all(&output.bytes)
-                .and_then(|()| stream.flush())
-                .map_err(|error| error.to_string())?;
-        }
-        Ok(true)
+        Ok(handled)
     }
 
     /// Frames the program has transmitted and no backend has taken. Draining the MAC's queue
@@ -1951,5 +1965,40 @@ mod tests {
             })
         );
         assert_eq!(machine.resume(&mut []).unwrap(), StopReason::Exit);
+    }
+
+    /// The core that reached the CIO handshake answers it, whichever one that is. Servicing
+    /// only the focused core parked every other core on the trap for good - a secondary core's
+    /// `printf` on a C6472 never came back, because the run loop could not advance it.
+    #[test]
+    fn cio_is_answered_on_the_core_that_reached_the_trap() {
+        const TRAP: u32 = 0x0080_0200;
+        const BUFFER: u32 = 0x0080_1000;
+
+        let mut machine = Machine::bare(Cpu::new(0));
+        machine.device = Device::with_boot_mode(&crate::device::C6472, 0, Endian::Little, 0);
+
+        // A DT_WRITE request as the TI runtime lays one out: a length, the command, the file
+        // descriptor, the byte count and the data.
+        let mut request = Vec::new();
+        request.extend_from_slice(&5u32.to_le_bytes());
+        request.push(0xf3);
+        request.extend_from_slice(&1i16.to_le_bytes());
+        request.extend_from_slice(&5u16.to_le_bytes());
+        request.extend_from_slice(&[0; 4]);
+        request.extend_from_slice(b"hello");
+        machine
+            .device
+            .with_core(1, |cpu| cpu.host_write_bytes(BUFFER, &request));
+
+        machine.cio = Some((TRAP, BUFFER));
+        machine.device.with_core(0, |cpu| cpu.set_pc(0x40));
+        machine.device.with_core(1, |cpu| cpu.set_pc(TRAP));
+
+        assert!(machine.pump_cio().unwrap(), "no core was serviced");
+        assert_eq!(machine.cio_output(), b"hello");
+        assert_eq!(machine.focus(), 0, "servicing moved the focus");
+        assert_eq!(machine.device.core(0).pc(), 0x40, "the focused core moved");
+        assert_eq!(machine.device.core(1).pc(), TRAP, "the answered core moved");
     }
 }
