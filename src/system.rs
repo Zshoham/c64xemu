@@ -1770,6 +1770,15 @@ impl Fabric {
     fn tick_timers(&mut self) -> bool {
         let mut fired = false;
         for index in 0..self.shared.timers.len() {
+            /* A megamodule's local timer runs on that megamodule's clock: "C64x+ Megamodule
+             * local timers are clock gated as well when the corresponding C64x+ Megamodule is
+             * clock gated" (SPRUEG3B section 4.1), and a module outside Enable has its functional
+             * clocks gated (section 4.1.2). The shared timers, and every timer on a device with
+             * no megamodule to belong to, keep counting.
+             */
+            if index < self.profile.megamodule_timers && !self.core_clocked(index) {
+                continue;
+            }
             let raised = self.shared.timers[index].tick_sysclk3();
             fired |= raised[0] || raised[1];
             for (half, raised) in raised.into_iter().enumerate() {

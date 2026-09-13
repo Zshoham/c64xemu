@@ -530,3 +530,98 @@ def test_c6472_echo_needs_every_core_out_of_reset(
     assert report["state"] == "cores-never-ready", f"{report}"
     ready = [core["ready"] for core in report["cores"]]
     assert ready == [True] + [False] * (CORES - 1), f"{ready}"
+
+TIMERS_FIRMWARE = ROOT / "tests/firmware/c6472_timers"
+
+
+@pytest.fixture(scope="module")
+def timers_firmware(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """The twelve-timer firmware, built with the checked-in TI toolchain.
+
+    It needs the C6472's memory map: code and data in one megamodule's 608 KB local L2, and the
+    counters it reports in the shared 768 KB window, at a fixed address so the dump does not
+    depend on how the linker orders the sections.
+    """
+    program = Program(
+        name="c6472_timers",
+        weight=0,
+        sources=(str(TIMERS_FIRMWARE / "main.c"),),
+        includes=(),
+        cflags=("-O1",),
+        link_flags=(),
+        entry="_c_int00",
+        max_cycles=5_000_000,
+        opt_levels=("-O1",),
+        rts=True,
+        expect={},
+        cio_output=None,
+        rx_frames=(),
+        tx_frames=None,
+        boot_table=None,
+        boot_config=None,
+        link_cmd=str(TIMERS_FIRMWARE / "link.cmd"),
+    )
+    workdir = tmp_path_factory.mktemp("c6472-timers")
+    image = build_target_program(program, workdir)
+    if image is None:
+        pytest.skip("could not build the C6472 timer firmware")
+    return image
+
+
+def test_c6472_timers_all_count_alike(
+    candidate_binary: Path, timers_firmware: Path
+) -> None:
+    """Twelve register blocks, one clock: every timer counts the internal CPU/6 clock, and which
+    core programmed the block makes no difference.
+
+    SPRS612G section 7.16: the device has "six localized timers (Timer 0 - Timer 5) and six
+    shared timers (Timer 6 - Timer 11)" on 64 KB boundaries from 025E 0000h, and the localized
+    ones are "clocked with an internal clock with a CPU/6 frequency". SPRU818B gives the 64-bit
+    general-purpose mode no prescaler (section 3.9.2) and one register layout for the family
+    (section 5), so instances brought up the same way must count at the same rate.
+
+    The firmware brings all twelve up from core 0 - five of them belonging to megamodules whose
+    cores are not running it, so those writes cross the switch fabric - spins 24 million CPU
+    cycles on the time-stamp counter, and leaves each counter's delta plus its TGCR in the shared
+    L2. A per-instance clock, a mis-addressed block, a dropped write, or a counter that stopped
+    would all show here as a delta that does not match its neighbours'.
+    """
+    completed = subprocess.run(
+        [
+            str(candidate_binary),
+            "run",
+            str(timers_firmware),
+            "--device",
+            "c6472",
+            "--boot-mode",
+            "2",
+            "--max-cycles",
+            "120000000",
+            "--dump",
+            "0x00200000:104",
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    words = dumped(completed.stderr, 0x0020_0000)
+    assert len(words) == 26, f"expected twelve deltas, twelve TGCRs, the spin and the verdict, got {words}"
+    deltas, tgcr, spin, worst = words[:12], words[12:24], words[24], words[25]
+
+    assert tgcr == [3] * 12, f"every timer in 64-bit general-purpose mode, got {tgcr}"
+    assert spin > 20_000_000, "the spin was measured on the time-stamp counter"
+
+    # The internal clock is CPU/6, so a million counts per six million CPU cycles: the timers
+    # start a moment apart, which is why this is a tolerance and not an equality.
+    expected = spin // 6
+    for index, delta in enumerate(deltas):
+        assert abs(delta - expected) <= expected // 100, (
+            f"timer {index} counted {delta}, not about {expected} (CPU/6 of {spin} CPU cycles)"
+        )
+
+    spread = max(deltas) - min(deltas)
+    assert spread <= expected // 100, (
+        f"the twelve timers disagree by {spread} counts: {deltas}"
+    )
+    assert worst == 0, f"the firmware's own check found a deviation of {worst} thousandths"

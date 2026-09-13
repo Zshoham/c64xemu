@@ -40,6 +40,12 @@ pub(crate) struct DeviceProfile {
     /// The 64-bit timers, in device order. On the C6472 the first six are one per megamodule
     /// and the last six are shared (SPRS612G section 7.16).
     pub(crate) timer_bases: &'static [u32],
+    /// How many of `timer_bases`, from the front, belong to a megamodule rather than to the
+    /// device. A megamodule's local timer is clocked by that megamodule - "C64x+ Megamodule local
+    /// timers are clock gated as well when the corresponding C64x+ Megamodule is clock gated"
+    /// (SPRUEG3B section 4.1) - while the C6455's two timers sit on the device's own clock and no
+    /// PSC module gates them.
+    pub(crate) megamodule_timers: usize,
     /// The memory protection page geometry of one megamodule.
     pub(crate) mpu_regions: &'static [MpuRegion],
     /// Peripherals a device either has or does not.
@@ -155,6 +161,7 @@ pub(crate) const C6455: DeviceProfile = DeviceProfile {
     emac_bases: &[0x02c8_0000],
     emic_bases: &[],
     timer_bases: C6455_TIMERS,
+    megamodule_timers: 0,
     mpu_regions: C6455_MPU_REGIONS,
     has_mcbsp: true,
     has_utopia: true,
@@ -176,6 +183,7 @@ pub(crate) const C6472: DeviceProfile = DeviceProfile {
     emac_bases: &[0x02c8_0000, 0x02cc_0000],
     emic_bases: &[0x02c8_1000, 0x02cc_1000],
     timer_bases: C6472_TIMERS,
+    megamodule_timers: 6,
     mpu_regions: C6472_MPU_REGIONS,
     // Three TSIPs replace the McBSPs, and the UTOPIA is a slave port with its own PDMA.
     has_mcbsp: false,
@@ -621,5 +629,93 @@ mod tests {
             cpu.bus_mut().write32(0x009f_0000, 0x5555_aaaa);
             assert_eq!(cpu.bus_mut().read32(0x009f_0000), 0x5555_aaaa);
         });
+    }
+    /// A megamodule's local timer runs on that megamodule's clock, so gating the megamodule stops
+    /// the timer with it - while a shared timer, which belongs to no megamodule, keeps counting.
+    ///
+    /// SPRUEG3B section 4.1: "C64x+ Megamodule local timers are clock gated as well when the
+    /// corresponding C64x+ Megamodule is clock gated"; section 4.1.2 has a module outside Enable
+    /// gate its functional clocks. SPRS612G section 7.16: timers 0-5 are the megamodules' and
+    /// timers 6-11 are shared, all of them counting the internal clock at CPU/6.
+    #[test]
+    fn gating_a_megamodule_stops_its_local_timer_and_not_a_shared_one() {
+        const TIMER0: u32 = 0x025e_0000;
+        const TIMER1: u32 = 0x025f_0000;
+        const TIMER6: u32 = 0x0264_0000;
+        const CNTLO: u32 = 0x10;
+        const PRDLO: u32 = 0x18;
+        const PRDHI: u32 = 0x1c;
+        const TCR: u32 = 0x20;
+        const TGCR: u32 = 0x24;
+        // MDCTL1 is the second megamodule's module register (SPRS612G Table 7-3); LRSTZ is bit 8
+        // and NEXT is 4:0, so 103h is Enable and 102h is Disable with reset left de-asserted
+        // (SPRUEG3B Tables 5 and 13, section 4.1.2).
+        const MDCTL1: u32 = 0x02ae_0a00 + 4;
+        const PTCMD: u32 = 0x02ae_0120;
+        const ENABLE: u32 = 0x103;
+        const DISABLE: u32 = 0x102;
+        let mut device = c6472();
+
+        // Three free-running 64-bit counters: TIMMODE 00b with both halves out of reset (SPRU818B
+        // Table 13), period out of reach, and ENAMODE_LO 10b to count continuously (Table 12).
+        for base in [TIMER0, TIMER1, TIMER6] {
+            device.with_core(0, |cpu| {
+                let mut bus = cpu.bus_mut();
+                bus.write32(base + CNTLO, 0);
+                bus.write32(base + 0x14, 0);
+                bus.write32(base + PRDHI, 0xffff_ffff);
+                bus.write32(base + PRDLO, 0xffff_ffff);
+                bus.write32(base + PRDHI, 0xffff_ffff);
+                bus.write32(base + TGCR, 0x3);
+                bus.write32(base + TCR, 0x80);
+            });
+        }
+
+        let count = |device: &mut Device, base: u32| {
+            device.with_core(0, |cpu| cpu.bus_mut().read32(base + CNTLO))
+        };
+        for _ in 0..6 * 32 {
+            device.step_cycle();
+        }
+        let (t0, t1, t6) = (
+            count(&mut device, TIMER0),
+            count(&mut device, TIMER1),
+            count(&mut device, TIMER6),
+        );
+        assert!(t0 > 0 && t1 > 0 && t6 > 0, "the three timers started: {t0} {t1} {t6}");
+
+        // Gate megamodule 1's clock without asserting its local reset, and let the domain's GO
+        // complete: the controller acknowledges one device cycle after the GO. The baseline is
+        // taken after that, so what the assertion below measures is the gate and not the
+        // transition's own cycle.
+        device.with_core(0, |cpu| {
+            let mut bus = cpu.bus_mut();
+            bus.write32(MDCTL1, DISABLE);
+            bus.write32(PTCMD, 1);
+        });
+        device.step_cycle();
+        device.step_cycle();
+        assert!(!device.fabric().core_clocked(1), "megamodule 1 is gated");
+        let t1 = count(&mut device, TIMER1);
+
+        for _ in 0..6 * 32 {
+            device.step_cycle();
+        }
+        assert_eq!(count(&mut device, TIMER1), t1, "the gated megamodule's timer stopped");
+        assert!(count(&mut device, TIMER0) > t0, "the boot core's timer kept counting");
+        assert!(count(&mut device, TIMER6) > t6, "a shared timer kept counting");
+
+        // And it is a gate, not a stop: enabling the module again lets the timer count on.
+        let gated = count(&mut device, TIMER1);
+
+        device.with_core(0, |cpu| {
+            let mut bus = cpu.bus_mut();
+            bus.write32(MDCTL1, ENABLE);
+            bus.write32(PTCMD, 1);
+        });
+        for _ in 0..6 * 32 {
+            device.step_cycle();
+        }
+        assert!(count(&mut device, TIMER1) > gated, "the timer counts again");
     }
 }
