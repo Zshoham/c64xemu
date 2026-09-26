@@ -47,10 +47,36 @@ executor consults the same value the display and the packet validator do, so the
 
 ## Delay slots and the write-back queue
 
-Results are not written when an instruction executes. They are scheduled into `writes`, a bucketed
-queue indexed by the cycle they are due (`WRITE_BUCKETS`, masked, so the lookup is an index rather
-than a search), and `commit_writes` lands the ones due this cycle. Stores, control-register writes
-and saturation updates have their own queues committed by the same call.
+Results are not written when an instruction executes. They are scheduled into the write-back
+queue (`WritebackQueue`, `src/writeback.rs`), and `commit_writes` performs the ones due this
+cycle. The queue owns every delayed effect and the order they come back in; the CPU keeps the
+architectural actions - writing the register, checking a store against memory protection,
+narrowing a control-register write, setting SSR - and the trace events for each.
+
+- **Register writes** wait in a ring of `SLOTS` (16) slots indexed by due cycle, so scheduling
+  and draining are an index rather than a search; every delay is shorter than the ring, so a
+  write never shares a slot with an earlier write-back. A slot drains from its end. Two writes
+  to one register on one cycle are resolved when the second is scheduled: issued on the same
+  cycle it is refused and the CPU raises the SPRUFE8B §3.8.8 resource fault, issued later it
+  replaces the earlier one. A per-slot register mask proves most schedules collision-free
+  without walking the slot.
+- **Stores** land at the end of the cycle they execute on, so every queued store is due at the
+  next write-back and they come back first, last, second to last, ..., second.
+- **Control-register writes** land exactly on their due cycle - the issue cycle, or four later
+  for ILC and RILC - found by a scan with `swap_remove`.
+- **Saturation flags** land from the cycle after the saturating result, as one SSR mask.
+
+An occupancy mask summarises which slots and queues hold anything, so a cycle with nothing due
+costs one mask test inlined into each caller of `commit_writes`, and only a cycle with work
+enters the out-of-line drain.
+
+The commit order - register writes, then stores, then control writes, then saturations, and
+within each the order above - is observable in the trace and in same-address stores, and it is
+the order the CPU committed in when these were four vectors scanned with `swap_remove`.
+`the_queue_commits_in_exactly_the_order_of_the_original_scans` pins it against a model of those
+scans. That includes one irregular case: a packet validation fault ends its cycle without a
+write-back, so a register write due then lands a full ring (16 cycles) later with that slot's
+writes, and a control write due then never lands.
 
 This is what makes delay slots observable in the right way: an instruction with a delay slot is
 one whose write is scheduled further out, and any read in an intervening cycle sees the *old*

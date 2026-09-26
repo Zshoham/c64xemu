@@ -22,7 +22,7 @@ peripherals on the same time base as the pipeline: exactly one device tick per s
 stalls included. `Cpu::cycles()` reports `cycle + stalls`, so it counts steps, and the
 `device_ticks` counter a core asks the fabric with counts the same steps.
 
-What a cycle does *inside* itself - delay slots as write-back buckets, packet validity, branch
+What a cycle does *inside* itself - delay slots as the write-back queue, packet validity, branch
 resolution, the SPLOOP buffer - belongs to [Execution and timing](execution.md).
 
 ## The layers, and the seam each one presents
@@ -384,7 +384,7 @@ Every file in `src/`.
 | `cio.rs` | The TI RTS CIO host handshake: request decoding, host-side service, captured output |
 | `component_conformance.rs` | In-process conformance cases against recorded component vectors (test-only) |
 | `control.rs` | The CPU control register file: CSR, TSR/ITSR/NTSR, the interrupt registers, privilege rules, register naming |
-| `cpu.rs` | The core: fetch, execute packets, the write-back queue, stalls, branches, exception and interrupt taking, `step`/`run_cycles`, `CpuSnapshot` |
+| `cpu.rs` | The core: fetch, execute packets, committing what the write-back queue has due, stalls, branches, exception and interrupt taking, `step`/`run_cycles`, `CpuSnapshot` |
 | `ddr2.rs` | The DDR2 memory controller register file |
 | `debugger.rs` | The console REPL, and the flag that selects the dashboard or the GDB stub instead |
 | `decode_cli.rs` | The `decode` subcommand |
@@ -426,3 +426,4 @@ Every file in `src/`.
 | `ui.html` | The dashboard page itself, embedded in the binary at build time |
 | `utopia.rs` | The UTOPIA 2 ATM slave interface |
 | `view.rs` | The instruction view: unit, data path, cross path, predicate, operands as TI's tools print them, resource accounting, and the JSON serialization |
+| `writeback.rs` | The write-back queue: register writes, stores, control-register writes and saturation flags between the cycle they are scheduled and the cycle they land, and the order they land in |

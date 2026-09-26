@@ -14,6 +14,7 @@ use crate::view::{
     sign_extend, source_fields, spmask_mask, unit_mask_bit, Bank, DecodedOpcode, Encoding,
     Instruction, SploopDump, UnitIssue,
 };
+use crate::writeback::{ControlWrite, RegisterWrite, StoreWrite, WritebackQueue};
 use std::collections::BTreeMap;
 
 /// IERR bit 3, the opcode exception: an instruction word that names no C64x+ instruction, or
@@ -37,39 +38,11 @@ struct Access {
     timing: AccessTiming,
 }
 
-struct PendingWrite {
-    due: u64,
-    bank: Bank,
-    register: usize,
-    value: u32,
-    /// The cycle the instruction issued on, which is what decides a collision between two
-    /// writes that land on the same cycle from different execute packets.
-    issued: u64,
-    /// Load destinations never cause a cross path stall (SPRUFE8B §3.8.4).
-    from_load: bool,
-}
-#[derive(Clone, Copy)]
-struct PendingStore {
-    due: u64,
-    address: u32,
-    size: u8,
-    value: u32,
-}
-#[derive(Clone, Copy)]
-struct PendingControl {
-    due: u64,
-    register: u8,
-    value: u32,
-    /// The mode the `MVC` issued in: a User-mode write only reaches the bits User mode owns.
-    user: bool,
-}
-
 const L2_DECODE_BASE: u32 = 0x0080_0000;
 const L2_DECODE_SIZE: usize = 2 * 1024 * 1024;
 const DECODE_PAGE_BYTES: usize = 512;
 const DECODE_PAGE_SLOTS: usize = DECODE_PAGE_BYTES / 2;
 const DECODE_PAGES: usize = L2_DECODE_SIZE / DECODE_PAGE_BYTES;
-const WRITE_BUCKETS: usize = 16;
 
 #[derive(Clone, Copy)]
 struct DecodedEntry {
@@ -317,9 +290,9 @@ pub struct Cpu {
     /// between cycles and hands it to one core at a time, which is what lets six cores share
     /// one set of peripherals without any of them holding a reference to another.
     attached: Option<Box<Fabric>>,
-    writes: [Vec<PendingWrite>; WRITE_BUCKETS],
-    stores: Vec<PendingStore>,
-    controls: Vec<PendingControl>,
+    /// Every effect scheduled for a later cycle: register writes, stores, control-register
+    /// writes and saturation flags. The queue orders them; `commit_writes` performs them.
+    writeback: WritebackQueue,
     control: Control,
     /// Branches in flight. The C64x+ allows several branches to be resolving at once and
     /// each takes effect on its own cycle, so a single pending slot is not enough.
@@ -352,9 +325,6 @@ pub struct Cpu {
     /// such a packet actually performs a load.
     prot_packet: bool,
     prot_load: bool,
-    /// Saturations to record: the unit's SSR bit becomes visible one cycle after the result
-    /// is written (SPRUFE8B Table 2-22).
-    saturations: Vec<(u64, u32)>,
     /// The SPLOOP packet address of a loop that drained for a pending interrupt, consumed
     /// when that interrupt is finally taken.
     interrupted_sploop: Option<u32>,
@@ -454,7 +424,6 @@ impl Cpu {
             mode_change: None,
             pipe_up: false,
             interrupted_sploop: None,
-            saturations: Vec::new(),
             a: [0; 32],
             b: [0; 32],
             pc,
@@ -462,9 +431,7 @@ impl Cpu {
             core,
             device_ticks: 0,
             attached: Some(fabric),
-            writes: std::array::from_fn(|_| Vec::with_capacity(2)),
-            stores: Vec::with_capacity(4),
-            controls: Vec::with_capacity(2),
+            writeback: WritebackQueue::default(),
             control,
             branches: Vec::new(),
             branch_block_until: 0,
@@ -2284,7 +2251,7 @@ impl Cpu {
                 } else {
                     Bank::A
                 };
-                self.controls.push(PendingControl {
+                self.writeback.schedule_control(ControlWrite {
                     due: self.cycle + u64::from(matches!(register, 0x0d | 0x0e)) * 4,
                     register,
                     value: self.read_register(bank, src),
@@ -2360,7 +2327,7 @@ impl Cpu {
                 let success = valid && buffered.is_some();
                 if let Some((_, value)) = buffered.filter(|_| success) {
                     self.note_store(bus, address);
-                    self.stores.push(PendingStore {
+                    self.writeback.schedule_store(StoreWrite {
                         due: self.cycle,
                         address,
                         size: 4,
@@ -2410,13 +2377,13 @@ impl Cpu {
                 self.note_store(bus, aligned);
                 let data_bank = encoded_data_bank(word);
                 let src = ((word >> 23) & 0x1f) as usize;
-                self.stores.push(PendingStore {
+                self.writeback.schedule_store(StoreWrite {
                     due: self.cycle,
                     address: aligned,
                     size: 4,
                     value: self.read_register(data_bank, src),
                 });
-                self.stores.push(PendingStore {
+                self.writeback.schedule_store(StoreWrite {
                     due: self.cycle,
                     address: aligned.wrapping_add(4),
                     size: 4,
@@ -2435,13 +2402,13 @@ impl Cpu {
                 let data_bank = encoded_data_bank(word);
                 self.note_store(bus, effective);
                 let src = (((word >> 24) & 0x0f) * 2) as usize;
-                self.stores.push(PendingStore {
+                self.writeback.schedule_store(StoreWrite {
                     due: self.cycle,
                     address: effective,
                     size: 4,
                     value: self.read_register(data_bank, src),
                 });
-                self.stores.push(PendingStore {
+                self.writeback.schedule_store(StoreWrite {
                     due: self.cycle,
                     address: effective.wrapping_add(4),
                     size: 4,
@@ -2456,7 +2423,7 @@ impl Cpu {
                 }
                 let data_bank = encoded_data_bank(word);
                 self.note_store(bus, effective);
-                self.stores.push(PendingStore {
+                self.writeback.schedule_store(StoreWrite {
                     due: self.cycle,
                     address: effective,
                     size: 4,
@@ -2478,7 +2445,7 @@ impl Cpu {
                 let data_bank = encoded_data_bank(word);
                 self.note_store(bus, effective & !(size - 1));
                 let value = self.read_register(data_bank, ((word >> 23) & 0x1f) as usize);
-                self.stores.push(PendingStore {
+                self.writeback.schedule_store(StoreWrite {
                     due: self.cycle,
                     address: effective & !(size - 1),
                     value,
@@ -2659,7 +2626,7 @@ impl Cpu {
                     }
                     _ => {
                         self.note_store(bus, effective & !(size - 1));
-                        self.stores.push(PendingStore {
+                        self.writeback.schedule_store(StoreWrite {
                             due: self.cycle,
                             address: effective & !(size - 1),
                             size: size as u8,
@@ -3390,7 +3357,7 @@ impl Cpu {
                     self.schedule_load(data_bank, register, value, 4);
                 } else {
                     self.note_store(bus, address & !3);
-                    self.stores.push(PendingStore {
+                    self.writeback.schedule_store(StoreWrite {
                         due: self.cycle,
                         address: address & !3,
                         size: 4,
@@ -3430,14 +3397,14 @@ impl Cpu {
                     }
                 } else {
                     self.note_store(bus, aligned);
-                    self.stores.push(PendingStore {
+                    self.writeback.schedule_store(StoreWrite {
                         due: self.cycle,
                         address: aligned,
                         size: 4,
                         value: self.read_register(data_bank, register),
                     });
                     if doubleword {
-                        self.stores.push(PendingStore {
+                        self.writeback.schedule_store(StoreWrite {
                             due: self.cycle,
                             address: aligned.wrapping_add(4),
                             size: 4,
@@ -3531,20 +3498,20 @@ impl Cpu {
                 } else if size == 8 {
                     let aligned = if aligned_access { base & !7 } else { base };
                     self.note_store(bus, aligned);
-                    self.stores.push(PendingStore {
+                    self.writeback.schedule_store(StoreWrite {
                         due: self.cycle,
                         address: aligned,
                         size: 4,
                         value: self.read_register(data_bank, register),
                     });
-                    self.stores.push(PendingStore {
+                    self.writeback.schedule_store(StoreWrite {
                         due: self.cycle,
                         address: aligned.wrapping_add(4),
                         size: 4,
                         value: self.read_register(data_bank, register + 1),
                     });
                 } else {
-                    self.stores.push(PendingStore {
+                    self.writeback.schedule_store(StoreWrite {
                         due: self.cycle,
                         address: if aligned_access {
                             base & !(size - 1)
@@ -3783,7 +3750,7 @@ impl Cpu {
                     MvkForm::Xor => self.schedule(side, register, current ^ 1, 0),
                     MvkForm::Neg => self.schedule(side, register, 0u32.wrapping_sub(current), 0),
                     MvkForm::Sub => self.schedule(side, register, current.wrapping_sub(1), 0),
-                    MvkForm::Mvc => self.controls.push(PendingControl {
+                    MvkForm::Mvc => self.writeback.schedule_control(ControlWrite {
                         due: self.cycle + 4,
                         register: 0x0d,
                         value: current,
@@ -3883,7 +3850,7 @@ impl Cpu {
             (b'M', Bank::A) => 4,
             _ => 5,
         };
-        self.saturations.push((self.cycle + 1, bit));
+        self.writeback.schedule_saturation(self.cycle + 1, bit);
     }
 
     /// The same-cycle duplicate-write fault, kept cold so `schedule`'s hot path does not carry
@@ -3901,45 +3868,31 @@ impl Cpu {
     }
 
     fn schedule(&mut self, bank: Bank, register: usize, value: u32, delay: u64) {
-        debug_assert!(delay < WRITE_BUCKETS as u64);
-        let due = self.cycle + delay;
-        let bucket = due as usize & (WRITE_BUCKETS - 1);
-        if let Some(index) = self.writes[bucket]
-            .iter()
-            .position(|write| write.due == due && write.bank == bank && write.register == register)
-        {
+        let write = RegisterWrite::new(
+            self.cycle,
+            delay,
+            bank,
+            register,
+            value,
+            self.scheduling_load,
+        );
+        if self.writeback.schedule_register(write).is_err() {
             // Two instructions in one execute packet writing the same register is the conflict
             // SPRUFE8B section 3.8.8 calls "easily detectable": the assembler rejects it, and a
             // packet that contains it is as malformed as one that claims a unit twice.
-            if self.writes[bucket][index].issued == self.cycle {
-                self.fault_duplicate_write(bank, register);
-                return;
-            }
-            // Across packets the same section says the assembler cannot detect the conflict and
-            // "if the pipeline does receive commands to perform multiple writes to the same
-            // register, the result is undefined" - there is no exception. The later-issued
-            // instruction wins here, which is the resolution TI's own code depends on: the
-            // compiler issues a speculative load whose result is dead and then overwrites the
-            // register with a live value exactly four cycles later.
-            self.writes[bucket].swap_remove(index);
+            self.fault_duplicate_write(bank, register);
+            return;
         }
         if self.trace_a4 && register == 4 {
             eprintln!(
-                "trace cycle {} schedule side {}{register} due {due} value {value:#010x} load {} pc {:#010x}",
+                "trace cycle {} schedule side {}{register} due {} value {value:#010x} load {} pc {:#010x}",
                 self.cycle,
                 bank_name(bank),
+                write.due,
                 self.scheduling_load,
                 self.pc
             );
         }
-        self.writes[bucket].push(PendingWrite {
-            due,
-            bank,
-            register,
-            value,
-            issued: self.cycle,
-            from_load: self.scheduling_load,
-        });
     }
 
     /// Schedule a load destination, which is exempt from the cross path stall rule.
@@ -4202,35 +4155,37 @@ impl Cpu {
         drain + first + parallel * (miss_count - 1)
     }
 
+    /// The write-back at the end of a cycle. Nothing due is the common shape of a stall cycle,
+    /// and of any cycle whose packets scheduled nothing that lands now; the queue answers that
+    /// with one mask test, so the check is inlined into every caller and only a cycle with
+    /// something due enters the out-of-line drain.
+    #[inline(always)]
     fn commit_writes(&mut self, bus: &mut CoreBus<'_>) {
-        let cycle = self.cycle;
         self.previous_writes = [0; 2];
-        let bucket = cycle as usize & (WRITE_BUCKETS - 1);
-        // Nothing is due: the common shape of a stall cycle, and of any cycle whose packet
-        // scheduled nothing. The four queues are checked inline rather than entered.
-        if self.writes[bucket].is_empty()
-            && self.stores.is_empty()
-            && self.controls.is_empty()
-            && self.saturations.is_empty()
-        {
-            return;
+        if !self.writeback.nothing_due(self.cycle) {
+            self.commit_due_writes(bus);
         }
+    }
+
+    /// Perform everything the write-back queue has due this cycle: register writes, then
+    /// stores, then control-register writes, then saturation flags.
+    #[inline(never)]
+    fn commit_due_writes(&mut self, bus: &mut CoreBus<'_>) {
+        let cycle = self.cycle;
         let traced = self.trace.enabled();
-        // Every write in the bucket is due this cycle (later dues live in other buckets), so
-        // popping to empty drains the whole bucket without the Vec swap. PendingWrite is Copy,
-        // so the borrow of `self.writes[bucket]` ends at the pop.
-        while let Some(write) = self.writes[bucket].pop() {
-            debug_assert!(write.due <= cycle);
+        // RegisterWrite is Copy, so the queue's borrow ends at the pop.
+        while let Some(write) = self.writeback.pop_register(cycle) {
+            let register = usize::from(write.register);
             if !write.from_load {
                 let bank = match write.bank {
                     Bank::A => 0,
                     Bank::B => 1,
                 };
-                self.previous_writes[bank] |= 1 << write.register;
+                self.previous_writes[bank] |= 1 << register;
             }
             if traced {
-                let name = format!("{}{}", bank_letter(write.bank), write.register);
-                let old = self.read_bank(write.bank, write.register);
+                let name = format!("{}{}", bank_letter(write.bank), register);
+                let old = self.read_bank(write.bank, register);
                 self.trace.emit(
                     cycle,
                     Event::Write {
@@ -4240,82 +4195,68 @@ impl Cpu {
                     },
                 );
             }
-            self.write_register(write.bank, write.register, write.value);
+            self.write_register(write.bank, register, write.value);
         }
-        let mut index = 0;
-        while index < self.stores.len() {
-            if self.stores[index].due <= cycle {
-                let store = self.stores.swap_remove(index);
-                // A page that does not grant the write swallows it and reports the fault.
-                let user = self.user_mode;
-                if bus.check_access(store.address, Permission::Write, user) {
-                    self.stats.stores += 1;
-                    if traced {
-                        // The old value comes from the host view: reading it through the
-                        // system would allocate a cache line, and tracing must be passive.
-                        let old = bus
-                            .host_read_bytes(store.address, store.size as usize)
-                            .iter()
-                            .rev()
-                            .fold(0u32, |value, byte| (value << 8) | u32::from(*byte));
-                        self.trace.emit(
-                            cycle,
-                            Event::Store {
-                                address: store.address,
-                                size: store.size,
-                                old,
-                                new: store.value,
-                            },
-                        );
-                    }
-                    match store.size {
-                        1 => bus.write_u8(store.address, store.value as u8),
-                        2 => bus.write_u16(store.address, store.value as u16),
-                        4 => bus.write32(store.address, store.value),
-                        _ => unreachable!(),
-                    }
-                }
-            } else {
-                index += 1;
-            }
-        }
-        let mut index = 0;
-        while index < self.controls.len() {
-            if self.controls[index].due == cycle {
-                let write = self.controls.swap_remove(index);
-                let noted = traced
-                    .then(|| crate::control::register_name(write.register))
-                    .flatten()
-                    .map(|name| (name, self.control.read(write.register, self.packet_address)));
-                if write.user {
-                    self.control.write_user(write.register, write.value);
-                } else {
-                    self.control.write(write.register, write.value);
-                }
-                if let Some((name, old)) = noted {
+        while let Some(store) = self.writeback.pop_store(cycle) {
+            // A page that does not grant the write swallows it and reports the fault.
+            let user = self.user_mode;
+            if bus.check_access(store.address, Permission::Write, user) {
+                self.stats.stores += 1;
+                if traced {
+                    // The old value comes from the host view: reading it through the
+                    // system would allocate a cache line, and tracing must be passive.
+                    let old = bus
+                        .host_read_bytes(store.address, store.size as usize)
+                        .iter()
+                        .rev()
+                        .fold(0u32, |value, byte| (value << 8) | u32::from(*byte));
                     self.trace.emit(
                         cycle,
-                        Event::Control {
-                            name,
+                        Event::Store {
+                            address: store.address,
+                            size: store.size,
                             old,
-                            // The register may narrow or ignore bits, so report what it now
-                            // holds rather than what the instruction offered.
-                            new: self.control.read(write.register, self.packet_address),
+                            new: store.value,
                         },
                     );
                 }
+                match store.size {
+                    1 => bus.write_u8(store.address, store.value as u8),
+                    2 => bus.write_u16(store.address, store.value as u16),
+                    4 => bus.write32(store.address, store.value),
+                    _ => unreachable!(),
+                }
+            }
+        }
+        let mut cursor = 0;
+        while let Some(write) = self.writeback.next_control(cycle, &mut cursor) {
+            let noted = traced
+                .then(|| crate::control::register_name(write.register))
+                .flatten()
+                .map(|name| (name, self.control.read(write.register, self.packet_address)));
+            if write.user {
+                self.control.write_user(write.register, write.value);
             } else {
-                index += 1;
+                self.control.write(write.register, write.value);
+            }
+            if let Some((name, old)) = noted {
+                self.trace.emit(
+                    cycle,
+                    Event::Control {
+                        name,
+                        old,
+                        // The register may narrow or ignore bits, so report what it now
+                        // holds rather than what the instruction offered.
+                        new: self.control.read(write.register, self.packet_address),
+                    },
+                );
             }
         }
         // A functional unit's saturation flag appears one cycle later and beats an MVC write.
-        let mut index = 0;
-        while index < self.saturations.len() {
-            if self.saturations[index].0 <= cycle {
-                let (_, bit) = self.saturations.swap_remove(index);
+        let saturated = self.writeback.take_saturations(cycle);
+        for bit in 0..8 {
+            if saturated & (1 << bit) != 0 {
                 self.control.note_saturation(bit);
-            } else {
-                index += 1;
             }
         }
     }

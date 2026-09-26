@@ -48,6 +48,7 @@ mod trace;
 mod ui;
 mod utopia;
 mod view;
+mod writeback;
 
 use clap::{Parser, Subcommand};
 use std::process::ExitCode;
