@@ -553,6 +553,14 @@ impl Cpu {
         self.with_bus(|cpu, bus| cpu.step(bus));
     }
 
+    /// One cycle against a fabric the device is holding rather than lending. The device keeps
+    /// the fabric for a whole batch of device cycles and hands each running core a bus onto it,
+    /// so no core has to take the fabric in and give it back every cycle.
+    pub(crate) fn step_on(&mut self, fabric: &mut Fabric) {
+        let mut bus = CoreBus::new(self.core, fabric);
+        self.step(&mut bus);
+    }
+
     /// Run a bounded batch while no machine-level service is due. Architectural stop-on-fetch
     /// addresses and faults are still checked every cycle; `cio` is an additional fetch boundary
     /// owned by Machine rather than by the debugger's halt list.
@@ -736,12 +744,13 @@ impl Cpu {
         self.nmi_line = asserted;
     }
 
-    /// Take the fabric back from this CPU. Only the device does this, between cycles.
+    /// Take the fabric back from this CPU. Only the device does this: to move it to another
+    /// core, or to hold it itself while it runs device cycles.
     pub fn detach(&mut self) -> Box<Fabric> {
         self.attached.take().expect("cpu has no fabric attached")
     }
 
-    /// Lend the fabric to this CPU for the cycle it is about to run.
+    /// Give the fabric to this CPU, which then holds it until the device takes it back.
     pub fn attach(&mut self, fabric: Box<Fabric>) {
         debug_assert!(self.attached.is_none(), "cpu already has a fabric");
         self.attached = Some(fabric);

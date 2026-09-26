@@ -967,40 +967,13 @@ impl Machine {
         }
     }
 
-    /// Locate a fetch halt without changing the focused core. Held cores do not fetch,
-    /// and simultaneous hits are attributed deterministically to the lowest core index.
+    /// Locate a fetch halt without changing the focused core; `Device::halted_core` owns the
+    /// attribution rule.
     fn halt_location(&self) -> Option<BreakpointHit> {
-        (0..self.device.cores()).find_map(|core| {
-            let cpu = self.device.core(core);
-            (!self.device.held_in_reset(core) && cpu.halted()).then(|| BreakpointHit {
-                core,
-                address: cpu.pc(),
-            })
+        self.device.halted_core().map(|core| BreakpointHit {
+            core,
+            address: self.device.core(core).pc(),
         })
-    }
-
-    fn any_core_halted(&self) -> bool {
-        self.halt_location().is_some()
-    }
-
-    /// The multicore equivalent of `Cpu::run_cycles`: step every core that is running until
-    /// one of them reaches a halt boundary, the CIO handshake comes due, or the batch is spent.
-    fn run_device_cycles(&mut self, cycles: u64, cio: Option<u32>, ignore_cio_once: bool) -> u64 {
-        let start = self.device.cycle();
-        for step in 0..cycles {
-            if self.any_core_halted() {
-                break;
-            }
-            if let Some(address) = cio {
-                let due = (0..self.device.cores())
-                    .any(|core| self.device.core(core).ready_to_fetch_at(address));
-                if due && !(step == 0 && ignore_cio_once) {
-                    break;
-                }
-            }
-            self.device.step_cycle();
-        }
-        self.device.cycle() - start
     }
 
     fn resume_budget(&mut self, start_cycles: u64, budget: u64) -> Result<StopReason, String> {
@@ -1038,13 +1011,7 @@ impl Machine {
                 batch = batch.min(limit.saturating_sub(current).max(1));
             }
             let cio = self.cio.map(|(breakpoint, _)| breakpoint);
-            // A single core runs itself, which is the fast path. A ROM boot is device state and
-            // the core it is booting is held, so the device has to be what advances.
-            let advanced = if self.device.cores() == 1 && !self.device.rom_booting() {
-                self.device.cpu_mut().run_cycles(batch, cio, handled_cio)
-            } else {
-                self.run_device_cycles(batch, cio, handled_cio)
-            };
+            let advanced = self.device.run_cycles(batch, cio, handled_cio);
             if advanced == 0 {
                 // A newly reached CIO boundary or halt is handled at the top of the next pass.
                 // Stepping here is only a guard against an inconsistent boundary predicate.

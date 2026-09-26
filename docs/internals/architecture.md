@@ -30,7 +30,7 @@ resolution, the SPLOOP buffer - belongs to [Execution and timing](execution.md).
 | Layer | Type | File | Seam it presents |
 |---|---|---|---|
 | machine | `Machine`, `MachineArgs` | `src/machine.rs` | `load`, `arm_halt`, `run`/`resume(&mut [StopCondition])`, `snapshot`, `state_json` |
-| device | `Device`, `DeviceProfile` | `src/device.rs` | `step_cycle`, `focus`/`set_focus`, `with_core`, `fabric` |
+| device | `Device`, `DeviceProfile` | `src/device.rs` | `run_cycles`, `step_cycle`, `halted_core`, `focus`/`set_focus`, `with_core`, `fabric` |
 | fabric | `Fabric`, `Megamodule`, `Shared` | `src/system.rs` | `read32`/`write32` per requesting core, `tick(cycle)`, `raise(destination, event)` |
 | core bus | `CoreBus<'a>` | `src/system.rs` | everything one core may ask of the device, with its core index already bound |
 | memory hierarchy | `MemoryHierarchy`, `BoundHierarchy` | `src/memory.rs` | `read_u32`, `fetch_packet`, `snoop_read`, `host_snoop_read`, `access_timing` |
@@ -63,13 +63,16 @@ behind the caches is the backing store, which `Fabric::memory` binds in on every
 
 ### Lending the fabric
 
-There is one `Fabric`, in a `Box`, and exactly one core holds it at a time. `Cpu::attach` and
-`Cpu::detach` move it; `Device` tracks `holder` and `focus`, and between cycles the holder is
-the focused core, so `device.cpu()` behaves the way a single-core `Cpu` always did. That is why
-a core reaches the shared peripherals without holding a reference to any other core, and why
-`CoreBus` is just `{ core, fabric }` - the core index is the only thing the CPU adds to the
-seam. `Device::with_core` lends the fabric to a named core for one closure and gives it back;
-`Device::fabric()` reaches the device-level operations no single core owns.
+There is one `Fabric`, in a `Box`, and exactly one holder at a time. At rest that is the focused
+core - `Cpu::attach` and `Cpu::detach` move it, and `Device` tracks only `focus` - so
+`device.cpu()` behaves the way a single-core `Cpu` always did. While the device runs cycles it
+detaches the fabric and holds it itself for the whole batch, handing each core it runs a bus
+onto it through `Cpu::step_on`; it gives the fabric back to the focused core before returning,
+so no caller ever sees it anywhere else. That is why a core reaches the shared peripherals
+without holding a reference to any other core, and why `CoreBus` is just `{ core, fabric }` -
+the core index is the only thing the CPU adds to the seam. `Device::with_core` lends the fabric
+to a named core for one closure and gives it back; `Device::fabric()` reaches the device-level
+operations no single core owns.
 
 The focused core is what every front end drives: `Machine::pc`, `snapshot`, `read_memory`,
 `set_register` and `cache_views` all go through `Device::cpu`/`cpu_mut`, and `set_focus` moves
@@ -77,15 +80,18 @@ the fabric so the newly focused core is inspected and driven exactly like the ol
 
 ## How a device cycle advances
 
-`Device::step_cycle` is one device cycle. It walks cores in index order, skips any core that
-`Fabric::held_in_reset` or `!Fabric::core_clocked` (the C6472's power/sleep controller can gate
-a megamodule's clock), attaches the fabric to each core it does run and calls `Cpu::step_cycle`.
-After the cores, it calls `fabric.tick(self.cycle)` - with every core held in reset the
-peripherals still run, which is how a host boots the device through the HPI while the cores wait
-- then advances the ROM boot if one is strapped, then applies the device-level effects of the
-cycle in `apply_device_requests`: cores the boot controller or the power/sleep controller
-released (set to their `boot_address` and let out of reset) and cores whose NMI pin the
-chip-level registers drove.
+`Device::cycle_on` is one device cycle, and the only implementation of one: `Device::step_cycle`
+runs a single cycle through it and `Device::run_cycles` runs a batch of them. It walks cores in
+index order, skips any core that `Fabric::held_in_reset` or `!Fabric::core_clocked` (the C6472's
+power/sleep controller can gate a megamodule's clock) - asked when that core's turn comes, so an
+earlier core's access can hold, release or gate a later one in the same cycle - and steps each
+core it does run with `Cpu::step_on` against the fabric the device is holding. After the cores,
+it calls `fabric.tick(self.cycle)` - with every core held in reset the peripherals still run,
+which is how a host boots the device through the HPI while the cores wait - then advances the
+ROM boot if one is strapped, then applies the device-level effects of the cycle in
+`apply_device_requests`: cores the boot controller or the power/sleep controller released (set
+to their `boot_address` and let out of reset) and cores whose NMI pin the chip-level registers
+drove.
 
 `Fabric::tick(cycle)` is guarded, and the guard is the whole tick model:
 
@@ -106,12 +112,20 @@ chip-level registers drove.
   `CoreBus::take_interrupt_state`. A dormant device answers "nothing asserted" for millions of
   cycles, which is what the short path exists for.
 
-With one core running, `Device::step_cycle` is bypassed entirely on the batch fast path:
-`Machine::resume_budget` calls `Cpu::run_cycles` when `self.device.cores() == 1` and no ROM boot
-is in progress, and that loop steps the CPU (which ticks the device from inside) until a halt
-address, the CIO boundary or the batch bound. With six cores, or during a ROM boot - the boot is
-device state and the core it is booting is held - it calls `Machine::run_device_cycles`, which
-drives `Device::step_cycle`.
+`Machine::resume_budget` asks the device for a batch with `Device::run_cycles(batch, cio,
+ignore_cio_once)` whatever the core count, and the device picks how to run it. With one core
+and no ROM boot in progress, `Device::step_cycle` is bypassed entirely on the fast path:
+`Cpu::run_cycles` steps the CPU (which ticks the device from inside) until a halt address, the
+CIO boundary or the batch bound, and answers in core cycles without moving `Device::cycle`.
+With six cores, or during a ROM boot - the boot is device state and the core it is booting is
+held - the device runs whole device cycles through `cycle_on`, checking before each one that no
+core out of reset has halted and that no core is ready to fetch the CIO breakpoint (except on
+the first cycle of a batch that has just answered the handshake), and answers in device cycles.
+Those two tests do not rescan the cores: a private `Boundaries` keeps each as a bit mask per
+core, observed again after the core steps and after the device moves its PC (the ROM boot's
+entry, a boot-controller release). Both predicates read only a core's own state, which nothing
+else changes inside a batch, so the masks always equal a fresh scan. Held-in-reset is fabric
+state and is read at the moment of the test, as the halt rule requires.
 
 Cores in the same cycle run in index order, and the ones that follow see the peripheral state
 the first core has already produced. Six cores are concurrent on silicon; this ordering is a
@@ -273,7 +287,7 @@ in the stop reply while keeping subsequent register reads on the selected core.
 The CPU enforces it at the fetch boundary: `Cpu::stops_at` is checked with a clean pipeline, and
 when it fires the cycle is counted as a halt cycle and nothing is fetched. That path does not
 tick the device from the core, so on the single-core fast path `Cpu::run_cycles` breaks out of
-its batch; under `Device::step_cycle` the device-level `fabric.tick(self.cycle)` still runs, so
+its batch; under `Device::cycle_on` the device-level `fabric.tick(self.cycle)` still runs, so
 the peripherals keep advancing while a core sits halted. What the halt leaves observable is
 `Cpu::halted()` and `Cpu::ready_to_fetch_at(address)`. The two differ deliberately:
 `ready_to_fetch_at` additionally requires the SPLOOP buffer to be empty, because a breakpoint

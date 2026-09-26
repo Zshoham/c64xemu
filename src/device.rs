@@ -232,18 +232,77 @@ impl RomBoot {
 
 /// The device as a whole: its cores and the fabric they share.
 ///
-/// The fabric is lent to exactly one core at a time. During a cycle it goes to whichever core
-/// is executing; at rest it stays with the **focused** core, which is the one every front end
-/// inspects and drives, so `device.cpu()` behaves the way a single-core `Cpu` always did.
+/// The fabric is lent to exactly one core at a time. At rest it stays with the **focused**
+/// core, which is the one every front end inspects and drives, so `device.cpu()` behaves the way
+/// a single-core `Cpu` always did. While the device runs cycles it holds the fabric itself and
+/// gives each core that executes a bus onto it; `with_core` lends it to another core for the
+/// length of one closure. Neither is observable from outside, so wherever a caller can look,
+/// the focused core is the one holding it.
 pub struct Device {
     cpus: Vec<Cpu>,
-    /// Which core currently holds the fabric. Between cycles this is `focus`.
-    holder: usize,
     focus: usize,
     cycle: u64,
     /// The ROM bootloader's boot, once a front end has strapped the device to one. It outlives
     /// the boot it performed: what it did is what a front end reports afterwards.
     rom_boot: Option<RomBoot>,
+}
+
+/// The two boundaries a batch of device cycles ends at, kept as bit masks over the cores and
+/// brought up to date as each core steps rather than rescanned across every core each cycle.
+///
+/// Both predicates read only a core's own state - its PC, its stall counters, its loop buffer,
+/// its fault and its halt list - and nothing another core or the fabric can reach. Within a
+/// batch that state changes only when the core itself steps, or when the device moves its PC
+/// (the ROM boot's entry, a boot-controller release); the device observes the core again at
+/// each of those points, so the masks always equal a fresh scan. Whether a core is held in
+/// reset is fabric state, which can change on any cycle, so it is not cached: the halt test
+/// reads it at the moment it asks, as the scan did.
+struct Boundaries {
+    /// The CIO breakpoint, when the machine has the handshake armed.
+    cio: Option<u32>,
+    /// Cores for which `Cpu::halted` holds, held in reset or not.
+    halted: u32,
+    /// Cores for which `Cpu::ready_to_fetch_at(cio)` holds.
+    at_cio: u32,
+}
+
+impl Boundaries {
+    fn scan(cpus: &[Cpu], cio: Option<u32>) -> Self {
+        let mut boundaries = Self {
+            cio,
+            halted: 0,
+            at_cio: 0,
+        };
+        for (core, cpu) in cpus.iter().enumerate() {
+            boundaries.observe(core, cpu);
+        }
+        boundaries
+    }
+
+    #[inline]
+    fn observe(&mut self, core: usize, cpu: &Cpu) {
+        let bit = 1u32 << core;
+        self.halted = (self.halted & !bit) | (u32::from(cpu.halted()) << core);
+        let at_cio = self
+            .cio
+            .is_some_and(|address| cpu.ready_to_fetch_at(address));
+        self.at_cio = (self.at_cio & !bit) | (u32::from(at_cio) << core);
+    }
+
+    /// Whether a core that is out of reset has halted. A held core does not fetch, so an armed
+    /// address its reset PC happens to match is not a halt.
+    #[inline]
+    fn any_halted(&self, fabric: &Fabric) -> bool {
+        let mut halted = self.halted;
+        while halted != 0 {
+            let core = halted.trailing_zeros() as usize;
+            if !fabric.held_in_reset(core) {
+                return true;
+            }
+            halted &= halted - 1;
+        }
+        false
+    }
 }
 
 impl Device {
@@ -278,7 +337,6 @@ impl Device {
         cpus[profile.reset_core].attach(fabric);
         Self {
             cpus,
-            holder: profile.reset_core,
             focus: profile.reset_core,
             cycle: 0,
             rom_boot: None,
@@ -323,7 +381,13 @@ impl Device {
     /// Whether a core is held in reset, without borrowing the fabric mutably: the halt rule
     /// asks on every pass and only needs to read.
     pub fn held_in_reset(&self, core: usize) -> bool {
-        self.cpus[self.holder].fabric_ref().held_in_reset(core)
+        self.cpus[self.focus].fabric_ref().held_in_reset(core)
+    }
+
+    /// The core that has halted on an armed address, if any. Held cores do not fetch, and
+    /// simultaneous hits are attributed deterministically to the lowest core index.
+    pub fn halted_core(&self) -> Option<usize> {
+        (0..self.cpus.len()).find(|&core| !self.held_in_reset(core) && self.cpus[core].halted())
     }
 
     /// What the Ethernet boot has done, when the device was strapped to one.
@@ -350,9 +414,8 @@ impl Device {
         if core == self.focus {
             return;
         }
-        let fabric = self.cpus[self.holder].detach();
+        let fabric = self.cpus[self.focus].detach();
         self.cpus[core].attach(fabric);
-        self.holder = core;
         self.focus = core;
     }
 
@@ -370,24 +433,22 @@ impl Device {
 
     /// Drive one core with the fabric attached to it, whichever core is focused.
     pub fn with_core<R>(&mut self, core: usize, action: impl FnOnce(&mut Cpu) -> R) -> R {
-        let previous = self.holder;
-        if previous != core {
-            let fabric = self.cpus[previous].detach();
+        let focus = self.focus;
+        if focus != core {
+            let fabric = self.cpus[focus].detach();
             self.cpus[core].attach(fabric);
-            self.holder = core;
         }
         let result = action(&mut self.cpus[core]);
-        if previous != core {
+        if focus != core {
             let fabric = self.cpus[core].detach();
-            self.cpus[previous].attach(fabric);
-            self.holder = previous;
+            self.cpus[focus].attach(fabric);
         }
         result
     }
 
     /// The shared fabric, for the device-level operations no single core owns.
     pub fn fabric(&mut self) -> &mut Fabric {
-        self.cpus[self.holder].fabric_mut()
+        self.cpus[self.focus].fabric_mut()
     }
 
     pub fn cycle(&self) -> u64 {
@@ -396,43 +457,97 @@ impl Device {
 
     /// One device cycle: every core that is out of reset executes, and the shared peripherals
     /// advance once.
+    pub fn step_cycle(&mut self) {
+        let mut fabric = self.cpus[self.focus].detach();
+        self.cycle_on(&mut fabric, None);
+        self.cpus[self.focus].attach(fabric);
+    }
+
+    /// Run up to `cycles` cycles while no machine-level service is due, answering how many
+    /// ran. The batch ends early, before the cycle that would cross it, when a core out of
+    /// reset has halted on an armed address or a core is ready to fetch the CIO breakpoint -
+    /// except on the first cycle when `ignore_cio_once` says the machine has just answered
+    /// that handshake and the core is still sitting on it.
+    ///
+    /// A single core with no ROM boot runs itself: `Cpu::run_cycles` is the fast path, it ticks
+    /// the device from inside its own cycle and counts in the core's cycles, and it leaves the
+    /// device's cycle counter alone. Six cores, or a ROM boot - which is device state, and holds
+    /// the core it boots - advance whole device cycles and count in those.
+    pub(crate) fn run_cycles(
+        &mut self,
+        cycles: u64,
+        cio: Option<u32>,
+        ignore_cio_once: bool,
+    ) -> u64 {
+        if self.cpus.len() == 1 && self.rom_boot.is_none() {
+            return self.cpus[0].run_cycles(cycles, cio, ignore_cio_once);
+        }
+        // The device keeps the fabric for the whole batch and gives it back to the focused
+        // core at the end, which is before any caller can look.
+        let mut fabric = self.cpus[self.focus].detach();
+        let mut boundaries = Boundaries::scan(&self.cpus, cio);
+        let start = self.cycle;
+        for step in 0..cycles {
+            if boundaries.any_halted(&fabric) {
+                break;
+            }
+            if boundaries.at_cio != 0 && !(step == 0 && ignore_cio_once) {
+                break;
+            }
+            self.cycle_on(&mut fabric, Some(&mut boundaries));
+        }
+        self.cpus[self.focus].attach(fabric);
+        self.cycle - start
+    }
+
+    /// The one implementation of a device cycle, against the fabric the device is holding.
+    /// `boundaries`, when a batch is watching for them, is kept current for every core whose
+    /// state the cycle touched.
     ///
     /// Cores run in index order and the peripherals tick inside the first core's cycle, which
     /// is what the single-core device has always done; the cores that follow it in the same
     /// cycle therefore see the peripheral state that core has just produced. That is a choice
     /// the hardware does not make for us - six cores are concurrent - but it is deterministic,
-    /// which is worth more to a debugger than an invented interleaving.
-    pub fn step_cycle(&mut self) {
-        let mut fabric = self.cpus[self.holder].detach();
+    /// which is worth more to a debugger than an invented interleaving. Whether a core runs is
+    /// asked when its turn comes, so an earlier core's access this cycle can hold, release or
+    /// gate a later one.
+    fn cycle_on(&mut self, fabric: &mut Fabric, mut boundaries: Option<&mut Boundaries>) {
         for core in 0..self.cpus.len() {
             if fabric.held_in_reset(core) || !fabric.core_clocked(core) {
                 continue;
             }
-            self.cpus[core].attach(fabric);
-            self.cpus[core].step_cycle();
-            fabric = self.cpus[core].detach();
+            let cpu = &mut self.cpus[core];
+            cpu.step_on(fabric);
+            if let Some(boundaries) = boundaries.as_deref_mut() {
+                boundaries.observe(core, cpu);
+            }
         }
         // With every core held in reset the peripherals still run: that is how a host boots the
         // device through the HPI while the cores wait (SPRUEC6G section 4.3.2).
         fabric.tick(self.cycle);
         self.cycle += 1;
         if let Some(boot) = self.rom_boot.as_mut() {
-            if let Some(entry) = boot.tick(&mut fabric) {
+            if let Some(entry) = boot.tick(fabric) {
                 // The boot table has ended: the ROM branches core 0 to the entry point it named,
                 // and the cores the table released are already starting from their own boot
                 // addresses (SPRUEC6G section 4.3.5).
                 self.cpus[0].set_pc(entry);
                 fabric.set_held_in_reset(0, false);
+                if let Some(boundaries) = boundaries.as_deref_mut() {
+                    boundaries.observe(0, &self.cpus[0]);
+                }
             }
         }
-        self.apply_device_requests(&mut fabric);
-        self.holder = self.focus;
-        self.cpus[self.holder].attach(fabric);
+        self.apply_device_requests(fabric, boundaries);
     }
 
     /// The device-level effects a cycle produced: cores released from reset, and cores whose
     /// NMI pin another core drove (SPRS612G sections 2.4.1 and 3.7.1).
-    fn apply_device_requests(&mut self, fabric: &mut Fabric) {
+    fn apply_device_requests(
+        &mut self,
+        fabric: &mut Fabric,
+        mut boundaries: Option<&mut Boundaries>,
+    ) {
         let released = fabric.take_release_requests();
         for core in 0..self.cpus.len() {
             if released & (1 << core) == 0 {
@@ -447,9 +562,13 @@ impl Device {
             }
             if let Some(address) = fabric.boot_address(core) {
                 self.cpus[core].set_pc(address);
+                if let Some(boundaries) = boundaries.as_deref_mut() {
+                    boundaries.observe(core, &self.cpus[core]);
+                }
             }
             fabric.set_held_in_reset(core, false);
         }
+        // Driving the NMI pin latches an edge and moves nothing a boundary reads.
         let nmi = fabric.take_nmi_requests();
         for core in 0..self.cpus.len() {
             if nmi & (1 << core) != 0 {
@@ -465,7 +584,6 @@ impl Device {
     pub fn from_cpu(cpu: Cpu) -> Self {
         Self {
             cpus: vec![cpu],
-            holder: 0,
             focus: 0,
             cycle: 0,
             rom_boot: None,
@@ -547,6 +665,77 @@ mod tests {
         assert!(device.core(3).cycles() > before, "core 3 is running");
         // A core that was never released stays put.
         assert!(device.fabric().held_in_reset(4));
+    }
+
+    /// A batch of device cycles ends exactly where stepping one device cycle at a time and
+    /// asking every core before each cycle would: before the first cycle on which a core out of
+    /// reset has halted or any core is ready to fetch the CIO breakpoint, with the handshake's
+    /// first-cycle exemption. The cases include a core the boot controller moves onto an armed
+    /// address mid-batch, and a held core sitting on one.
+    #[test]
+    fn a_batch_of_device_cycles_stops_where_a_per_cycle_scan_would() {
+        let entry = 0x0080_0000u32;
+        let start = 0x0080_2000u32;
+        // Cores 1-5 held, core 3 about to be released onto `start`, and each core's halt list.
+        let prepare = |armed: &[(usize, u32)]| {
+            let mut device = c6472();
+            for core in 1..6 {
+                device.fabric().set_held_in_reset(core, true);
+            }
+            device.with_core(3, |cpu| cpu.write_bytes(start, &[0u8; 32]));
+            device.with_core(0, |cpu| {
+                let mut bus = cpu.bus_mut();
+                bus.write32(DSP_BOOT_ADDR0 + 0x20 * 3, start >> 10);
+                bus.write32(BOOT_COMPLETE_STAT, 1 << 3);
+            });
+            for &(core, address) in armed {
+                device.with_core(core, |cpu| cpu.set_stop_on_fetch(vec![address]));
+            }
+            device
+        };
+        let scanned = |device: &mut Device, cycles: u64, cio: Option<u32>, ignore: bool| {
+            let first = device.cycle();
+            for step in 0..cycles {
+                if device.halted_core().is_some() {
+                    break;
+                }
+                let due = cio.is_some_and(|address| {
+                    (0..device.cores()).any(|core| device.core(core).ready_to_fetch_at(address))
+                });
+                if due && !(step == 0 && ignore) {
+                    break;
+                }
+                device.step_cycle();
+            }
+            device.cycle() - first
+        };
+        // Each case: the halt lists armed, the CIO breakpoint, the handshake's first-cycle
+        // exemption, and where the batch ends.
+        type Case<'a> = (&'a [(usize, u32)], Option<u32>, bool, u64);
+        let cases: &[Case] = &[
+            // Core 3 is released onto its armed address after the first cycle.
+            (&[(3, start)], None, false, 1),
+            // A held core on an armed address is not a halt.
+            (&[(4, entry)], None, false, 40),
+            // Held cores sit on the entry point, so the CIO boundary is due at once...
+            (&[], Some(entry), false, 0),
+            // ...and still due after the exempt first cycle.
+            (&[], Some(entry), true, 1),
+            // The release moves core 3 onto the CIO breakpoint.
+            (&[], Some(start), false, 1),
+        ];
+        for &(armed, cio, ignore, expected) in cases {
+            let mut batched = prepare(armed);
+            let mut stepped = prepare(armed);
+            let advanced = batched.run_cycles(40, cio, ignore);
+            assert_eq!(advanced, scanned(&mut stepped, 40, cio, ignore));
+            assert_eq!(advanced, expected, "{armed:?} {cio:?} {ignore}");
+            for core in 0..6 {
+                assert_eq!(batched.core(core).pc(), stepped.core(core).pc());
+                assert_eq!(batched.core(core).cycles(), stepped.core(core).cycles());
+            }
+            assert_eq!(batched.halted_core(), stepped.halted_core());
+        }
     }
 
     /// A held core executes nothing, but its memories still answer: that is how a host, or
@@ -682,7 +871,10 @@ mod tests {
             count(&mut device, TIMER1),
             count(&mut device, TIMER6),
         );
-        assert!(t0 > 0 && t1 > 0 && t6 > 0, "the three timers started: {t0} {t1} {t6}");
+        assert!(
+            t0 > 0 && t1 > 0 && t6 > 0,
+            "the three timers started: {t0} {t1} {t6}"
+        );
 
         // Gate megamodule 1's clock without asserting its local reset, and let the domain's GO
         // complete: the controller acknowledges one device cycle after the GO. The baseline is
@@ -701,9 +893,19 @@ mod tests {
         for _ in 0..6 * 32 {
             device.step_cycle();
         }
-        assert_eq!(count(&mut device, TIMER1), t1, "the gated megamodule's timer stopped");
-        assert!(count(&mut device, TIMER0) > t0, "the boot core's timer kept counting");
-        assert!(count(&mut device, TIMER6) > t6, "a shared timer kept counting");
+        assert_eq!(
+            count(&mut device, TIMER1),
+            t1,
+            "the gated megamodule's timer stopped"
+        );
+        assert!(
+            count(&mut device, TIMER0) > t0,
+            "the boot core's timer kept counting"
+        );
+        assert!(
+            count(&mut device, TIMER6) > t6,
+            "a shared timer kept counting"
+        );
 
         // And it is a gate, not a stop: enabling the module again lets the timer count on.
         let gated = count(&mut device, TIMER1);
