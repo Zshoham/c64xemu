@@ -63,6 +63,10 @@ _Avoid_: interrupt map, event table
 The interface a peripheral presents to the router, as the `SlavePort` trait: `read(address, context) -> Option<u32>` and `write(address, value, context) -> PortWrite`, answering `None` or `Unhandled` for an address it does not own. The router is the single seam the CPU and DMA masters cross to reach it. The context carries what a port needs but does not own - the device's endianness, which three ports report their registers under - and the write outcome carries the completion event IDMA raises; the interrupt latchers stay in the router, because a follow-up the megamodules are owed is not part of a port's shape.
 _Avoid_: register interface, MMIO interface
 
+**SYSCLK3 schedule**:
+How the fabric clocks the blocks that run on SYSCLK3 (the CPU clock divided by six): the timers, the GPIO edge detector, the UTOPIA port and the device configuration block. Each block says how many coming edges are certain to be quiet - no event, no EDMA3 trigger, nothing that counts as movement - and can skip that many at once to exactly where single steps would leave it. The fabric steps a block only on the edge it is due, and catches it up whenever an access or a clock-gating change is about to look at it. Every SYSCLK3 edge is still a full device tick; only the calls into quiet blocks are elided. `sysclk3.rs`.
+_Avoid_: lazy timers, event scheduler
+
 **boot ROM**:
 The device's on-chip bootloader, modelled by what it does rather than by its instructions:
 the boot mode's register programming, the frames it puts on the wire, the memory it writes,
@@ -98,6 +102,10 @@ exit point and the armed halt list — are always members and are checked first,
 reason a run stopped names the member that fired, including the core and address for a breakpoint.
 _Avoid_: stop event, run condition
 
+**batch boundary**:
+A point where a batch of cycles the machine asked the device for must end before the next cycle: a core out of reset has halted on an armed address, or any core is ready to fetch the CIO breakpoint (exempt on the first cycle after the machine has just answered the handshake). The device keeps both per core as cores step instead of asking every core each cycle, so the machine sees the halt or services CIO on exactly the cycle a per-cycle check would.
+_Avoid_: stop point, batch end
+
 **compact instruction**:
 A 16-bit instruction encoding, which cannot be named or executed without its fetch-packet header.
 _Avoid_: halfword instruction, short instruction
@@ -112,6 +120,10 @@ The last word of a fetch packet; the field compact instructions decode against, 
 **execute packet**:
 The set of instructions a fetch packet (or loop buffer) issues in one cycle, by parallel bit.
 _Avoid_: instruction group, bundle
+
+**write-back queue**:
+The per-core holding area for every effect an instruction makes after the cycle it issues: register destinations waiting out their delay slots, stores landing at the end of their execute cycle, MVC control-register writes, and saturation flags landing a cycle after their result. It decides where an effect waits, which of two colliding register writes survives (same issue cycle: a resource fault; otherwise the later-issued write replaces), and the order due effects come back in (registers, stores, control writes, saturations). The CPU performs the effects at the write-back that ends each cycle. `WritebackQueue` in `writeback.rs`.
+_Avoid_: pending writes, delay buckets
 
 **functional unit**:
 The execution resource an instruction claims — L, S, D or M on side 1 or 2. Packet validity is unit-conflict checking.
