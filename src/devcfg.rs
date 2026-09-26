@@ -24,6 +24,7 @@
 //! so there is no RMII logic to hold. The enable that does gate this device's wire is
 //! MACCONTROL.GMIIEN, in `emac.rs`.
 use crate::port::{PortContext, PortWrite, SlavePort};
+use crate::sysclk3::Sysclk3Block;
 use crate::system::Endian;
 #[cfg(test)]
 const LITTLE_CONTEXT: PortContext = PortContext {
@@ -116,6 +117,7 @@ const PERSTAT0_FIELDS: [(u32, u32); 10] = [
 /// PERSTAT1 carries UTOPIA and PCI only.
 const PERSTAT1_FIELDS: [(u32, u32); 2] = [(3, 22), (0, 20)];
 
+#[cfg_attr(test, derive(Clone, Debug, PartialEq))]
 pub struct DeviceConfig {
     priority: u32,
     lock: u32,
@@ -215,27 +217,15 @@ impl SlavePort for DeviceConfig {
 }
 
 impl DeviceConfig {
+    /// One CPU cycle for the unit tests. On the device the block is never stepped edge by
+    /// edge: nothing it does reaches the fabric, so the SYSCLK3 schedule only brings it up to
+    /// date when it is accessed (`Sysclk3Block::skip_quiet`).
     #[cfg(test)]
     pub fn tick(&mut self) {
         self.divide += 1;
         if self.divide == CLOCK_DIVIDER {
             self.divide = 0;
-            self.tick_sysclk3();
-        }
-    }
-
-    pub(crate) fn tick_sysclk3(&mut self) {
-        if self.lock_window > 0 {
-            self.lock_window -= 1;
-            if self.lock_window == 0 {
-                self.lock_armed = false;
-            }
-        }
-        if self.transition > 0 {
-            self.transition -= 1;
-            if self.transition == 0 {
-                self.settled = self.config;
-            }
+            self.skip_quiet(1);
         }
     }
 
@@ -256,10 +246,39 @@ impl DeviceConfig {
     }
 }
 
+impl Sysclk3Block for DeviceConfig {
+    /// The two countdowns only ever change what the registers read and whether PERCFG0 takes a
+    /// write, never anything the fabric sees, so every edge is quiet: the block is only brought
+    /// up to date when it is accessed.
+    fn quiet_edges(&self) -> u64 {
+        u64::MAX
+    }
+
+    fn skip_quiet(&mut self, edges: u64) {
+        if self.lock_window > 0 {
+            if edges >= u64::from(self.lock_window) {
+                self.lock_window = 0;
+                self.lock_armed = false;
+            } else {
+                self.lock_window -= edges as u32;
+            }
+        }
+        if self.transition > 0 {
+            if edges >= u64::from(self.transition) {
+                self.transition = 0;
+                self.settled = self.config;
+            } else {
+                self.transition -= edges as u32;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::port::SlavePort;
+    use crate::sysclk3::{assert_skip_matches_steps, TestRng};
     fn sysclk3(config: &mut DeviceConfig, cycles: u32) {
         for _ in 0..cycles * CLOCK_DIVIDER {
             config.tick();
@@ -359,5 +378,26 @@ mod tests {
         assert_eq!(config.read(PRI_ALLOC, LITTLE_CONTEXT), Some(0x0000_0f3f));
         config.write(EMUBUFPD, 0xffff_ffff, LITTLE_CONTEXT);
         assert_eq!(config.read(EMUBUFPD, LITTLE_CONTEXT), Some(1));
+    }
+
+    #[test]
+    fn catching_up_many_edges_equals_one_edge_at_a_time() {
+        // The block is only ever caught up, never stepped, so the countdowns have to land the
+        // same whether a window or a transition runs out inside a long catch-up or at its end.
+        let mut rng = TestRng::new(0x0de5_c0f6);
+        for _ in 0..2000 {
+            let config = DeviceConfig {
+                lock_window: rng.below(u64::from(LOCK_WINDOW) + 2) as u32,
+                lock_armed: rng.below(2) == 0,
+                transition: rng.below(u64::from(TRANSITION) + 2) as u32,
+                config: rng.u32() & PERCFG0_WRITABLE,
+                settled: rng.u32() & PERCFG0_WRITABLE,
+                ..DeviceConfig::default()
+            };
+            assert_skip_matches_steps(&config, 40, &mut rng, |config| {
+                config.skip_quiet(1);
+                true
+            });
+        }
     }
 }

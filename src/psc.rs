@@ -298,6 +298,12 @@ impl PowerSleep {
         self.gostat = 0;
     }
 
+    /// Whether a GO is in flight, which the next `tick` completes - the only place a module's
+    /// state, and with it `module_enabled`, changes.
+    pub(crate) fn transition_pending(&self) -> bool {
+        self.gostat != 0
+    }
+
     /// The PSC_ALLINT line, system event 65 (SPRS612G section 7.6, Table 7-10).
     ///
     /// High while any MERRPR bit is set - SPRUEG3B section 7.1 keeps the internal pending signal

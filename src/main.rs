@@ -42,6 +42,7 @@ mod runner;
 mod smc;
 mod space;
 mod sploop;
+mod sysclk3;
 mod system;
 mod timer;
 mod trace;

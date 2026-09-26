@@ -78,7 +78,18 @@ behind a four-bit prescaler — or as a watchdog. Reaching the period raises the
 interrupt and its EDMA3 event, and drives the timer output as a pulse or a square wave.
 
 The clock is SYSCLK3, the CPU clock divided by six ([SPRS276M](../reference/sprs276m.pdf) §7.6),
-which is the same clock GPIO, the I2C and the UTOPIA run on.
+which is the same clock GPIO, the I2C and the UTOPIA run on. A C6472 megamodule's local timer is
+also gated by that megamodule's PSC module ([SPRUEG3B](../reference/sprueg3b.pdf) §4.1).
+
+The timer is not stepped on every edge: the SYSCLK3 schedule (see
+[Architecture](architecture.md)) steps it only on the edge of its next period match, which is
+the only edge a timer raises anything on, and derives everything in between - counters,
+prescaler positions, pulse countdowns, TSTAT, one-shot stops - when an access or that edge
+catches it up. The derivation follows the per-edge model to its quirks: a 32-bit half compares
+the incremented count before truncating it, so wrapping to a zero period does not match and the
+half then sits at its period; an unchained TDDRHI written above PSCHI counts up past 15 and
+carries into TGCR bit 16; a one-shot half that stops freezes its prescaler with it; and a
+watchdog timeout forced by a bad key is due on the very next edge.
 
 | Device | Timers | Bases |
 |---|---|---|
@@ -92,6 +103,10 @@ or an output, with edge detection per pin raising a CPU interrupt and an EDMA3 e
 detector runs on the peripheral clock (CPU/6, SPRU724A Figure 2) and sees output pins too, so
 firmware toggling OUT_DATA generates events exactly as an external signal would — which is what
 makes GPIO usable as a stimulus source in a test with no board attached.
+
+The detector only does something on an edge where the pins differ from what it last sampled, so
+the SYSCLK3 schedule steps it only on the edge after an access - a register write, or an external
+driver on the inputs - changed them.
 
 ## I2C
 
@@ -131,6 +146,11 @@ The clock-detect bits say what the absence of a master means: nothing drives UXC
 RCPP and XCPP stay clear and an enabled section with a non-zero clock count reaches the
 clock-failure condition after that many peripheral clocks (SPRUE48 Table 8). The cell path is
 modelled against an external ATM master pulling cells out of the transmit queue.
+
+Under the SYSCLK3 schedule the port is stepped on every edge while an enabled section's event or
+UINT is asserted - the device tick treats an asserted UINT as movement on every edge - and
+otherwise only on the edge a section's clock count runs out; its idle counters are derived in
+between.
 
 ## McBSP
 
@@ -181,6 +201,9 @@ source, but the mask registers and their write-one-to-clear pairing are exactly 
 latched at reset, JTAGID identifies the silicon, PRI_ALLOC sets the bus priority of masters
 without their own priority register, and PERLOCK/PERCFG0 turn peripherals on and off with
 PERSTAT0/PERSTAT1 reporting the transition.
+
+The PERLOCK window and the PERSTAT transition are SYSCLK3 countdowns that raise nothing, so the
+SYSCLK3 schedule never steps this block: an access catches the countdowns up first.
 
 Two device-level choices are documented rather than invented: the silicon is revision 3.1, the
 last one [SPRZ234R](../reference/sprz234r.pdf) Table 3 lists, and the configuration pins are what

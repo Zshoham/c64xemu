@@ -6,6 +6,7 @@
 //! output pins too, so software toggling OUT_DATA generates events exactly as an external
 //! signal would.
 use crate::port::{PortContext, PortWrite, SlavePort};
+use crate::sysclk3::Sysclk3Block;
 #[cfg(test)]
 const TEST_CONTEXT: PortContext = PortContext {
     endian: crate::system::Endian::Little,
@@ -27,6 +28,7 @@ const PINS: u32 = 0xffff;
 #[cfg(test)]
 const CLOCK_DIVIDER: u32 = 6;
 
+#[cfg_attr(test, derive(Clone, Debug, PartialEq))]
 pub struct Gpio {
     binten: u32,
     /// A set bit makes the pin an input, which is the reset state (SPRU724A Table 4).
@@ -132,10 +134,28 @@ impl Gpio {
     }
 }
 
+impl Sysclk3Block for Gpio {
+    /// The detector only does something on an edge where the pins differ from what it last
+    /// sampled, and only an access - a register write, or an external driver on the inputs -
+    /// changes the pins, so an edge is quiet exactly when they agree, and then so is every edge
+    /// after it until the next access.
+    fn quiet_edges(&self) -> u64 {
+        if self.pins() == self.sampled {
+            u64::MAX
+        } else {
+            0
+        }
+    }
+
+    /// A quiet edge samples the level it already holds.
+    fn skip_quiet(&mut self, _edges: u64) {}
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::port::SlavePort;
+    use crate::sysclk3::{assert_skip_matches_steps, TestRng};
     fn clock(gpio: &mut Gpio) -> u32 {
         let mut events = 0;
         for _ in 0..CLOCK_DIVIDER {
@@ -188,5 +208,27 @@ mod tests {
         gpio.write(DIR, 0xffff, TEST_CONTEXT);
         assert_eq!(clock(&mut gpio), 0);
         assert_eq!(gpio.read(IN_DATA, TEST_CONTEXT), Some(0));
+    }
+
+    #[test]
+    fn only_a_pin_change_makes_an_edge_that_is_not_quiet() {
+        // Any direction, drive, trigger and bank enable, with the detector's last sample either
+        // matching the pins or not: an edge the schedule skips detects nothing.
+        let mut rng = TestRng::new(0x0691_0000);
+        for _ in 0..2000 {
+            let mut gpio = Gpio::default();
+            gpio.dir = rng.u32() & PINS;
+            gpio.out_data = rng.u32() & PINS;
+            gpio.input = rng.u32() & PINS;
+            gpio.rising = rng.u32() & PINS;
+            gpio.falling = rng.u32() & PINS;
+            gpio.binten = rng.u32() & 1;
+            gpio.sampled = if rng.below(2) == 0 {
+                gpio.pins()
+            } else {
+                rng.u32() & PINS
+            };
+            assert_skip_matches_steps(&gpio, 50, &mut rng, |gpio| gpio.tick_sysclk3() == 0);
+        }
     }
 }

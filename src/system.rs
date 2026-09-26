@@ -40,6 +40,7 @@ use crate::port::{PortContext, PortWrite, SlavePort};
 use crate::psc::PowerSleep;
 use crate::smc::{SharedMemory, SharedMemoryProfiler};
 use crate::space::{Placement, Requester};
+use crate::sysclk3::Clocked;
 use crate::timer::Timer;
 use crate::utopia::Utopia;
 #[cfg(test)]
@@ -763,17 +764,18 @@ pub(crate) struct Shared {
     /// The per-core interrupt-control module in front of each MAC, on a device that has them.
     emic: Vec<EmacInterruptControl>,
     edma: Option<Box<Edma>>,
-    timers: Vec<Timer>,
-    gpio: Gpio,
+    /// The SYSCLK3 blocks, each with its place in the SYSCLK3 schedule (`sysclk3.rs`).
+    timers: Vec<Clocked<Timer>>,
+    gpio: Clocked<Gpio>,
     i2c: I2c,
     pll: Pll,
     transfer_controllers: [TransferController; 4],
     hpi: Hpi,
     ddr2: Ddr2,
     emifa: Option<Emifa>,
-    utopia: Option<Utopia>,
+    utopia: Option<Clocked<Utopia>>,
     mcbsp: Vec<Mcbsp>,
-    devcfg: Option<DeviceConfig>,
+    devcfg: Option<Clocked<DeviceConfig>>,
     pll2: Pll2,
     /// The C6472's device-level blocks.
     chipcfg: Option<ChipConfig>,
@@ -796,6 +798,14 @@ pub(crate) struct Shared {
     /// `Option` or an empty `Vec` that it must not interrogate to find out.
     device_level_blocks: bool,
     sysclk3_divide: u8,
+    /// How many SYSCLK3 edges the device has had, counted where the timers step within the
+    /// tick, so an access earlier in an edge's cycle sees the blocks as they were before it.
+    sysclk3_edge: u64,
+    /// No SYSCLK3 block is due before this edge: the schedule steps none of them until then.
+    /// Never later than the earliest block's due edge, and brought forward by every access.
+    sysclk3_deadline: u64,
+    /// How many of the timers, from the front, belong to a megamodule and run on its clock.
+    megamodule_timers: usize,
     /// No cycle-driven peripheral can change state before the next SYSCLK3 edge or host/MMIO
     /// action. Level interrupt sources are still relatched on the short path.
     dynamic_idle: bool,
@@ -867,21 +877,29 @@ impl Shared {
     /// the emulator's throughput against 1.0% for the virtual call, inlined or outlined. The
     /// register path probes ports in a loop, so the match's code size hurts more than the
     /// indirect call does.
+    ///
+    /// A SYSCLK3 block is handed out caught up through the edges the device has had, so the
+    /// access sees and changes the state the per-edge model would have; once a port claims the
+    /// access, `reschedule` plans the block again from what the access left.
     fn port(&mut self, which: Port) -> Option<&mut dyn SlavePort> {
+        let edge = self.sysclk3_edge;
         Some(match which {
             Port::Emac(index) => self.emac[index].as_deref_mut()? as &mut dyn SlavePort,
             Port::Emic(index) => &mut self.emic[index],
             Port::Edma => self.edma.as_deref_mut()?,
-            Port::Timer(index) => &mut self.timers[index],
-            Port::Gpio => &mut self.gpio,
+            Port::Timer(index) => {
+                let clocked = self.timer_clocked(index);
+                self.timers[index].at(edge, clocked)
+            }
+            Port::Gpio => self.gpio.at(edge, true),
             Port::I2c => &mut self.i2c,
             Port::Pll => &mut self.pll,
             Port::Hpi => &mut self.hpi,
             Port::Ddr2 => &mut self.ddr2,
             Port::Emifa => self.emifa.as_mut()?,
             Port::Mcbsp(index) => &mut self.mcbsp[index],
-            Port::Utopia => self.utopia.as_mut()?,
-            Port::Devcfg => self.devcfg.as_mut()?,
+            Port::Utopia => self.utopia.as_mut()?.at(edge, true),
+            Port::Devcfg => self.devcfg.as_mut()?.at(edge, true),
             Port::Pll2 => &mut self.pll2,
             Port::TransferController(index) => &mut self.transfer_controllers[index],
             Port::Mdio => &mut self.mdio,
@@ -891,6 +909,88 @@ impl Shared {
             Port::SmcProfiler(index) => &mut self.smc_profilers[index],
             Port::ChipConfig => self.chipcfg.as_mut()?,
         })
+    }
+
+    /// A port claimed an access. A SYSCLK3 block's register write - or a UTOPIA queue read -
+    /// may have changed when it next does something, so it is planned again from the state the
+    /// access left, and the deadline brought forward if that is sooner. The device
+    /// configuration block is never due, whatever it holds.
+    fn reschedule(&mut self, which: Port) {
+        let due = match which {
+            Port::Timer(index) => {
+                let clocked = self.timer_clocked(index);
+                let timer = &mut self.timers[index];
+                timer.plan(clocked);
+                timer.due()
+            }
+            Port::Gpio => {
+                self.gpio.plan(true);
+                self.gpio.due()
+            }
+            Port::Utopia => {
+                let Some(utopia) = self.utopia.as_mut() else {
+                    return;
+                };
+                utopia.plan(true);
+                utopia.due()
+            }
+            _ => return,
+        };
+        self.sysclk3_deadline = self.sysclk3_deadline.min(due);
+    }
+
+    /// The earliest edge any stepped SYSCLK3 block is due on.
+    fn next_sysclk3_due(&self) -> u64 {
+        let timers = self.timers.iter().map(Clocked::due).min();
+        let utopia = self.utopia.as_ref().map(Clocked::due);
+        [timers, utopia]
+            .into_iter()
+            .flatten()
+            .fold(self.gpio.due(), u64::min)
+    }
+
+    /// Whether a megamodule's functional clock runs: its module is in Enable (SPRUEG3B section
+    /// 4.1.2); a device without a PSC always runs.
+    fn core_clocked(&self, core: usize) -> bool {
+        match self.psc.as_ref() {
+            Some(psc) => psc.module_enabled(crate::psc::MODULE_GEM0 + core),
+            None => true,
+        }
+    }
+
+    /// Whether a timer is clocked. A megamodule's local timer runs on that megamodule's clock:
+    /// "C64x+ Megamodule local timers are clock gated as well when the corresponding C64x+
+    /// Megamodule is clock gated" (SPRUEG3B section 4.1), and a module outside Enable has its
+    /// functional clocks gated (section 4.1.2). The shared timers, and every timer on a device
+    /// with no megamodule to belong to, keep counting.
+    fn timer_clocked(&self, index: usize) -> bool {
+        index >= self.megamodule_timers || self.core_clocked(index)
+    }
+
+    /// Bring the megamodule timers through the edges they have had under the gating they had it
+    /// with, before a PSC transition can change it.
+    fn sync_megamodule_timers(&mut self) {
+        for index in 0..self.megamodule_timers {
+            let clocked = self.timer_clocked(index);
+            self.timers[index].sync(self.sysclk3_edge, clocked);
+        }
+    }
+
+    /// Plan the megamodule timers under the gating a PSC transition left.
+    fn plan_megamodule_timers(&mut self) {
+        for index in 0..self.megamodule_timers {
+            let clocked = self.timer_clocked(index);
+            self.timers[index].plan(clocked);
+            self.sysclk3_deadline = self.sysclk3_deadline.min(self.timers[index].due());
+        }
+    }
+
+    /// UINT, from a UTOPIA brought up to date first.
+    fn utopia_interrupt_pending(&mut self) -> bool {
+        let edge = self.sysclk3_edge;
+        self.utopia
+            .as_mut()
+            .is_some_and(|utopia| utopia.at(edge, true).interrupt_pending())
     }
 
     /// An access left the memory windows, or a host delivered something: the next device tick
@@ -920,9 +1020,9 @@ impl Shared {
             timers: profile
                 .timer_bases
                 .iter()
-                .map(|base| Timer::new(*base))
+                .map(|base| Clocked::new(Timer::new(*base)))
                 .collect(),
-            gpio: Gpio::default(),
+            gpio: Clocked::new(Gpio::default()),
             i2c: I2c::default(),
             pll: Pll::default(),
             transfer_controllers: [
@@ -934,7 +1034,7 @@ impl Shared {
             hpi: Hpi::new(),
             ddr2: Ddr2::default(),
             emifa: profile.has_emifa.then(Emifa::default),
-            utopia: profile.has_utopia.then(Utopia::default),
+            utopia: profile.has_utopia.then(|| Clocked::new(Utopia::default())),
             mcbsp: if profile.has_mcbsp {
                 vec![
                     Mcbsp::new(0x028c_0000, 0x3000_0000, 0x3000_0010),
@@ -943,7 +1043,9 @@ impl Shared {
             } else {
                 Vec::new()
             },
-            devcfg: profile.has_device_config.then(DeviceConfig::default),
+            devcfg: profile
+                .has_device_config
+                .then(|| Clocked::new(DeviceConfig::default())),
             pll2: Pll2::default(),
             chipcfg: profile.has_boot_controller.then(|| {
                 ChipConfig::new(
@@ -972,6 +1074,10 @@ impl Shared {
             emacs: profile.emac_bases.len(),
             device_level_blocks: profile.has_boot_controller,
             sysclk3_divide: 0,
+            sysclk3_edge: 0,
+            // Every block starts due on the first edge (`Clocked::new`).
+            sysclk3_deadline: 1,
+            megamodule_timers: profile.megamodule_timers,
             last_tick_short: false,
             dynamic_idle: false,
             dynamic_active: u8::MAX,
@@ -1170,6 +1276,7 @@ impl Fabric {
                 continue;
             };
             if let Some(value) = port.read(address, context) {
+                self.shared.reschedule(which);
                 self.follow(which.after_read());
                 return Some(value);
             }
@@ -1192,6 +1299,7 @@ impl Fabric {
                 continue;
             };
             if port.read(address, context).is_some() {
+                self.shared.reschedule(which);
                 return Some(which);
             }
         }
@@ -1205,6 +1313,7 @@ impl Fabric {
                 continue;
             };
             if port.write(address, value, context) != PortWrite::Unhandled {
+                self.shared.reschedule(which);
                 self.follow(which.after_write());
                 return true;
             }
@@ -1435,9 +1544,18 @@ impl Fabric {
             let edma_active = self.shared.edma.as_ref().unwrap().active();
             active = (active & !ACTIVE_EDMA) | (u8::from(edma_active) * ACTIVE_EDMA);
         }
+        // The SYSCLK3 blocks step only on the edges the schedule has them due: on the others
+        // they would raise nothing, trigger nothing and add nothing to `moved`, and whatever
+        // they count is caught up when something reads it (`sysclk3.rs`). The edge is counted
+        // here, where the timers step, so the masters that ran above saw the edge before.
+        let mut scheduled = false;
         if sysclk3 {
-            moved |= self.tick_timers();
-            moved |= self.tick_gpio();
+            self.shared.sysclk3_edge += 1;
+            scheduled = self.shared.sysclk3_edge >= self.shared.sysclk3_deadline;
+            if scheduled {
+                moved |= self.tick_timers();
+                moved |= self.tick_gpio();
+            }
         }
         if previous & ACTIVE_I2C != 0 {
             if self.shared.i2c.active() {
@@ -1447,8 +1565,11 @@ impl Fabric {
             let i2c_active = self.shared.i2c.transfer_active();
             active = (active & !ACTIVE_I2C) | (u8::from(i2c_active) * ACTIVE_I2C);
         }
-        if sysclk3 && self.tick_utopia() {
-            moved = true;
+        if scheduled {
+            if self.tick_utopia() {
+                moved = true;
+            }
+            self.shared.sysclk3_deadline = self.shared.next_sysclk3_due();
         }
         if previous & ACTIVE_MCBSP != 0 {
             if self.shared.mcbsp.iter().any(Mcbsp::active) {
@@ -1457,11 +1578,6 @@ impl Fabric {
             }
             let mcbsp_active = self.shared.mcbsp.iter().any(Mcbsp::active);
             active = (active & !ACTIVE_MCBSP) | (u8::from(mcbsp_active) * ACTIVE_MCBSP);
-        }
-        if sysclk3 {
-            if let Some(devcfg) = self.shared.devcfg.as_mut() {
-                devcfg.tick_sysclk3();
-            }
         }
         if previous & ACTIVE_MDIO != 0 {
             if self.shared.mdio.active() {
@@ -1512,9 +1628,21 @@ impl Fabric {
         for index in 0..self.shared.emic.len() {
             self.shared.emic[index].tick();
         }
-        if let Some(psc) = self.shared.psc.as_mut() {
+        if let Some(psc) = self.shared.psc.as_ref() {
+            // A GO this tick completes can take a megamodule in or out of Enable, which gates
+            // its local timer: the schedule brings those timers through the edges they have had
+            // under the old gating first, and plans them under the new one after.
+            let regating = psc.transition_pending();
+            if regating {
+                self.shared.sync_megamodule_timers();
+            }
+            let psc = self.shared.psc.as_mut().unwrap();
             psc.tick();
-            if psc.interrupt_pending() {
+            let interrupt = psc.interrupt_pending();
+            if regating {
+                self.shared.plan_megamodule_timers();
+            }
+            if interrupt {
                 if let Some(event) = self.profile.events.psc {
                     self.raise(Destination::All, event);
                 }
@@ -1595,12 +1723,7 @@ impl Fabric {
             if self.shared.edma.as_ref().unwrap().interrupt_pending() {
                 note(self.profile.events.edma_global);
             }
-            if self
-                .shared
-                .utopia
-                .as_ref()
-                .is_some_and(Utopia::interrupt_pending)
-            {
+            if self.shared.utopia_interrupt_pending() {
                 note(self.profile.events.utopia);
             }
             if self.shared.i2c.interrupt_pending() {
@@ -1764,22 +1887,19 @@ impl Fabric {
         pending
     }
 
-    /// Advance both timers by one SYSCLK3 edge, reporting whether either period match fired:
-    /// a match raises a CPU event and may arm an EDMA channel, so the tick has to look at the
-    /// device again afterwards.
+    /// Step the timers due on this SYSCLK3 edge, in device order, reporting whether any period
+    /// match fired: a match raises a CPU event and may arm an EDMA channel, so the tick has to
+    /// look at the device again afterwards. A timer that is not due would raise nothing here.
     fn tick_timers(&mut self) -> bool {
+        let edge = self.shared.sysclk3_edge;
         let mut fired = false;
         for index in 0..self.shared.timers.len() {
-            /* A megamodule's local timer runs on that megamodule's clock: "C64x+ Megamodule
-             * local timers are clock gated as well when the corresponding C64x+ Megamodule is
-             * clock gated" (SPRUEG3B section 4.1), and a module outside Enable has its functional
-             * clocks gated (section 4.1.2). The shared timers, and every timer on a device with
-             * no megamodule to belong to, keep counting.
-             */
-            if index < self.profile.megamodule_timers && !self.core_clocked(index) {
+            if self.shared.timers[index].due() > edge {
                 continue;
             }
-            let raised = self.shared.timers[index].tick_sysclk3();
+            // A gated megamodule timer lets the edge pass without counting (`timer_clocked`).
+            let clocked = self.shared.timer_clocked(index);
+            let raised = self.shared.timers[index].step(edge, clocked, Timer::tick_sysclk3);
             fired |= raised[0] || raised[1];
             for (half, raised) in raised.into_iter().enumerate() {
                 if !raised {
@@ -1798,9 +1918,14 @@ impl Fabric {
         fired
     }
 
-    /// Sample the GPIO pins, reporting whether any edge was detected.
+    /// Sample the GPIO pins if they changed since the detector last looked, reporting whether
+    /// any edge was detected.
     fn tick_gpio(&mut self) -> bool {
-        let raised = self.shared.gpio.tick_sysclk3();
+        let edge = self.shared.sysclk3_edge;
+        if self.shared.gpio.due() > edge {
+            return false;
+        }
+        let raised = self.shared.gpio.step(edge, true, Gpio::tick_sysclk3);
         if raised == 0 {
             return false;
         }
@@ -1858,15 +1983,20 @@ impl Fabric {
         }
     }
 
-    /// One SYSCLK3 edge of the UTOPIA port, reporting whether it moved: a clock-detect section
-    /// that failed latches an error the interrupt is a level on, and a cell either way arms an
-    /// EDMA channel. A port with both directions disabled cannot do either.
+    /// One SYSCLK3 edge of the UTOPIA port if it is due, reporting whether it moved: a
+    /// clock-detect section that failed latches an error the interrupt is a level on, and a
+    /// cell either way arms an EDMA channel. A port with both directions disabled cannot do
+    /// either, and a port that is not due does neither and has no interrupt asserted.
     fn tick_utopia(&mut self) -> bool {
+        let edge = self.shared.sysclk3_edge;
         let Some(utopia) = self.shared.utopia.as_mut() else {
             return false;
         };
-        let events = utopia.tick_sysclk3();
-        let moved = events.receive || events.transmit || utopia.interrupt_pending();
+        if utopia.due() > edge {
+            return false;
+        }
+        let events = utopia.step(edge, true, Utopia::tick_sysclk3);
+        let moved = events.receive || events.transmit || utopia.at(edge, true).interrupt_pending();
         let Some((receive, transmit)) = self.profile.events.utopia_channels else {
             return moved;
         };
@@ -1881,11 +2011,7 @@ impl Fabric {
 
     /// The UTOPIA error interrupt, which is a level, so it answers whether it is asserting.
     fn latch_utopia_interrupt(&mut self) -> bool {
-        let pending = self
-            .shared
-            .utopia
-            .as_ref()
-            .is_some_and(Utopia::interrupt_pending);
+        let pending = self.shared.utopia_interrupt_pending();
         if pending {
             self.raise(Destination::All, self.profile.events.utopia);
         }
@@ -2705,10 +2831,7 @@ impl Fabric {
     /// power/sleep controller has taken out of Enable does not execute (SPRUEG3B section
     /// 4.1.2); a device without a PSC always runs.
     pub(crate) fn core_clocked(&self, core: usize) -> bool {
-        match self.shared.psc.as_ref() {
-            Some(psc) => psc.module_enabled(crate::psc::MODULE_GEM0 + core),
-            None => true,
-        }
+        self.shared.core_clocked(core)
     }
 
     /// Whether a core is held in reset at power-up: with a boot controller, every core but the
@@ -2844,13 +2967,16 @@ impl Fabric {
                 Ok(None)
             }
             // The external ATM master on the UTOPIA pins: it polls the transmit queue for a
-            // cell and offers cells to the receive queue.
+            // cell and offers cells to the receive queue. Like a register access, it acts on the
+            // port as of the current edge and leaves it to be planned again.
             "utopia_master_read" => {
+                let edge = self.shared.sysclk3_edge;
                 let cell = self
                     .shared
                     .utopia
                     .as_mut()
-                    .and_then(|utopia| utopia.master_take_cell());
+                    .and_then(|utopia| utopia.at(edge, true).master_take_cell());
+                self.shared.reschedule(Port::Utopia);
                 self.latch_utopia_interrupt();
                 Ok(Some(match cell {
                     Some(bytes) => json!(encode_hex(&bytes)),
@@ -2859,11 +2985,13 @@ impl Fabric {
             }
             "utopia_master_write" => {
                 let bytes = decode_hex(string_field(operation, "hex")?)?;
+                let edge = self.shared.sysclk3_edge;
                 let accepted = self
                     .shared
                     .utopia
                     .as_mut()
-                    .is_some_and(|utopia| utopia.master_send_cell(&bytes));
+                    .is_some_and(|utopia| utopia.at(edge, true).master_send_cell(&bytes));
+                self.shared.reschedule(Port::Utopia);
                 self.latch_utopia_interrupt();
                 Ok(Some(json!(accepted)))
             }
@@ -2883,7 +3011,9 @@ impl Fabric {
             // would otherwise hold at any level.
             "gpio_input" => {
                 let value = u32_field(operation, "value")?;
-                self.shared.gpio.drive_inputs(value);
+                let edge = self.shared.sysclk3_edge;
+                self.shared.gpio.at(edge, true).drive_inputs(value);
+                self.shared.reschedule(Port::Gpio);
                 Ok(None)
             }
             "inject_frame" => {
@@ -3841,6 +3971,87 @@ mod tests {
         assert_eq!(
             fabric.read_bytes(1, 0x0080_2000, 6),
             vec![0x02, 0, 0, 0x11, 0x22, 0x33]
+        );
+    }
+
+    /// The SYSCLK3 schedule is invisible: a C6455 timer the fabric only steps on its due edges
+    /// raises its events on the same cycles, and answers every register read the same, as a
+    /// timer stepped on every edge - whatever the CPU writes to it and whenever it looks.
+    #[test]
+    fn a_scheduled_timer_matches_one_stepped_on_every_edge() {
+        use crate::sysclk3::TestRng;
+        const BASE: u32 = 0x0294_0000;
+        // CNTLO, CNTHI, PRDLO, PRDHI, TCR, TGCR and WDTCR (SPRU968 Table 6).
+        const REGISTERS: [u32; 7] = [0x10, 0x14, 0x18, 0x1c, 0x20, 0x24, 0x28];
+        // The watchdog's key sequences (SPRU968 Figure 12): arm it, service it, or time it out
+        // with a wrong key, after which it stays out of the way until reset.
+        const WATCHDOG: [&[u32]; 3] = [
+            &[0xa5c6_4000, 0xda7e_4000],
+            &[0xa5c6_0000, 0xda7e_0000],
+            &[0x1234_0000],
+        ];
+        let mut fabric = Fabric::new(&crate::device::C6455);
+        let context = fabric.port_context();
+        let mut stepped = Timer::new(BASE);
+        let events = [0, 1].map(|half| fabric.profile.events.timer(0, half).unwrap().1);
+        let mut rng = TestRng::new(0x5c3d_ed9e);
+        let mut raised = [0; 2];
+        let write = |fabric: &mut Fabric, stepped: &mut Timer, offset: u32, value: u32| {
+            fabric.write32(0, BASE + offset, value);
+            stepped.write(BASE + offset, value, context);
+        };
+        for _ in 0..2_000_000 {
+            match rng.below(1500) {
+                0 => {
+                    let offset = REGISTERS[rng.below(6) as usize];
+                    let value = match offset {
+                        // Counts below periods of a few hundred edges, and a high half that
+                        // is often zero so the 64-bit and watchdog modes match too.
+                        0x10 => rng.below(40) as u32,
+                        0x18 => 40 + rng.below(360) as u32,
+                        0x14 | 0x1c if rng.below(2) == 0 => 0,
+                        0x14 => rng.below(40) as u32,
+                        0x1c => 40 + rng.below(360) as u32,
+                        // Any pulse width and clock mode, and mostly continuous halves.
+                        0x20 => {
+                            let enable = [2, 2, 2, 1][rng.below(4) as usize] * 0x0040_0040;
+                            (rng.u32() & 0x0039_0039) | enable
+                        }
+                        // Any mode and prescaler, mostly with both halves out of reset.
+                        _ => (rng.u32() & 0xff0c) | if rng.below(4) == 0 { 0 } else { 3 },
+                    };
+                    write(&mut fabric, &mut stepped, offset, value);
+                }
+                1 if rng.below(20) == 0 => {
+                    for key in WATCHDOG[rng.below(3) as usize] {
+                        write(&mut fabric, &mut stepped, 0x28, *key);
+                    }
+                }
+                2..=9 => {
+                    let offset = REGISTERS[rng.below(REGISTERS.len() as u64) as usize];
+                    assert_eq!(
+                        fabric.read32(0, BASE + offset),
+                        stepped.read(BASE + offset, context).unwrap(),
+                        "register {offset:#x}"
+                    );
+                }
+                _ => {}
+            }
+            fabric.tick_once();
+            let expected = stepped.tick();
+            let flags = fabric.megamodule(0).event_flag_registers();
+            for half in 0..2 {
+                let (bank, bit) = (events[half] / 32, 1 << (events[half] % 32));
+                assert_eq!(flags[bank] & bit != 0, expected[half], "half {half}");
+                if expected[half] {
+                    fabric.write32(0, EVTCLR0 + 4 * bank as u32, bit);
+                    raised[half] += 1;
+                }
+            }
+        }
+        assert!(
+            raised[0] > 200 && raised[1] > 20,
+            "matches seen: {raised:?}"
         );
     }
 }

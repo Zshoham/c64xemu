@@ -101,16 +101,50 @@ drove.
   own `device_ticks` counter. A core that stalls therefore drifts behind the others and simply
   skips its ask until it catches up, so the peripherals advance at the rate of the fastest core
   rather than six times per cycle.
-- `SYSCLK3_DIVIDER` is 6: one tick in six is a SYSCLK3 edge, and `Fabric::tick_device` gates
-  the timers, the GPIO pins, the UTOPIA port and the C6455's device configuration block on it.
-  The IDMA, the MACs, the EDMA3, the I2C, the McBSPs and the MDIO are considered on every full
-  device cycle, but only while their bit in the activity summary is set: a peripheral whose bit
-  is clear was inactive and only a register write can arm it.
+- `SYSCLK3_DIVIDER` is 6: one tick in six is a SYSCLK3 edge, and every edge is a full tick.
+  The timers, the GPIO pins, the UTOPIA port and the C6455's device configuration block are
+  clocked by it, but `Fabric::tick_device` steps them only on the edges the *SYSCLK3 schedule*
+  (`src/sysclk3.rs`) has them due, described below. The IDMA, the MACs, the EDMA3, the I2C, the
+  McBSPs and the MDIO are considered on every full device cycle, but only while their bit in the
+  activity summary is set: a peripheral whose bit is clear was inactive and only a register write
+  can arm it.
 - A tick that is neither a SYSCLK3 edge nor dirty returns `true`, the *short* tick: nothing
   cycle-driven moved, and the asking core reads the interrupt lines the last full tick
   selected rather than fresh ones. `Cpu::finish_cycle` passes that flag straight into
   `CoreBus::take_interrupt_state`. A dormant device answers "nothing asserted" for millions of
   cycles, which is what the short path exists for.
+
+The SYSCLK3 schedule exists because on almost every edge those four blocks only count: a timer
+towards its period, a prescaler towards its match, a pulse towards its end, a clock-detect
+counter towards its limit, a PERLOCK window towards its close. Each block implements
+`Sysclk3Block`: `quiet_edges` answers how many of the coming edges are certain to be *quiet* -
+no event raised, no EDMA3 channel triggered, nothing added to the tick's `moved` (for UTOPIA,
+that includes UINT staying deasserted, because an asserted UINT counts as movement on every
+edge) - and `skip_quiet` advances over that many at once, leaving the block exactly where the
+same number of `tick_sysclk3` calls would. `Clocked<T>` wraps each block with the edge its state
+reflects and the edge it is next *due* on, and `Shared` keeps the device's edge count and a
+deadline no later than the earliest due edge:
+
+- The edge is counted where the timers step inside `tick_device`, so a DMA access earlier in
+  the same cycle sees the blocks as the edge before, exactly as when they were stepped there.
+- On an edge before the deadline none of the four is called. Everything else the full tick
+  does - the return value, the activity summary, the level relatch that also flushes
+  interrupts a megamodule raised without `Shared::touched` - is unchanged.
+- On an edge at or past it, the due blocks are caught up through their quiet edges, stepped
+  for real in the old order (timers in device order, then GPIO, then UTOPIA), and planned again;
+  the deadline becomes the earliest due edge. The device configuration block raises nothing at
+  all, so it is never due and only ever caught up.
+- Every access that reaches one of these blocks - `Shared::port` for CPU, DMA and HPI accesses,
+  the host operations of the conformance vectors, the UTOPIA interrupt queries - catches it up
+  first; a port that claims the access has the block planned again (`Shared::reschedule`), and
+  the deadline brought forward if that is sooner.
+- A megamodule's local timer is gated by its PSC module. Module states change only in the PSC
+  tick that completes a GO, so that tick first brings the megamodule timers through the edges
+  they have had under the old gating and plans them under the new one after.
+
+A quiet-edge count may be short - the block is then stepped on an edge that turns out to do
+nothing, which is what every edge did before - but never long; the property tests in each
+block's module check both that and that a skip equals the same number of single steps.
 
 `Machine::resume_budget` asks the device for a batch with `Device::run_cycles(batch, cio,
 ignore_cio_once)` whatever the core count, and the device picks how to run it. With one core
@@ -419,6 +453,7 @@ Every file in `src/`.
 | `smc.rs` | The C6472 shared-memory controller and its six per-core profilers |
 | `space.rs` | The address map: local windows, global aliases, shared memories, and `Placement` per `Requester` |
 | `sploop.rs` | The SPLOOP hardware loop buffer |
+| `sysclk3.rs` | The SYSCLK3 schedule: `Sysclk3Block` and `Clocked`, which keep the SYSCLK3 blocks out of the device tick on quiet edges |
 | `system.rs` | The fabric: megamodules, shared peripherals, the router, the device tick, event raising, and `CoreBus` |
 | `timer.rs` | The 64-bit timers |
 | `trace.rs` | Execution tracing: one event stream, rendered as aligned text or JSON Lines |

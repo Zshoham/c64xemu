@@ -7,6 +7,7 @@
 //! square wave. The timers are clocked by SYSCLK3, which SPRS276M section 7.6 fixes at the
 //! CPU clock divided by six.
 use crate::port::{PortContext, PortWrite, SlavePort};
+use crate::sysclk3::Sysclk3Block;
 #[cfg(test)]
 const TEST_CONTEXT: PortContext = PortContext {
     endian: crate::system::Endian::Little,
@@ -40,6 +41,7 @@ const WDKEY_SECOND: u32 = 0xDA7E;
 
 /// Where the watchdog is in the state machine of SPRU968 Figure 12.
 #[derive(Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(test, derive(Debug))]
 enum Watchdog {
     /// The counter runs but the output is disconnected; the timer is a general-purpose one.
     Disabled,
@@ -51,6 +53,7 @@ enum Watchdog {
     Timeout,
 }
 
+#[cfg_attr(test, derive(Clone, Debug, PartialEq))]
 pub struct Timer {
     base: u32,
     /// SOFT and FREE; CLKDIV is read-only.
@@ -383,6 +386,260 @@ impl Timer {
     }
 }
 
+/// The SYSCLK3 schedule's view of a timer: how far off its next period match is, and the edges
+/// before it taken at once.
+impl Timer {
+    /// The counter steps half `half` takes up to and including the one that reaches its period,
+    /// or `None` when it never will: it is disabled or stopped, a one-shot sits at its period and
+    /// stops on the next step, or a continuous timer with a zero period restarts to its period on
+    /// every step without ever counting up to it (`advance`). A 32-bit half with a zero period
+    /// is the last case too once it wraps: `advance` compares the incremented count before
+    /// truncating it, so the step that wraps to zero does not match.
+    fn steps_to_match(&self, half: usize, wide: bool) -> Option<u64> {
+        let enable = self.enable_mode(half);
+        if enable == 0 || self.stopped[half] {
+            return None;
+        }
+        let (counter, period, mask) = if wide {
+            (
+                (u64::from(self.cnt[1]) << 32) | u64::from(self.cnt[0]),
+                (u64::from(self.prd[1]) << 32) | u64::from(self.prd[0]),
+                u64::MAX,
+            )
+        } else {
+            (
+                u64::from(self.cnt[half]),
+                u64::from(self.prd[half]),
+                u64::from(u32::MAX),
+            )
+        };
+        if counter != period {
+            if !wide && period == 0 {
+                None
+            } else {
+                Some(period.wrapping_sub(counter) & mask)
+            }
+        } else if enable == 2 && period != 0 {
+            // The restart to zero, then the whole period.
+            Some(period.saturating_add(1))
+        } else {
+            None
+        }
+    }
+
+    /// `steps` counter steps taken without reaching the period, which `advance` would take one
+    /// at a time. A half at its period takes the restart or the stop first; a continuous half with
+    /// a zero period then stays at zero. A 32-bit half wrapping to a zero period lands there
+    /// without matching, and carries on the same way.
+    fn skip_counter(&mut self, half: usize, wide: bool, steps: u64) {
+        let enable = self.enable_mode(half);
+        if steps == 0 || enable == 0 || self.stopped[half] {
+            return;
+        }
+        let (counter, period) = if wide {
+            (
+                (u64::from(self.cnt[1]) << 32) | u64::from(self.cnt[0]),
+                (u64::from(self.prd[1]) << 32) | u64::from(self.prd[0]),
+            )
+        } else {
+            (u64::from(self.cnt[half]), u64::from(self.prd[half]))
+        };
+        let counter = if counter != period {
+            if !wide && period == 0 && steps > (1 << 32) - counter {
+                if enable != 2 {
+                    self.stopped[half] = true;
+                }
+                0
+            } else {
+                counter.wrapping_add(steps)
+            }
+        } else if enable == 2 {
+            if period == 0 {
+                0
+            } else {
+                steps - 1
+            }
+        } else {
+            self.stopped[half] = true;
+            return;
+        };
+        if wide {
+            self.cnt[0] = counter as u32;
+            self.cnt[1] = (counter >> 32) as u32;
+        } else {
+            self.cnt[half] = counter as u32;
+        }
+    }
+
+    /// The chained-mode prescaler, CNTHI counting to PRDHI (`chain_prescale`).
+    fn chain_prescaler(&self) -> Prescaler {
+        Prescaler {
+            first: u64::from(self.prd[1].wrapping_sub(self.cnt[1])) + 1,
+            period: u64::from(self.prd[1]) + 1,
+        }
+    }
+
+    /// The unchained high half's prescaler, TDDRHI counting to PSCHI (`prescale`). A TDDRHI
+    /// written above PSCHI counts on up to 15 first, and the step past 15 carries into TGCR bit
+    /// 16, where it stays.
+    fn unchained_prescaler(&self) -> Prescaler {
+        let counter = u64::from((self.tgcr >> 12) & 0xf);
+        let period = u64::from((self.tgcr >> 8) & 0xf);
+        let first = if counter <= period {
+            period - counter + 1
+        } else {
+            16 - counter + period + 1
+        };
+        Prescaler {
+            first,
+            period: period + 1,
+        }
+    }
+
+    /// `edges` chained-mode edges without an event: CNTHI's position afterwards, and how many
+    /// clocks it passed to TIMLO.
+    fn skip_chain_prescaler(&mut self, edges: u64) -> u64 {
+        if self.enable_mode(0) == 0 || self.stopped[0] {
+            return 0;
+        }
+        let (position, clocks) = self.chain_prescaler().skip(edges);
+        let stopped = clocks >= self.clocks_to_stop(0);
+        self.cnt[1] = match position {
+            Some(position) if !stopped => position as u32,
+            Some(_) => 0,
+            None => self.cnt[1].wrapping_add(edges as u32),
+        };
+        clocks
+    }
+
+    /// `edges` unchained edges without a high-half event: TDDRHI's position afterwards, and how
+    /// many clocks it passed to TIMHI.
+    fn skip_unchained_prescaler(&mut self, edges: u64) -> u64 {
+        if self.enable_mode(1) == 0 || self.stopped[1] {
+            return 0;
+        }
+        let counter = u64::from((self.tgcr >> 12) & 0xf);
+        let (position, clocks) = self.unchained_prescaler().skip(edges);
+        let stopped = clocks >= self.clocks_to_stop(1);
+        let position = match position {
+            Some(position) if !stopped => position,
+            Some(_) => 0,
+            None => (counter + edges) % 16,
+        };
+        // The step from 15 writes 16 into the four-bit field, which carries into bit 16.
+        let carried = counter > u64::from((self.tgcr >> 8) & 0xf) && counter + edges >= 16;
+        self.tgcr = (self.tgcr & !0xf000) | ((position as u32) << 12) | (u32::from(carried) << 16);
+        clocks
+    }
+
+    /// The clock at which a one-shot 32-bit half stops without an event, `u64::MAX` for never:
+    /// the next one when it sits at its period, or the one after it wraps to a zero period
+    /// (`steps_to_match`). Its prescaler freezes at zero with it, because the prescaler only
+    /// runs while the half does.
+    fn clocks_to_stop(&self, half: usize) -> u64 {
+        let (counter, period) = (self.cnt[half], self.prd[half]);
+        if self.enable_mode(half) == 2 {
+            u64::MAX
+        } else if counter == period {
+            1
+        } else if period == 0 {
+            (1 << 32) - u64::from(counter) + 1
+        } else {
+            u64::MAX
+        }
+    }
+}
+
+/// A prescaler in front of a counter half: the edges to its first clock out, and between the
+/// clocks after that, once it has restarted from zero.
+struct Prescaler {
+    first: u64,
+    period: u64,
+}
+
+impl Prescaler {
+    /// The edge carrying the `clocks`th clock out.
+    fn edge_of(&self, clocks: u64) -> u64 {
+        self.first
+            .saturating_add((clocks - 1).saturating_mul(self.period))
+    }
+
+    /// `edges` edges: the position after them once the first clock has gone out (`None` before
+    /// it), and how many clocks they carried.
+    fn skip(&self, edges: u64) -> (Option<u64>, u64) {
+        if edges < self.first {
+            return (None, 0);
+        }
+        let since = edges - self.first;
+        (Some(since % self.period), since / self.period + 1)
+    }
+}
+
+impl Sysclk3Block for Timer {
+    /// The edges before the next period match, which is the only edge a timer raises anything
+    /// on: pulses ending, prescalers and counters stepping change only register contents.
+    fn quiet_edges(&self) -> u64 {
+        if self.watchdog_forced {
+            return 0;
+        }
+        let running = self.tgcr & 3 == 3;
+        let first_event = match (self.tgcr >> 2) & 3 {
+            MODE_64BIT | MODE_WATCHDOG if running => self.steps_to_match(0, true),
+            MODE_UNCHAINED => {
+                let low = (self.tgcr & 1 != 0)
+                    .then(|| self.steps_to_match(0, false))
+                    .flatten();
+                let high = (self.tgcr & 2 != 0)
+                    .then(|| self.steps_to_match(1, false))
+                    .flatten()
+                    .map(|clocks| self.unchained_prescaler().edge_of(clocks));
+                match (low, high) {
+                    (Some(low), Some(high)) => Some(low.min(high)),
+                    (low, high) => low.or(high),
+                }
+            }
+            MODE_CHAINED if running => self
+                .steps_to_match(0, false)
+                .map(|clocks| self.chain_prescaler().edge_of(clocks)),
+            _ => None,
+        };
+        first_event.map_or(u64::MAX, |edge| edge - 1)
+    }
+
+    fn skip_quiet(&mut self, edges: u64) {
+        if edges == 0 {
+            return;
+        }
+        let running = self.tgcr & 3 == 3;
+        match (self.tgcr >> 2) & 3 {
+            MODE_64BIT | MODE_WATCHDOG if running => self.skip_counter(0, true, edges),
+            MODE_UNCHAINED => {
+                if self.tgcr & 1 != 0 {
+                    self.skip_counter(0, false, edges);
+                }
+                if self.tgcr & 2 != 0 {
+                    let clocks = self.skip_unchained_prescaler(edges);
+                    self.skip_counter(1, false, clocks);
+                }
+            }
+            MODE_CHAINED if running => {
+                let clocks = self.skip_chain_prescaler(edges);
+                self.skip_counter(0, false, clocks);
+            }
+            _ => {}
+        }
+        for half in 0..2 {
+            if self.pulse[half] > 0 {
+                if edges >= u64::from(self.pulse[half]) {
+                    self.clear_status(half);
+                } else {
+                    self.pulse[half] -= edges as u32;
+                }
+            }
+        }
+    }
+}
+
 const STATUS_LOW: u32 = 1 << 0;
 const STATUS_HIGH: u32 = 1 << 16;
 
@@ -390,6 +647,7 @@ const STATUS_HIGH: u32 = 1 << 16;
 mod tests {
     use super::*;
     use crate::port::SlavePort;
+    use crate::sysclk3::{assert_skip_matches_steps, TestRng};
     #[test]
     fn the_watchdog_follows_its_key_sequence() {
         let mut timer = Timer::new(0);
@@ -487,5 +745,66 @@ mod tests {
         timer.write(TCR, (2 << 22) | (2 << 6), TEST_CONTEXT);
         // Twelve timer clocks: six low events, three high events.
         assert_eq!(run(&mut timer, 12 * 6), [6, 3]);
+    }
+
+    /// A counter or period value from the places a timer's arithmetic has edges: small values,
+    /// the top of the 32-bit range, and anywhere.
+    fn interesting(rng: &mut TestRng) -> u32 {
+        match rng.below(3) {
+            0 => rng.below(6) as u32,
+            1 => u32::MAX - rng.below(6) as u32,
+            _ => rng.u32(),
+        }
+    }
+
+    #[test]
+    fn skipping_quiet_edges_matches_stepping_them_and_stops_at_the_next_match() {
+        // Every mode, enable, pulse width, prescaler position - TDDRHI above PSCHI included, so
+        // the carry into TGCR bit 16 is crossed - watchdog state and counter a few steps short
+        // of, at, or past its period in either width. Each state is walked through a few matches
+        // so the restart, the one-shot stop, the pulse and the timeout that follow are covered.
+        let mut rng = TestRng::new(0x7153_c103);
+        for _ in 0..3000 {
+            let mut timer = Timer::new(0);
+            timer.prd = [interesting(&mut rng), interesting(&mut rng)];
+            for half in 0..2 {
+                timer.cnt[half] = if rng.below(2) == 0 {
+                    timer.prd[half].wrapping_sub(rng.below(8) as u32)
+                } else {
+                    interesting(&mut rng)
+                };
+                timer.pulse[half] = rng.below(5) as u32;
+                timer.stopped[half] = rng.below(4) == 0;
+            }
+            // ENAMODE, PWID, CP and TSTAT for both halves.
+            timer.tcr = rng.u32() & 0x00f9_00f9;
+            timer.tgcr = (rng.below(4) as u32) << 2
+                | rng.below(4) as u32
+                | (rng.below(16) as u32) << 8
+                | (rng.below(16) as u32) << 12
+                | (rng.below(2) as u32) << 16;
+            timer.watchdog = [
+                Watchdog::Disabled,
+                Watchdog::PreActive,
+                Watchdog::Active,
+                Watchdog::Timeout,
+            ][rng.below(4) as usize];
+            timer.watchdog_forced = rng.below(8) == 0;
+            for _ in 0..4 {
+                assert_skip_matches_steps(&timer, 600, &mut rng, |timer| {
+                    timer.tick_sysclk3() == [false; 2]
+                });
+                let quiet = timer.quiet_edges();
+                let before = timer.clone();
+                timer.skip_quiet(quiet.min(600));
+                let events = timer.tick_sysclk3();
+                if quiet < 600 {
+                    assert_ne!(
+                        events, [false; 2],
+                        "the edge after {quiet} quiet ones: {before:?}"
+                    );
+                }
+            }
+        }
     }
 }

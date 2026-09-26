@@ -22,6 +22,7 @@
 //! appears and that data is not overwritten - and XQSP reports it meanwhile; a read from an empty
 //! receive queue raises RQSP.
 use crate::port::{PortContext, PortWrite, SlavePort};
+use crate::sysclk3::Sysclk3Block;
 #[cfg(test)]
 const TEST_CONTEXT: PortContext = PortContext {
     endian: crate::system::Endian::Little,
@@ -89,6 +90,7 @@ pub struct UtopiaEvents {
     pub receive: bool,
 }
 
+#[cfg_attr(test, derive(Clone, Debug, PartialEq))]
 pub struct Utopia {
     control: u32,
     clock_detect: u32,
@@ -370,10 +372,71 @@ impl Utopia {
     }
 }
 
+impl Sysclk3Block for Utopia {
+    /// An edge is quiet when it raises no synchronisation event, fails no section and leaves UINT
+    /// deasserted: the device tick counts an asserted UINT as movement on every edge, because it
+    /// drives the EDMA3 activity recompute and the level relatch. What remains is an enabled
+    /// section without its event counting towards the clock failure its count sets.
+    fn quiet_edges(&self) -> u64 {
+        if self.interrupt_pending() {
+            return 0;
+        }
+        let transmit = Self::section_quiet_edges(
+            self.control & UCR_UXEN != 0,
+            self.transmit_event,
+            self.transmit_idle,
+            (self.clock_detect >> 16) & 0xff,
+        );
+        let receive = Self::section_quiet_edges(
+            self.control & UCR_UREN != 0,
+            self.receive_event,
+            self.receive_idle,
+            self.clock_detect & 0xff,
+        );
+        transmit.min(receive)
+    }
+
+    fn skip_quiet(&mut self, edges: u64) {
+        if edges == 0 {
+            return;
+        }
+        // Quiet edges never reach a section's count, and a disabled section holds its counter
+        // at zero. The counter wraps like the per-edge increment does.
+        self.transmit_idle = if self.control & UCR_UXEN != 0 {
+            self.transmit_idle.wrapping_add(edges as u32)
+        } else {
+            0
+        };
+        self.receive_idle = if self.control & UCR_UREN != 0 {
+            self.receive_idle.wrapping_add(edges as u32)
+        } else {
+            0
+        };
+    }
+}
+
+impl Utopia {
+    /// The quiet edges one enabled section allows: none while its event is asserted, and
+    /// otherwise the edges before its clock-detect counter reaches a non-zero count. A disabled
+    /// section does neither.
+    fn section_quiet_edges(enabled: bool, event: bool, idle: u32, count: u32) -> u64 {
+        if !enabled {
+            u64::MAX
+        } else if event {
+            0
+        } else if count == 0 {
+            u64::MAX
+        } else {
+            u64::from(count.saturating_sub(idle).max(1) - 1)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::port::SlavePort;
+    use crate::sysclk3::{assert_skip_matches_steps, TestRng};
     fn clocks(utopia: &mut Utopia, peripheral_clocks: u32) -> u32 {
         let mut transmit_events = 0;
         for _ in 0..peripheral_clocks * CLOCK_DIVIDER {
@@ -436,5 +499,41 @@ mod tests {
         assert_eq!(utopia.read(EIPR, TEST_CONTEXT), Some(RQSP));
         // A disabled transmitter raises no synchronisation event at all.
         assert_eq!(clocks(&mut utopia, 4), 0);
+    }
+
+    #[test]
+    fn skipping_quiet_edges_matches_stepping_them() {
+        // Either section enabled or not, with or without its event, clock counts from disabled
+        // to a few edges away - or already passed - and errors pending with or without their
+        // enable. A quiet edge also leaves UINT deasserted, since an asserted one counts as
+        // movement on every edge.
+        let mut rng = TestRng::new(0x0710_91a5);
+        for _ in 0..3000 {
+            let clock_detect = ((rng.below(8) as u32) << 16) | rng.below(8) as u32;
+            let mut utopia = Utopia {
+                control: UCR_RESET
+                    | (u32::from(rng.below(2) == 0) * UCR_UXEN)
+                    | (u32::from(rng.below(2) == 0) * UCR_UREN),
+                clock_detect: if rng.below(4) == 0 {
+                    CDR_RESET
+                } else {
+                    clock_detect
+                },
+                transmit_idle: rng.below(12) as u32,
+                receive_idle: rng.below(12) as u32,
+                transmit_event: rng.below(2) == 0,
+                receive_event: rng.below(2) == 0,
+                pending: rng.u32() & rng.u32() & ERROR_MASK,
+                enable: rng.u32() & rng.u32() & ERROR_MASK,
+                ..Utopia::default()
+            };
+            for _ in 0..4 {
+                assert_skip_matches_steps(&utopia, 600, &mut rng, |utopia| {
+                    utopia.tick_sysclk3() == UtopiaEvents::default() && !utopia.interrupt_pending()
+                });
+                utopia.skip_quiet(utopia.quiet_edges().min(600));
+                utopia.tick_sysclk3();
+            }
+        }
     }
 }
