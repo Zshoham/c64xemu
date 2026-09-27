@@ -196,9 +196,8 @@ impl WritebackQueue {
     }
 
     /// The next register write the write-back of `cycle` lands. The slot is drained from its
-    /// end, so writes come back in reverse of the slot's order. A write whose due cycle passed
-    /// without a write-back (a cycle ended by a packet validation fault) is still in its slot
-    /// and lands with the writes due a full ring later.
+    /// end, so writes come back in reverse of the slot's order. Every cycle ends with a
+    /// write-back, so nothing in the slot is from an earlier lap of the ring.
     pub(crate) fn pop_register(&mut self, cycle: u64) -> Option<RegisterWrite> {
         let slot = slot(cycle);
         let write = self.registers[slot].pop()?;
@@ -459,9 +458,8 @@ mod tests {
     /// Random schedules of every kind the CPU makes - register writes with every delay, few
     /// enough registers that same-cycle duplicates and later-issued replacements are common,
     /// stores due on their issue cycle, `MVC`s with and without ILC's four delay slots,
-    /// saturations due a cycle later - with one write-back in eight skipped, as a packet
-    /// validation fault skips it. Everything drained, and every duplicate refused, must match
-    /// the old queues item for item and in order.
+    /// saturations due a cycle later - drained by a write-back every cycle. Everything drained,
+    /// and every duplicate refused, must match the old queues item for item and in order.
     #[test]
     fn the_queue_commits_in_exactly_the_order_of_the_original_scans() {
         let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
@@ -511,11 +509,9 @@ mod tests {
                 queue.schedule_saturation(cycle + 1, bit);
                 oracle.saturations.push((cycle + 1, bit));
             }
-            if rng.below(8) != 0 {
-                let expected = oracle.commit(cycle);
-                committed += expected.0.len() + expected.1.len() + expected.2.len();
-                assert_eq!(commit(&mut queue, cycle), expected, "cycle {cycle}");
-            }
+            let expected = oracle.commit(cycle);
+            committed += expected.0.len() + expected.1.len() + expected.2.len();
+            assert_eq!(commit(&mut queue, cycle), expected, "cycle {cycle}");
         }
         assert!(committed > 100_000, "{committed}");
     }

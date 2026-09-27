@@ -1039,7 +1039,10 @@ impl Cpu {
                 .packets()
                 .chain(std::iter::once(&packet[..length]));
             if let Err((error, cause)) = validate_packets(validation_packets) {
+                // The packet is annulled, but what earlier packets have in flight completes as
+                // the pipeline drains into the exception (SPRU732J 6.3).
                 self.raise_fault(error, cause);
+                self.commit_writes(bus);
                 self.finish_cycle(bus);
                 return;
             }
@@ -1246,7 +1249,9 @@ impl Cpu {
         self.begin_loop_cycle(offset);
         let replay_packets = self.take_replay_packets(offset, 0);
         if let Err((error, cause)) = validate_packets(replay_packets.packets()) {
+            // As for a program packet: the replay is annulled, the writes in flight land.
             self.raise_fault(error, cause);
+            self.commit_writes(bus);
             self.finish_cycle(bus);
             return;
         }
@@ -6500,6 +6505,25 @@ mod tests {
             cpu.fault(),
             Some("functional unit conflict on .L1 at 0x00000000 and 0x00000004")
         );
+    }
+
+    /// A packet that fails validation is annulled, but the instructions already past E1 are
+    /// not: they complete as the pipeline drains into the exception (SPRU732J 6.3), so a load
+    /// issued four cycles earlier lands on the cycle the bad packet would have executed.
+    #[test]
+    fn a_rejected_packet_does_not_hold_back_writes_already_in_flight() {
+        let mut cpu = Cpu::new(0);
+        cpu.control.write(0x1a, 1 << 2); // TSR.GEE
+        cpu.control.write(0x05, 0x400); // ISTP
+        cpu.set_register("A0", 0x1000).unwrap();
+        cpu.write_bytes(0x1000, &0x7654_3210u32.to_le_bytes());
+        // LDW *A0,B1, three NOPs, then two instructions claiming .L1 in one packet on the
+        // cycle the load's result is written.
+        cpu.write_words(0, &[0x0080_0066, 0, 0, 0, 0x0080_1079, 0x0100_10f8]);
+        cpu.run(5);
+        assert_eq!(cpu.fault(), None);
+        assert_eq!(cpu.register('B', 1), 0x7654_3210);
+        assert_eq!(cpu.control.read(0x1d, 0), 1 << 1); // EFR.IXF: the exception was taken
     }
     #[test]
     fn register_branch_executes_five_delay_slots() {

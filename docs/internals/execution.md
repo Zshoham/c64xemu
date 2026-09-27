@@ -74,9 +74,9 @@ The commit order - register writes, then stores, then control writes, then satur
 within each the order above - is observable in the trace and in same-address stores, and it is
 the order the CPU committed in when these were four vectors scanned with `swap_remove`.
 `the_queue_commits_in_exactly_the_order_of_the_original_scans` pins it against a model of those
-scans. That includes one irregular case: a packet validation fault ends its cycle without a
-write-back, so a register write due then lands a full ring (16 cycles) later with that slot's
-writes, and a control write due then never lands.
+scans. Every cycle ends with a write-back, a packet rejected by validation included: the packet
+is annulled, but what earlier packets have in flight completes as the pipeline drains into the
+exception (SPRU732J 6.3), so nothing ever waits past its due cycle.
 
 This is what makes delay slots observable in the right way: an instruction with a delay slot is
 one whose write is scheduled further out, and any read in an intervening cycle sees the *old*
