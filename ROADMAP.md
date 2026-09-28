@@ -516,6 +516,16 @@ a bound of 16 or more never terminated. Found by the new `edma_timer_event` firm
 where the fill loop spun past its last element; the long-operand forms were already right.
 `cpu:unsigned-compare-constant-{below,above}-the-bound` pin both sides of the bound.
 
+**[x] A 32-bit NEG of the most negative int.** *Fixed.* The model saturated `SUB 0,0x80000000`
+- every constant-zero SUB, which is the word NEG assembles to - to 0x7fffffff, reading the NEG
+page's execution line, "0 -s src2", as the definition. The same word is SUB's .L opfield 0000110,
+whose execution is plain `src1 - src2`, and TI's compiler settles which one silicon does: cl6x
+negates an `unsigned int` with NEG, where C requires -0x80000000u to be 0x80000000u, and the high
+word of every 64-bit negation is this instruction. Found from the Zephyr port, where cbprintf
+printed INT64_MIN as -9223372032559808512 and two of upstream's JSON cases failed on it.
+`cpu::tests::neg_of_the_most_negative_int_wraps` pins it; the 40-bit form is untouched, and the
+entry below is about that one.
+
 **[!] A known codegen corner for new `_lssub` programs.** cl6x realises a saturating long
 subtraction as saturating `NEG` followed by `SADD`, which loses one ulp when the subtrahend
 is exactly INT40_MIN. The host oracle disagrees with the compiled form there regardless of

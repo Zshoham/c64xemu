@@ -1620,17 +1620,15 @@ impl Cpu {
                 let (left, right, dst) = binary_operands(word, side, &self.a, &self.b);
                 let value = match opcode {
                     Opcode::Add => left.wrapping_add(right),
-                    // NEG assembles as SUB 0,src2,dst and executes as the saturating
-                    // 0 -s src2 (SPRU732J), so 0 - INT_MIN clamps to INT_MAX. The SAT
-                    // bit is left alone here: this group spans several units and the
-                    // SSR unit field is not tracked for it.
-                    Opcode::Sub => {
-                        if left == 0 && right == i32::MIN as u32 {
-                            i32::MAX as u32
-                        } else {
-                            left.wrapping_sub(right)
-                        }
-                    }
+                    // A plain two's-complement subtraction, 0 - INT_MIN included. NEG
+                    // is this word with a zero constant (SPRU189F NEG: "the assembler
+                    // uses the operation SUB 0, src, dst"; .L opfield 0000110, the SUB
+                    // form whose execution is src1 - src2). The NEG page's own
+                    // execution line reads "0 -s src2", the saturating operator, but
+                    // one encoding has one behaviour, and TI's compiler settles which:
+                    // cl6x negates an unsigned int with NEG, where C defines
+                    // -0x80000000u as 0x80000000u.
+                    Opcode::Sub => left.wrapping_sub(right),
                     Opcode::And => left & right,
                     Opcode::Or => left | right,
                     Opcode::Xor => left ^ right,
@@ -5984,6 +5982,26 @@ mod tests {
         );
         cpu.run(8);
         assert_eq!(cpu.register('B', 4), 39);
+        assert_eq!(cpu.fault(), None);
+    }
+
+    /// The 32-bit NEG wraps: it is SUB 0,src2 (.L opfield 0000110), and cl6x negates an
+    /// unsigned int with it, where C requires -0x80000000u to be 0x80000000u. Zephyr's
+    /// cbprintf printed INT64_MIN as -9223372032559808512 while this saturated, because
+    /// the high word of a 64-bit negation is exactly this instruction.
+    #[test]
+    fn neg_of_the_most_negative_int_wraps() {
+        let mut cpu = Cpu::new(0);
+        cpu.set_register("A4", 0x8000_0000).unwrap();
+        cpu.write_words(
+            0,
+            &[
+                0x0210_00d8, // NEG.L1 A4,A4 (cl6x, dis6x)
+                0x0000_0000,
+            ],
+        );
+        cpu.run(8);
+        assert_eq!(cpu.register('A', 4), 0x8000_0000);
         assert_eq!(cpu.fault(), None);
     }
 
