@@ -153,6 +153,21 @@ terminator - and boot configuration tables that set, clear and toggle through CP
 `c64xemu run IMAGE --boot-table FILE:ADDR --boot-config FILE:ADDR` loads nothing but those tables
 and starts where the boot table says.
 
+**Booting through HPI.** C6455 `--boot-mode 1 --hpi-unix EMU.sock` is the hardware host boot of
+SPRS276M section 2.4, so no ROM code is involved. Strapped to it, the HPI comes out of reset
+enabled with HPIRST clear, and core 0 is held in reset while an external host loads code and data
+through the address and data ports. The host's first DSPINT releases the core at the base of L2,
+`0x00800000`, with reset CPU state (GIE clear). DSPINT stays set until the application clears
+it. There is no boot table and the positional ELF supplies only symbols. Both L1 caches are
+32 KB and L2 is SRAM (SPRUEC6G Table 2).
+
+`tests/tools/hpi_host.py --boot --image IMAGE --report` launches the emulator, transfers and
+verifies the ELF load segments, flushes partial FIFO bursts, then raises DSPINT. Link the
+image's entry at L2 base; the host tool rejects other entry points. `--no-dspint` loads and
+verifies without releasing the CPU. `--state-out FILE` records the final state, including
+`hpi_boot.entry`, which is null until release. Mailbox mode remains the host tool's default.
+The C6472's mode 1 is a different HPI boot protocol and is refused.
+
 **Booting over Ethernet.** The C6472's ROM Ethernet boot (SPRUEC6G section 4.3.5), which is how a
 board with no boot EEPROM comes up: `c64xemu run IMAGE --device c6472 --boot-mode 9` loads nothing
 at all. Core 0 is held while the boot code runs in its place - bringing up the MAC port the

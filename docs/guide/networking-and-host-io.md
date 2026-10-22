@@ -93,6 +93,11 @@ and reads the reply, four rounds, checking every answer — so its exit status i
 firmware side is `tests/firmware/hpi_mailbox/`, which takes DSPINT as a real interrupt (system
 event 15 on the C6455).
 
+`hpi_host.py --boot --image <image>` is the host for the C6455's HPI boot instead (see
+[HPI host boot](booting.md#hpi-host-boot)). It loads and verifies the ELF's load segments, then
+raises the DSPINT that releases core 0. In either mode the tool fails when the emulator faults,
+writes no machine state, or, after a released boot, never reaches the application's exit.
+
 ## CIO
 
 CIO is TI's runtime host-I/O protocol, and it is what makes `printf` work in a target program.

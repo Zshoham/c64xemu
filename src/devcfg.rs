@@ -87,6 +87,8 @@ const PERCFG0_WRITABLE: u32 = (0x3 << 30)
     | (1 << 4)
     | (1 << 2)
     | 1;
+/// HPICTL, the HPI's PERCFG0 mode control bit (SPRS276M Table 3-7).
+const PERCFG0_HPICTL: u32 = 1 << 18;
 /// EMIFACTL and DDR2CTL, both set-only (SPRS276M Table 3-8).
 const PERCFG1_WRITABLE: u32 = 0x3;
 
@@ -217,6 +219,19 @@ impl SlavePort for DeviceConfig {
 }
 
 impl DeviceConfig {
+    /// The block as reset leaves it. A peripheral used for boot comes out of reset already
+    /// enabled: HPICTL "defaults to 1 when host boot is used (BOOTMODE[3:0] = 0001b)", and
+    /// "Peripherals used for boot such as HPI and PCI are enabled automatically following a
+    /// device reset" (SPRS276M Tables 3-7 and 3-4), so there is no transition to wait for.
+    pub(crate) fn new(hpi_boot: bool) -> Self {
+        let enabled = if hpi_boot { PERCFG0_HPICTL } else { 0 };
+        Self {
+            config: enabled,
+            settled: enabled,
+            ..Self::default()
+        }
+    }
+
     /// One CPU cycle for the unit tests. On the device the block is never stepped edge by
     /// edge: nothing it does reaches the fabric, so the SYSCLK3 schedule only brings it up to
     /// date when it is accessed (`Sysclk3Block::skip_quiet`).

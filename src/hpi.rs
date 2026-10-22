@@ -39,6 +39,13 @@ const HPIC_HPIARWSEL: u32 = 1 << 11;
 const FIFO_WORDS: usize = 8;
 const BURST_WORDS: usize = 4;
 
+/// BOOTMODE[3:0] 0001b is the C6455's host boot through the HPI (SPRS276M section 2.4).
+pub(crate) const BOOTMODE_HPI: u8 = 1;
+
+/// Where the CPU starts when an HPI boot releases it: "the internal L2 SRAM located at
+/// 0x80 0000" (SPRS276M section 2.4).
+pub(crate) const HPI_BOOT_ENTRY: u32 = 0x0080_0000;
+
 /// The access types the host selects on HCNTL[1:0] (SPRU969B Table 4).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum HostPort {
@@ -61,6 +68,9 @@ pub struct Hpi {
     /// The CPU's software reset. While it is set the FIFOs are held clear and every host access
     /// is held off by HRDY (SPRU969B section 8.3).
     hpirst: bool,
+    /// The device was strapped to HPI boot and the host has not yet raised the DSPINT that
+    /// brings the CPU out of reset (SPRS276M section 2.4).
+    boot_pending: bool,
     /// Host-configured HPIC bits.
     hwob: bool,
     dual_hpia: bool,
@@ -84,13 +94,29 @@ pub struct Hpi {
 }
 
 impl Hpi {
-    /// Reset leaves the software reset bit set and both interrupts cleared. HPIRST comes up set
-    /// unless the device booted through the HPI (SPRU969B Figure 31).
-    pub fn new() -> Self {
+    /// Reset leaves both interrupts cleared. HPIRST "defaults to 0 when HPI boot is selected;
+    /// otherwise it defaults to 1" (SPRU969B Figure 31): a booting host has to reach memory
+    /// before any code has run to clear it.
+    pub fn new(boot: bool) -> Self {
         Self {
-            hpirst: true,
+            hpirst: !boot,
+            boot_pending: boot,
             ..Self::default()
         }
+    }
+
+    /// Whether this DSPINT is the one that ends an HPI boot, which the hardware answers by
+    /// taking the CPU out of reset. Only the first DSPINT after reset is: every later one is an
+    /// ordinary interrupt for the application. DSPINT itself stays set either way; "the CPU
+    /// needs to clear the DSPINT, otherwise, no more DSPINTs can be received" (SPRS276M
+    /// section 2.4).
+    pub(crate) fn take_boot_release(&mut self) -> bool {
+        std::mem::take(&mut self.boot_pending)
+    }
+
+    /// Whether the device is strapped to an HPI boot the host has not finished.
+    pub(crate) fn boot_pending(&self) -> bool {
+        self.boot_pending
     }
 }
 
@@ -372,7 +398,7 @@ mod tests {
 
     #[test]
     fn the_cpu_sees_the_documented_reset_state() {
-        let mut hpi = Hpi::new();
+        let mut hpi = Hpi::new(false);
         // HPIRST comes up set, both interrupts clear, and the CPU reads zero for FETCH and HRDY
         // whatever the host would see (SPRU969B Table 8 and Figure 31).
         assert_eq!(hpi.read(HPIC, TEST_CONTEXT), Some(HPIC_HPIRST));
@@ -383,7 +409,7 @@ mod tests {
 
     #[test]
     fn the_cpu_may_raise_the_host_interrupt_and_acknowledge_its_own() {
-        let mut hpi = Hpi::new();
+        let mut hpi = Hpi::new(false);
         hpi.write(HPIC, HPIC_HINT, TEST_CONTEXT);
         assert_eq!(hpi.read(HPIC, TEST_CONTEXT), Some(HPIC_HINT));
         // A write of zero to either interrupt bit does nothing; only the host clears HINT.

@@ -180,7 +180,50 @@ def positive_float(text: str) -> float:
     return value
 
 
-def load_elf(core: int, path: str) -> Image:
+@dataclass(frozen=True)
+class ProgramHeader:
+    kind: int
+    offset: int
+    virtual_address: int
+    physical_address: int
+    file_size: int
+    memory_size: int
+
+    @property
+    def address(self) -> int:
+        return self.physical_address or self.virtual_address
+
+
+@dataclass(frozen=True)
+class Elf:
+    """A validated ELF32 C6000 file: the bytes and every fact the hosts read from its headers."""
+
+    data: bytes
+    endian: str  # struct prefix: "<" or ">"
+    entry: int
+    table_offset: int  # e_phoff, e_phentsize and e_phnum, for a caller that edits the table
+    table_entry_size: int
+    programs: tuple[ProgramHeader, ...]
+
+    @property
+    def byteorder(self) -> str:
+        return "little" if self.endian == "<" else "big"
+
+    def image(self, core: int, zero_fill: bool = False) -> Image:
+        """The PT_LOAD segments with file contents. `zero_fill` pads each to p_memsz, keeping a
+        segment that is all .bss, for a host that must write the whole memory image."""
+        segments = []
+        for program in self.programs:
+            if program.kind != PT_LOAD or (program.memory_size if zero_fill else program.file_size) == 0:
+                continue
+            contents = self.data[program.offset : program.offset + program.file_size]
+            if zero_fill:
+                contents += bytes(program.memory_size - program.file_size)
+            segments.append(Segment(program.address, contents))
+        return Image(core, self.entry, tuple(segments))
+
+
+def parse_elf(path: str) -> Elf:
     try:
         with open(path, "rb") as elf_file:
             data = elf_file.read()
@@ -213,22 +256,25 @@ def load_elf(core: int, path: str) -> Image:
     if program_count and program_size < 32:
         raise invalid("invalid ELF program-header size")
 
-    segments = []
+    programs = []
     for index in range(program_count):
         offset = program_offset + index * program_size
         if offset + 32 > len(data):
             raise invalid("program-header table lies outside file")
         fields = struct.unpack_from(endian + "IIIIIIII", data, offset)
-        kind, file_offset, virtual_address, physical_address, file_size, memory_size = fields[:6]
-        if kind != PT_LOAD or file_size == 0:
+        program = ProgramHeader(*fields[:6])
+        programs.append(program)
+        if program.kind != PT_LOAD or program.file_size == 0:
             continue
-        if file_size > memory_size:
+        if program.file_size > program.memory_size:
             raise invalid(f"program header {index} has p_filesz greater than p_memsz")
-        if file_offset + file_size > len(data):
+        if program.offset + program.file_size > len(data):
             raise invalid(f"program header {index} data lies outside file")
-        address = physical_address if physical_address else virtual_address
-        segments.append(Segment(address, data[file_offset : file_offset + file_size]))
-    return Image(core, entry, tuple(segments))
+    return Elf(data, endian, entry, program_offset, program_size, tuple(programs))
+
+
+def load_elf(core: int, path: str) -> Image:
+    return parse_elf(path).image(core)
 
 
 def global_alias(core: int, address: int) -> int:

@@ -98,7 +98,7 @@ Shared by `run` and `debug`.
 | Option | Default | What it does |
 |---|---|---|
 | `--device NAME` | `c6455` | Selects the device profile by name; `DeviceProfile::named` refuses anything else with `unknown device NAME`. `c6455` is single-core, `c6472` has six cores. See [The six-core device](multicore.md). |
-| `--boot-mode MODE` | `0` | The BOOTMODE pins. Mode 0 is no ROM boot: the ELF's segments are installed and every core starts. Mode 5 is the I2C EEPROM boot and requires `--i2c-eeprom`. Modes 9 and 10 are the C6472's Ethernet boot over MAC port 0 or 1; the C6455 has no Ethernet boot mode and refuses them (`ethernet_boot_port`, [SPRUEC6G](../reference/spruec6g.pdf) §4.3.5). Every other mode starts core 0 and leaves it to release the rest. See [Booting an image](booting.md). |
+| `--boot-mode MODE` | `0` | The BOOTMODE pins. Mode 0 is no ROM boot: the ELF's segments are installed and every core starts. Mode 1 on the C6455 is the HPI host boot and requires `--hpi-unix`: core 0 is held in reset until the host's DSPINT, then starts at `0x00800000`; the C6472's mode 1 is a different HPI boot and is refused. Mode 5 is the I2C EEPROM boot and requires `--i2c-eeprom`. Modes 9 and 10 are the C6472's Ethernet boot over MAC port 0 or 1; the C6455 has no Ethernet boot mode and refuses them (`ethernet_boot_port`, [SPRUEC6G](../reference/spruec6g.pdf) §4.3.5). Every other mode starts core 0 and leaves it to release the rest. See [Booting an image](booting.md). |
 | `--i2c-eeprom FILE` | none | The serial EEPROM image on the I2C bus that an I2C boot reads its boot parameters and boot table from. Supplying it makes the load `Wire`: nothing comes from the ELF's segments. |
 | `--boot-param-index N` | `0` | Which of the eight boot parameter blocks the I2C boot loads. The block sits at `0x80 * N`. |
 | `--mac-id MAC` | `02:00:00:00:64:72` | The address fused into the MAC ID words, which an Ethernet boot names itself by. |
@@ -248,6 +248,7 @@ stdout or stderr according to the file descriptor the request named, and also ac
 | `stats` | The CPU's counters, which the perf report renders. |
 | `ethernet_boot` | Present only when the ROM's Ethernet boot ran: `frames_accepted`, `frames_discarded`, `table_bytes`, `entry`. The only way to tell a boot that completed from one still waiting for a frame. |
 | `i2c_boot` | Present only when the ROM's I2C boot ran: `parameter_blocks`, `table_blocks`, `table_bytes`, `checksum_failures`, `entry`, `error`. |
+| `hpi_boot` | Present only when the C6455 was strapped to HPI boot: `entry`, which is `0x00800000` once the host's DSPINT has released core 0 and null until then. |
 | `profile` | Present with `--profile`: the 32 hottest execute-packet addresses as `{pc, where, packets}`, `where` being the covering symbol as `name+0x1c`. |
 | `cache_stats` | Present with `--profile`: per cache, its name, `enabled`, `frozen`, `capacity_bytes`, `line_size`, `ways`, `sets`, `resident_lines`, `dirty_lines` and its hit/miss/fill/eviction counters. |
 

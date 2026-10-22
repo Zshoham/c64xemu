@@ -82,16 +82,18 @@ the fabric so the newly focused core is inspected and driven exactly like the ol
 
 `Device::cycle_on` is one device cycle, and the only implementation of one: `Device::step_cycle`
 runs a single cycle through it and `Device::run_cycles` runs a batch of them. It walks cores in
-index order, skips any core that `Fabric::held_in_reset` or `!Fabric::core_clocked` (the C6472's
-power/sleep controller can gate a megamodule's clock) - asked when that core's turn comes, so an
-earlier core's access can hold, release or gate a later one in the same cycle - and steps each
-core it does run with `Cpu::step_on` against the fabric the device is holding. After the cores,
-it calls `fabric.tick(self.cycle)` - with every core held in reset the peripherals still run,
-which is how a host boots the device through the HPI while the cores wait - then advances the
-ROM boot if one is strapped, then applies the device-level effects of the cycle in
-`apply_device_requests`: cores the boot controller or the power/sleep controller released (set
-to their `boot_address` and let out of reset) and cores whose NMI pin the chip-level registers
-drove.
+index order. It skips any core that `Fabric::held_in_reset` or `!Fabric::core_clocked` (the
+C6472's power/sleep controller can gate a megamodule's clock), asking when that core's turn comes
+so that an earlier core's access can hold, release or gate a later one in the same cycle. A held
+core's event receptions are dropped (`Fabric::drop_held_core_events`): a core in reset has no IFR
+to latch them into, so nothing raised while it waited is pending when it comes out. Each core
+that does run is stepped with `Cpu::step_on` against the fabric the device is holding. After the
+cores, it calls `fabric.tick(self.cycle)`. The peripherals run even with every core held in
+reset, which is how a host boots the device through the HPI while the cores wait. It then
+advances the ROM boot if one is strapped, and finally applies the device-level effects of the
+cycle in `apply_device_requests`. Those effects are: cores released by the boot controller, the
+power/sleep controller or an HPI boot's DSPINT (set to their `boot_address`, where the device has
+one, and let out of reset), and cores whose NMI pin the chip-level registers drove.
 
 `Fabric::tick(cycle)` is guarded, and the guard is the whole tick model:
 

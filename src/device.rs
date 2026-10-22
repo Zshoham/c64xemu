@@ -10,7 +10,9 @@
 
 use crate::cpu::Cpu;
 use crate::events::{EventMap, C6455_EVENTS, C6472_EVENTS};
+use crate::hpi::HPI_BOOT_ENTRY;
 use crate::i2cboot::{I2cBoot, Progress as I2cProgress};
+use crate::memory::{L1DCFG, L1PCFG, L2CFG};
 use crate::romboot::{BootParameters, EmacBoot, Progress};
 use crate::space::{AddressMap, C6455_MAP, C6472_MAP};
 use crate::system::{Endian, Fabric};
@@ -245,6 +247,9 @@ pub struct Device {
     /// The ROM bootloader's boot, once a front end has strapped the device to one. It outlives
     /// the boot it performed: what it did is what a front end reports afterwards.
     rom_boot: Option<RomBoot>,
+    /// Strapped to the C6455's HPI boot, which is hardware rather than ROM: core 0 is held in
+    /// reset until the host's DSPINT, then starts at the base of L2 (SPRS276M section 2.4).
+    hpi_boot: bool,
 }
 
 /// The two boundaries a batch of device cycles ends at, kept as bit masks over the cores and
@@ -315,7 +320,9 @@ impl Device {
     }
 
     /// A device strapped to a boot mode: 0 starts every core at once, and any other mode runs
-    /// core 0 and holds the rest until it releases them (SPRS612G section 2.4.1).
+    /// core 0 and holds the rest until it releases them (SPRS612G section 2.4.1). Strapped to
+    /// HPI boot, the core starts held at the base of L2, wherever `entry` says: the host loads
+    /// the image, and nothing in that boot names an entry point (SPRS276M section 2.4).
     pub fn with_boot_mode(
         profile: &'static DeviceProfile,
         entry: u32,
@@ -324,6 +331,8 @@ impl Device {
     ) -> Self {
         let mut fabric = Box::new(Fabric::with_boot_mode(profile, boot_mode));
         fabric.apply_reset_holds();
+        let hpi_boot = fabric.hpi_boot_pending();
+        let entry = if hpi_boot { HPI_BOOT_ENTRY } else { entry };
         let mut cpus: Vec<Cpu> = Vec::with_capacity(profile.cores());
         for core in (0..profile.cores()).rev() {
             // Each core in turn takes the fabric to be built with, and the last one built -
@@ -335,11 +344,20 @@ impl Device {
         }
         cpus.reverse();
         cpus[profile.reset_core].attach(fabric);
+        if hpi_boot {
+            // SPRUEC6G Table 2: an HPI boot leaves 32 KB of each L1 cache and all of L2 as
+            // SRAM. Written through the registers, like every other cache configuration.
+            let mut bus = cpus[profile.reset_core].bus_mut();
+            bus.write32(L1PCFG, 4);
+            bus.write32(L1DCFG, 4);
+            bus.write32(L2CFG, 0);
+        }
         Self {
             cpus,
             focus: profile.reset_core,
             cycle: 0,
             rom_boot: None,
+            hpi_boot,
         }
     }
 
@@ -363,6 +381,11 @@ impl Device {
         self.rom_boot = Some(RomBoot::I2c(I2cBoot::new(index, endian)));
     }
 
+    /// Where an HPI boot started core 0, once the host's DSPINT has released it.
+    pub fn hpi_boot_entry(&self) -> Option<u32> {
+        (self.hpi_boot && !self.held_in_reset(0)).then_some(HPI_BOOT_ENTRY)
+    }
+
     /// What the I2C boot has done, when the device was strapped to one.
     pub fn i2c_boot(&self) -> Option<I2cProgress> {
         match self.rom_boot.as_ref()? {
@@ -371,11 +394,11 @@ impl Device {
         }
     }
 
-    /// Whether the ROM bootloader is running in place of core 0. A run loop has to advance the
-    /// device rather than the core while it is, because the boot is device state and the core
-    /// it is booting is held.
-    pub fn rom_booting(&self) -> bool {
-        self.rom_boot.is_some()
+    /// Whether the device was strapped to a boot that holds core 0 - the ROM bootloader running
+    /// in its place, or the HPI boot holding it in reset for the host. A run loop has to
+    /// advance the device rather than the core while it is, because the core is held.
+    pub fn boot_holds_core_zero(&self) -> bool {
+        self.rom_boot.is_some() || self.hpi_boot
     }
 
     /// Whether a core is held in reset, without borrowing the fabric mutably: the halt rule
@@ -474,17 +497,18 @@ impl Device {
     /// CIO includes held cores, matching the machine's handshake scan; its first-cycle
     /// exemption still advances a device cycle even when the core at CIO cannot run.
     ///
-    /// A single core with no ROM boot runs itself: `Cpu::run_cycles` is the fast path, it ticks
-    /// the device from inside its own cycle and counts in the core's cycles, and it leaves the
-    /// device's cycle counter alone. Six cores, or a ROM boot - which is device state, and holds
-    /// the core it boots - advance whole device cycles and count in those.
+    /// A single core with no boot holding it runs itself: `Cpu::run_cycles` is the fast path,
+    /// it ticks the device from inside its own cycle and counts in the core's cycles, and it
+    /// leaves the device's cycle counter alone. Six cores, or a boot that holds core 0 - device
+    /// state the core cannot step past on its own - advance whole device cycles and count in
+    /// those.
     pub(crate) fn run_cycles(
         &mut self,
         cycles: u64,
         cio: Option<u32>,
         ignore_cio_once: bool,
     ) -> u64 {
-        if self.cpus.len() == 1 && self.rom_boot.is_none() {
+        if self.cpus.len() == 1 && !self.boot_holds_core_zero() {
             return self.cpus[0].run_cycles(cycles, cio, ignore_cio_once);
         }
         // The device keeps the fabric for the whole batch and gives it back to the focused
@@ -518,7 +542,11 @@ impl Device {
     /// gate a later one.
     fn cycle_on(&mut self, fabric: &mut Fabric, mut boundaries: Option<&mut Boundaries>) {
         for core in 0..self.cpus.len() {
-            if fabric.held_in_reset(core) || !fabric.core_clocked(core) {
+            if fabric.held_in_reset(core) {
+                fabric.drop_held_core_events(core);
+                continue;
+            }
+            if !fabric.core_clocked(core) {
                 continue;
             }
             let cpu = &mut self.cpus[core];
@@ -592,6 +620,7 @@ impl Device {
             focus: 0,
             cycle: 0,
             rom_boot: None,
+            hpi_boot: false,
         }
     }
 }
@@ -612,6 +641,113 @@ mod tests {
 
     fn c6472() -> Device {
         Device::new(&C6472, 0x0080_0000, Endian::Little)
+    }
+
+    #[test]
+    fn hpi_boot_holds_core_zero_in_reset_until_the_hosts_dspint() {
+        use crate::hpi::{HostPort, BOOTMODE_HPI};
+        const HPIC: u32 = 0x0288_0030;
+        const HPIC_DSPINT: u32 = 1 << 1;
+        const HPIC_HRDY: u32 = 1 << 3;
+        const HPIC_HPIRST: u32 = 1 << 7;
+        const PERCFG0: u32 = 0x02ac_0008;
+        const PERSTAT0: u32 = 0x02ac_0014;
+        const CSR: u8 = 0x01;
+        const IFR: u8 = 0x02;
+        const INT15: u32 = 1 << 15;
+
+        for endian in [Endian::Little, Endian::Big] {
+            let mut device = Device::with_boot_mode(&C6455, 0x0080_1000, endian, BOOTMODE_HPI);
+            // Strapped to the boot, the HPI is enabled and out of its software reset before
+            // any cycle has run: nothing on the DSP side runs to open it for the host.
+            assert_eq!(
+                device.fabric().hpi_host_read(HostPort::Control),
+                Some(HPIC_HRDY)
+            );
+            let mut bus = device.cpu_mut().bus_mut();
+            assert_eq!(bus.read32(HPIC) & HPIC_HPIRST, 0);
+            assert_ne!(bus.read32(PERCFG0) & (1 << 18), 0);
+            assert_eq!((bus.read32(PERSTAT0) >> 27) & 7, 1, "HPI enabled");
+            assert_eq!(bus.read32(L1PCFG) & 7, 4);
+            assert_eq!(bus.read32(L1DCFG) & 7, 4);
+            assert_eq!(bus.read32(L2CFG) & 7, 0);
+            assert!(device.held_in_reset(0));
+            assert_eq!(device.hpi_boot_entry(), None);
+
+            // Three posted words cannot complete a four-word DMA burst. The host must flush
+            // its final short burst; the boot ending does not do it.
+            let address = 0x0080_2000;
+            device
+                .fabric()
+                .hpi_host_write(HostPort::Address, address >> 2);
+            for word in [0x1234_5678, 0x89ab_cdef, 0xdead_beef] {
+                device
+                    .fabric()
+                    .hpi_host_write(HostPort::DataAutoIncrement, word);
+            }
+            device.step_cycle();
+            assert_eq!(device.cpu_mut().bus_mut().read32(address), 0);
+            device
+                .fabric()
+                .hpi_host_write(HostPort::Address, address >> 2);
+            assert_eq!(device.cpu_mut().bus_mut().read32(address + 8), 0xdead_beef);
+            device.step_cycle();
+            assert!(
+                device.held_in_reset(0),
+                "loading memory is not boot completion"
+            );
+            assert_eq!(device.core(0).cycles(), 0);
+
+            device
+                .fabric()
+                .hpi_host_write(HostPort::Control, HPIC_DSPINT);
+            device.step_cycle();
+            assert!(!device.held_in_reset(0));
+            assert_eq!(device.core(0).pc(), 0x0080_0000, "not the ELF entry");
+            assert_eq!(
+                device.core(0).cycles(),
+                0,
+                "release does not execute a packet"
+            );
+            assert_eq!(device.hpi_boot_entry(), Some(0x0080_0000));
+            // The CPU leaves reset with interrupts disabled, and DSPINT stays set until the
+            // application clears it.
+            assert_eq!(device.core(0).read_control(CSR) & 1, 0, "GIE");
+            assert_eq!(
+                device.fabric().hpi_host_read(HostPort::Control),
+                Some(HPIC_HRDY | HPIC_DSPINT)
+            );
+            // The DSPINT arrived while the core was in reset, so it never reaches IFR.
+            for _ in 0..20 {
+                device.step_cycle();
+            }
+            assert_eq!(device.core(0).read_control(IFR) & INT15, 0);
+
+            // While DSPINT stands the host cannot raise another; once the application clears
+            // it, the next one is an ordinary interrupt and the core keeps running.
+            device
+                .fabric()
+                .hpi_host_write(HostPort::Control, HPIC_DSPINT);
+            for _ in 0..20 {
+                device.step_cycle();
+            }
+            assert_eq!(device.core(0).read_control(IFR) & INT15, 0);
+            device.cpu_mut().bus_mut().write32(HPIC, HPIC_DSPINT);
+            assert_eq!(
+                device.fabric().hpi_host_read(HostPort::Control),
+                Some(HPIC_HRDY)
+            );
+            device
+                .fabric()
+                .hpi_host_write(HostPort::Control, HPIC_DSPINT);
+            let cycles = device.core(0).cycles();
+            for _ in 0..20 {
+                device.step_cycle();
+            }
+            assert_ne!(device.core(0).read_control(IFR) & INT15, 0);
+            assert!(!device.held_in_reset(0));
+            assert!(device.core(0).cycles() > cycles, "the core was not reset");
+        }
     }
 
     #[test]

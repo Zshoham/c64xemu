@@ -54,8 +54,9 @@ pub struct MachineArgs {
     /// Which device to emulate: the single-core c6455, or the six-core c6472
     #[arg(long, default_value = "c6455", value_name = "NAME")]
     pub device: String,
-    /// The BOOTMODE pins: 0 starts every core, 9 and 10 boot over MAC port 0 or 1, and every
-    /// other mode starts core 0 and leaves it to release the rest through BOOT_COMPLETE_STAT
+    /// The BOOTMODE pins: C6455 mode 1 boots through --hpi-unix, mode 5 reads --i2c-eeprom;
+    /// C6472 modes 9 and 10 boot over MAC port 0 or 1. Mode 0 starts every core; other C6472
+    /// modes start core 0, which releases the rest through BOOT_COMPLETE_STAT
     #[arg(long, default_value_t = 0, value_name = "MODE")]
     pub boot_mode: u8,
     /// The serial EEPROM image on the I2C bus, which boot mode 5 reads its boot parameters and
@@ -149,8 +150,8 @@ enum Load {
     Segments(Vec<Segment>),
     /// The table bytes, where they sit, and the entry point the bootloader reported.
     BootTable(Vec<u8>, u32, u32),
-    /// An Ethernet boot loads nothing: the boot table arrives over the wire while the device
-    /// runs, so the ELF on the command line supplies only symbols (SPRUEC6G section 4.3.5).
+    /// A ROM boot loads nothing from the ELF: the host, bus or network supplies the image,
+    /// and the ELF on the command line supplies only symbols.
     Wire,
 }
 
@@ -303,6 +304,24 @@ impl Machine {
         };
         let profile = DeviceProfile::named(&args.device)
             .ok_or_else(|| format!("unknown device {}", args.device))?;
+        let hpi_boot = hpi_boot_mode(profile, args.boot_mode)?;
+        if hpi_boot {
+            if args.hpi_unix.is_none() {
+                return Err(format!(
+                    "boot mode {} is the {}'s HPI host boot; give it the host with --hpi-unix",
+                    args.boot_mode, profile.name
+                ));
+            }
+            if args.i2c_eeprom.is_some() {
+                return Err("--i2c-eeprom and HPI host boot are two boot sources; use one".into());
+            }
+            if args.boot_config.is_some() {
+                return Err(
+                    "--boot-config cannot be used with HPI host boot; the host loads memory directly"
+                        .into(),
+                );
+            }
+        }
         let i2c_eeprom = match &args.i2c_eeprom {
             Some(path) => {
                 Some(std::fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?)
@@ -316,14 +335,17 @@ impl Machine {
                 crate::i2cboot::BOOTMODE_I2C_EEPROM
             ));
         }
-        // A ROM boot builds the whole memory image from what it reads - off the wire for an
-        // Ethernet boot, off the bus for an I2C one - so nothing is loaded from the ELF: it is
-        // on the command line for its symbols (SPRUEC6G sections 2.3.4 and 4.3.5).
-        let load = match ethernet_boot_port(profile, args.boot_mode) {
-            Some(Ok(_)) => Load::Wire,
+        // A boot builds the memory image from the host, wire or bus, so the ELF supplies only
+        // symbols (SPRS276M section 2.4, SPRUEC6G sections 2.3.4 and 4.3.5).
+        let ethernet_boot = match ethernet_boot_port(profile, args.boot_mode) {
+            Some(Ok(_)) => true,
             Some(Err(message)) => return Err(message),
-            None if i2c_eeprom.is_some() => Load::Wire,
-            None => Load::Segments(image.segments),
+            None => false,
+        };
+        let load = if ethernet_boot || hpi_boot || i2c_eeprom.is_some() {
+            Load::Wire
+        } else {
+            Load::Segments(image.segments)
         };
         // One wire, and it is attached to one of the device's MACs: MAC 0 unless the command
         // line says otherwise, or the MAC an Ethernet boot was strapped to, because that is the
@@ -388,7 +410,7 @@ impl Machine {
             }
             // A capture file cannot be the Ethernet boot's source: the boot code resets the MAC
             // before it configures it, so frames handed over before the announcement are gone.
-            if machine.ethernet.has_preload() && machine.i2c_eeprom.is_none() {
+            if ethernet_boot && machine.ethernet.has_preload() {
                 return Err(
                     "--pcap-in frames arrive before an Ethernet boot has configured the \
                             MAC and are lost with its reset; drive the boot through --net-unix"
@@ -572,7 +594,7 @@ impl Machine {
                 crate::boot::load_boot_table(&mut self.device.cpu_mut().bus_mut(), address)?;
                 self.device.cpu_mut().set_pc(entry);
             }
-            // Nothing to load: the boot table is on its way over the wire.
+            // Nothing to preload: the host, bus or network supplies the image during boot.
             Load::Wire => {}
         }
         self.load = load;
@@ -601,16 +623,11 @@ impl Machine {
         Ok(())
     }
 
-    /// The clock the run loop measures with: the focused core's cycle count, or the device's own
-    /// while an Ethernet boot is in the picture. Core 0 is held for the whole of that boot -
-    /// the ROM's boot code runs in its place - so the core's counter stands still and cannot
-    /// pace a poll or end a cycle budget. The device's count then stays the clock for the rest
-    /// of the run, because two clocks in one run would let a budget measure against both.
-    /// The clock a run budget is measured against. A ROM boot spends device cycles on the bus
-    /// or the wire while the core it is booting is held and retires nothing, so the budget has
-    /// to be the device's cycle rather than the core's.
+    /// The clock a run budget and host polling measure against. A boot that holds core 0 spends
+    /// device cycles waiting for the host, bus or wire while the core retires nothing. Keep
+    /// that clock after release too, so a budget never switches between two counters.
     fn run_clock(&self) -> u64 {
-        if self.device.rom_booting() {
+        if self.device.boot_holds_core_zero() {
             self.device.cycle()
         } else {
             self.device.cpu().cycles()
@@ -1128,8 +1145,8 @@ impl Machine {
             Load::BootTable(table, address, _) => {
                 vec![(*address, address + table.len() as u32)]
             }
-            // Nothing was loaded from the command line, so no range is known in advance: what
-            // an Ethernet boot placed is whatever its frames carried.
+            // Nothing was loaded from the command line, so the boot image's ranges are not
+            // known in advance.
             Load::Wire => Vec::new(),
         }
     }
@@ -1187,6 +1204,11 @@ impl Machine {
                 "checksum_failures": boot.checksum_failures,
                 "entry": boot.entry,
                 "error": boot.error,
+            });
+        }
+        if hpi_boot_mode(self.profile, self.boot_mode) == Ok(true) {
+            state["hpi_boot"] = json!({
+                "entry": self.device.hpi_boot_entry(),
             });
         }
         if profile {
@@ -1399,6 +1421,26 @@ fn cio_handshake(image: &Image) -> Option<(u32, u32)> {
         .get("__CIOBUF_")
         .or_else(|| image.symbols.get("_CIOBUF_"))?;
     Some((*breakpoint, *buffer))
+}
+
+/// Whether the strapped boot mode is the C6455's HPI boot, a hardware boot that holds the CPU in
+/// reset until the host's DSPINT (SPRS276M section 2.4). The device-state block is what enables
+/// the port for it, so that is the profile fact it follows. The C6472's mode 1 is an HPI boot
+/// too, but a different protocol - the host releases the cores through BOOT_COMPLETE_STAT
+/// (SPRUEC6G section 4.3.2) - which this model does not have, so it is refused rather than run
+/// as if no boot were strapped.
+fn hpi_boot_mode(profile: &'static DeviceProfile, boot_mode: u8) -> Result<bool, String> {
+    if boot_mode != crate::hpi::BOOTMODE_HPI {
+        Ok(false)
+    } else if profile.has_device_config {
+        Ok(true)
+    } else {
+        Err(format!(
+            "boot mode {boot_mode} is the {}'s HPI boot (SPRUEC6G section 4.3.2), which this \
+             model does not implement",
+            profile.name
+        ))
+    }
 }
 
 /// The MAC port register base an Ethernet boot uses, when the strapped boot mode asks for one:
