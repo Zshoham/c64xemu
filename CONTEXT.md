@@ -88,6 +88,10 @@ It owns the halt rule and the state snapshot, so the batch runner, the console d
 the browser dashboard and the GDB stub all run through the same seam.
 _Avoid_: emulator, session, driver
 
+**Ethernet backend**:
+The host-side module that exchanges frames with the fabric: it admits live received frames when the MAC has room, retains every transmitted frame for capture, and keeps a separate bounded history for inspection. Its socket adapter moves datagrams, while the machine supplies the emulated clock and the fabric owns the MAC's silicon behavior.
+_Avoid_: network service, frame broker
+
 **halt rule**:
 The combination of a driver's breakpoints and the program's exit point into the fetch-halt
 set the CPU enforces, dropping the address the target sits on when it is about to move off

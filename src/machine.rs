@@ -14,15 +14,14 @@ use crate::cpu::Cpu;
 use crate::cpu::{CpuSnapshot, StatsCounters};
 use crate::device::{Device, DeviceProfile};
 use crate::elf::{Image, Segment};
-use crate::netio::{Bridge, HostLink};
-use crate::pcap;
+use crate::netio::{hex, Ethernet, EthernetFiles, HostLink, PollSchedule};
 use crate::romboot::BootParameters;
-use crate::system::Endian;
+use crate::system::{Endian, Fabric};
 use crate::trace::Trace;
 use crate::view::{SploopDump, UnitIssue};
 use clap::{Args, ValueEnum};
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -155,15 +154,6 @@ enum Load {
     Wire,
 }
 
-const ETHERNET_HISTORY_LIMIT: usize = 256;
-
-struct EthernetPacket {
-    sequence: u64,
-    cycle: u64,
-    incoming: bool,
-    bytes: Vec<u8>,
-}
-
 /// One core's state as the device sees it from outside, for a front end listing the cores.
 #[derive(Clone, serde::Serialize)]
 pub struct CoreSummary {
@@ -219,32 +209,12 @@ pub struct Machine {
     cio: Option<(u32, u32)>,
     /// Everything the program has written through CIO, for the state dump.
     cio_output: Vec<u8>,
-    bridge: Option<Bridge>,
+    ethernet: Ethernet,
     host_link: Option<HostLink>,
-    net_poll: u64,
-    /// Which of the device's MACs the backend's frames are delivered to.
-    net_port: usize,
-    next_net_poll: u64,
-    hpi_poll: u64,
-    next_hpi_poll: u64,
+    hpi_poll: PollSchedule,
     trace_exceptions: bool,
     profiling: bool,
     trace: Option<(PathBuf, bool, Option<usize>, u64)>,
-    pcap_in: Option<Vec<Vec<u8>>>,
-    pcap_out: Option<PathBuf>,
-    /// Transmitted frames drained from the MAC that no backend has taken, and how many of
-    /// them the Ethernet backend has already been handed.
-    transmitted: Vec<Vec<u8>>,
-    sent_to_bridge: usize,
-    /// Frames the backend delivered that the MAC's receive FIFO had no room for yet. The host
-    /// socket delivers as fast as the peer writes; the modelled wire does not, so a frame waits
-    /// here rather than being counted as an overrun.
-    pending_receive: VecDeque<Vec<u8>>,
-    /// Recent frames in wire order for the dashboard. This is deliberately separate from
-    /// `transmitted`: packet capture files remain complete while the live view stays bounded.
-    ethernet_history: VecDeque<EthernetPacket>,
-    next_ethernet_sequence: u64,
-    ethernet_history_enabled: bool,
     /// Where the program ends: `--stop-pc`, or C$$EXIT, or abort.
     stop: Option<u32>,
     /// Driver-owned breakpoint addresses retained for arming, resume and reload.
@@ -331,10 +301,6 @@ impl Machine {
             )),
             None => None,
         };
-        let pcap_in = match &args.pcap_in {
-            Some(path) => Some(pcap::read(path)?),
-            None => None,
-        };
         let profile = DeviceProfile::named(&args.device)
             .ok_or_else(|| format!("unknown device {}", args.device))?;
         let i2c_eeprom = match &args.i2c_eeprom {
@@ -382,19 +348,21 @@ impl Machine {
             by_address,
             cio,
             cio_output: Vec::new(),
-            bridge: match &args.net_unix {
-                Some(path) => Some(Bridge::bind(path, args.net_peer.as_deref())?),
-                None => None,
-            },
+            ethernet: Ethernet::open(
+                args.net_poll,
+                net_port,
+                EthernetFiles {
+                    pcap_in: args.pcap_in.as_deref(),
+                    pcap_out: args.pcap_out.as_deref(),
+                    socket: args.net_unix.as_deref(),
+                    peer: args.net_peer.as_deref(),
+                },
+            )?,
             host_link: match &args.hpi_unix {
                 Some(path) => Some(HostLink::bind(path, args.hpi_peer.as_deref())?),
                 None => None,
             },
-            net_poll: args.net_poll,
-            net_port,
-            next_net_poll: 0,
-            hpi_poll: args.hpi_poll,
-            next_hpi_poll: 0,
+            hpi_poll: PollSchedule::new(args.hpi_poll),
             trace_exceptions: args.trace_exceptions,
             profiling: args.profile,
             trace: args.trace.as_ref().map(|path| {
@@ -405,14 +373,6 @@ impl Machine {
                     args.trace_start,
                 )
             }),
-            pcap_in,
-            pcap_out: args.pcap_out.clone(),
-            transmitted: Vec::new(),
-            sent_to_bridge: 0,
-            pending_receive: VecDeque::new(),
-            ethernet_history: VecDeque::new(),
-            next_ethernet_sequence: 0,
-            ethernet_history_enabled: false,
             stop: None,
             breakpoints: Vec::new(),
             initial_breakpoints: Vec::new(),
@@ -428,7 +388,7 @@ impl Machine {
             }
             // A capture file cannot be the Ethernet boot's source: the boot code resets the MAC
             // before it configures it, so frames handed over before the announcement are gone.
-            if machine.pcap_in.is_some() && machine.i2c_eeprom.is_none() {
+            if machine.ethernet.has_preload() && machine.i2c_eeprom.is_none() {
                 return Err(
                     "--pcap-in frames arrive before an Ethernet boot has configured the \
                             MAC and are lost with its reset; drive the boot through --net-unix"
@@ -500,24 +460,12 @@ impl Machine {
             by_address: Vec::new(),
             cio: None,
             cio_output: Vec::new(),
-            bridge: None,
+            ethernet: Ethernet::offline(),
             host_link: None,
-            net_poll: 1,
-            net_port: 0,
-            next_net_poll: 0,
-            hpi_poll: 1,
-            next_hpi_poll: 0,
+            hpi_poll: PollSchedule::new(1),
             trace_exceptions: false,
             profiling: false,
             trace: None,
-            pcap_in: None,
-            pcap_out: None,
-            transmitted: Vec::new(),
-            sent_to_bridge: 0,
-            pending_receive: VecDeque::new(),
-            ethernet_history: VecDeque::new(),
-            next_ethernet_sequence: 0,
-            ethernet_history_enabled: false,
             stop: None,
             breakpoints: Vec::new(),
             initial_breakpoints: Vec::new(),
@@ -549,8 +497,9 @@ impl Machine {
     /// line asked, and the trace sink carried across so a restart keeps recording.
     pub fn reload(&mut self) -> Result<(), String> {
         let trace = std::mem::replace(self.device.cpu_mut().trace_mut(), Trace::off());
-        self.ethernet_history.clear();
-        self.next_ethernet_sequence = 0;
+        // Frames the old device transmitted belong in the TX archive before it is rebuilt.
+        self.with_ethernet(Ethernet::collect);
+        self.ethernet.reset_history();
         // Rebuilding the device also rebuilds its CPUs, including their fetch-halt sets.
         let result = self.install();
         self.install_halt(false);
@@ -570,8 +519,8 @@ impl Machine {
         self.device = Device::with_boot_mode(self.profile, self.entry, endian, self.boot_mode);
         let profiling = self.profiling;
         self.device.cpu_mut().set_profiling(profiling);
-        self.next_net_poll = 0;
-        self.next_hpi_poll = 0;
+        self.ethernet.reset_poll();
+        self.hpi_poll.reset();
         // The board's fused Ethernet address: what the ROM's Ethernet boot names itself by, and
         // what any firmware reads out of the MAC ID words (SPRS612G Table 3-2).
         self.device.fabric().fuse_mac_id(self.mac_id);
@@ -627,11 +576,7 @@ impl Machine {
             Load::Wire => {}
         }
         self.load = load;
-        let pcap_frames = self.pcap_in.as_ref().map_or(0, Vec::len);
-        for index in 0..pcap_frames {
-            let frame = self.pcap_in.as_ref().unwrap()[index].clone();
-            self.inject_network_frame(frame);
-        }
+        self.with_ethernet(Ethernet::preload);
         if let Some((path, json, ring, start)) = self.trace.clone() {
             self.open_trace(&path, json, ring, start)
                 .map_err(|error| format!("{}: {error}", path.display()))?;
@@ -640,13 +585,13 @@ impl Machine {
     }
 
     fn step(&mut self) -> Result<(), String> {
-        self.service_network();
+        self.with_ethernet(Ethernet::service);
         self.service_host_port();
         self.pump_cio()?;
         // Every core out of reset runs this cycle, and the shared peripherals advance once.
         self.device.step_cycle();
-        if self.ethernet_history_enabled {
-            self.collect_frames();
+        if self.ethernet.history_enabled() {
+            self.with_ethernet(Ethernet::collect);
         }
         if self.trace_exceptions {
             if let Some(cause) = self.device.cpu_mut().take_exception_cause() {
@@ -672,51 +617,21 @@ impl Machine {
         }
     }
 
-    /// Poll on a cycle boundary rather than from a thread: the run loop owns the MAC.
-    fn service_network(&mut self) {
-        if self.bridge.is_none() || self.run_clock() < self.next_net_poll {
-            return;
-        }
-        self.next_net_poll = self.run_clock() + self.net_poll;
-        let received = self.bridge.as_mut().unwrap().receive();
-        self.pending_receive.extend(received);
-        // The backend's socket has no rate of its own, so a frame delivered while the receive
-        // FIFO is full would be an overrun the modelled 100 Mbit/s line could never have
-        // produced that fast: it waits here until the MAC has room, which is what the wire
-        // itself would have done.
-        let port = self.net_port;
-        while let Some(length) = self.pending_receive.front().map(Vec::len) {
-            if !self
-                .device
-                .cpu_mut()
-                .bus_mut()
-                .emac_rx_has_room(port, length)
-            {
-                break;
-            }
-            let frame = self.pending_receive.pop_front().expect("frame");
-            self.inject_network_frame(frame);
-        }
-        self.collect_frames();
-        if let Some(bridge) = self.bridge.as_mut() {
-            for frame in &self.transmitted[self.sent_to_bridge..] {
-                bridge.send(frame);
-            }
-            self.sent_to_bridge = self.transmitted.len();
-            // Frames a full peer socket refused earlier go out here even if the firmware
-            // transmitted nothing this poll.
-            bridge.flush();
-        }
+    /// The Ethernet backend with the device's fabric and the run clock it measures by. The
+    /// machine chooses the clock; the backend owns poll scheduling and frame lifetimes.
+    fn with_ethernet<R>(
+        &mut self,
+        operation: impl FnOnce(&mut Ethernet, &mut Fabric, u64) -> R,
+    ) -> R {
+        let cycle = self.run_clock();
+        operation(&mut self.ethernet, self.device.fabric(), cycle)
     }
 
     fn service_host_port(&mut self) {
-        if self.host_link.is_none() {
+        let cycle = self.run_clock();
+        if self.host_link.is_none() || !self.hpi_poll.take_due(cycle) {
             return;
         }
-        if self.run_clock() < self.next_hpi_poll {
-            return;
-        }
-        self.next_hpi_poll = self.run_clock() + self.hpi_poll;
         let Some(link) = self.host_link.as_mut() else {
             return;
         };
@@ -779,62 +694,13 @@ impl Machine {
         Ok(handled)
     }
 
-    /// Frames the program has transmitted and no backend has taken. Draining the MAC's queue
-    /// is destructive, so what is drained is kept here: a mid-session state dump and the pcap
-    /// written at exit then report the same frames rather than stealing them from each other.
-    fn collect_frames(&mut self) {
-        for frame in self.device.cpu_mut().bus_mut().take_tx_frames() {
-            self.record_ethernet(false, &frame);
-            self.transmitted.push(frame);
-        }
-    }
-
-    fn inject_network_frame(&mut self, frame: Vec<u8>) {
-        self.record_ethernet(true, &frame);
-        let port = self.net_port;
-        self.device.cpu_mut().bus_mut().inject_frame_on(port, frame);
-    }
-
     pub(crate) fn enable_ethernet_history(&mut self) {
-        self.ethernet_history_enabled = true;
-        self.ethernet_history.clear();
-        self.next_ethernet_sequence = 0;
-        let pcap_frames = self.pcap_in.as_ref().map_or(0, Vec::len);
-        for index in 0..pcap_frames {
-            let frame = self.pcap_in.as_ref().unwrap()[index].clone();
-            self.record_ethernet(true, &frame);
-        }
-    }
-
-    fn record_ethernet(&mut self, incoming: bool, bytes: &[u8]) {
-        if !self.ethernet_history_enabled {
-            return;
-        }
-        if self.ethernet_history.len() == ETHERNET_HISTORY_LIMIT {
-            self.ethernet_history.pop_front();
-        }
-        self.ethernet_history.push_back(EthernetPacket {
-            sequence: self.next_ethernet_sequence,
-            cycle: self.run_clock(),
-            incoming,
-            bytes: bytes.to_vec(),
-        });
-        self.next_ethernet_sequence = self.next_ethernet_sequence.wrapping_add(1);
+        let cycle = self.run_clock();
+        self.ethernet.enable_history(cycle);
     }
 
     pub(crate) fn ethernet_history_json(&mut self) -> Value {
-        self.collect_frames();
-        json!(self
-            .ethernet_history
-            .iter()
-            .map(|packet| json!({
-                "sequence": packet.sequence,
-                "cycle": packet.cycle,
-                "direction": if packet.incoming { "rx" } else { "tx" },
-                "length": packet.bytes.len(),
-                "hex": hex(&packet.bytes),
-            }))
-            .collect::<Vec<_>>())
+        self.with_ethernet(Ethernet::history_json)
     }
 
     /// Flushes the trace and writes any captured frames. Every front end calls this on the way
@@ -842,18 +708,7 @@ impl Machine {
     /// behind as a batch run.
     pub fn finish(&mut self) -> Result<(), String> {
         self.device.cpu_mut().trace_mut().flush();
-        self.collect_frames();
-        if let Some(bridge) = self.bridge.as_mut() {
-            // Anything still queued when the program exits still belongs on the wire.
-            for frame in &self.transmitted[self.sent_to_bridge..] {
-                bridge.send(frame);
-            }
-            self.sent_to_bridge = self.transmitted.len();
-        }
-        if let Some(path) = &self.pcap_out {
-            pcap::write(path, &self.transmitted)?;
-        }
-        Ok(())
+        self.with_ethernet(Ethernet::finish)
     }
 
     /// Bytes written through the TI RTS CIO channel during this run.
@@ -926,7 +781,7 @@ impl Machine {
     fn run_until_stop(&mut self, conditions: &mut [StopCondition]) -> Result<StopReason, String> {
         let start_cycles = self.run_clock();
         let start_packets = self.device.cpu_mut().packets_executed();
-        if !self.ethernet_history_enabled && !self.trace_exceptions {
+        if !self.ethernet.history_enabled() && !self.trace_exceptions {
             if let [StopCondition::Budget(budget)] = conditions {
                 return self.resume_budget(start_cycles, *budget);
             }
@@ -995,16 +850,16 @@ impl Machine {
                 return Ok(StopReason::Budget);
             }
 
-            self.service_network();
+            self.with_ethernet(Ethernet::service);
             self.service_host_port();
             let handled_cio = self.pump_cio()?;
 
             let mut batch = 4096u64;
-            if self.bridge.is_some() {
-                batch = batch.min(self.next_net_poll.saturating_sub(current).max(1));
+            if let Some(delay) = self.ethernet.poll_delay(current) {
+                batch = batch.min(delay);
             }
             if self.host_link.is_some() {
-                batch = batch.min(self.next_hpi_poll.saturating_sub(current).max(1));
+                batch = batch.min(self.hpi_poll.delay(current));
             }
             if let Some(limit) = deadline {
                 batch = batch.min(limit.saturating_sub(current).max(1));
@@ -1282,8 +1137,13 @@ impl Machine {
     /// The machine state a batch run reports, and the same JSON the debugger's `state` command
     /// writes: one description of a finished program, whoever ran it.
     pub fn state_json(&mut self, profile: bool) -> Value {
-        self.collect_frames();
-        let net_dropped = self.bridge.as_ref().map_or(0, Bridge::dropped);
+        let tx_frames: Vec<String> = self.with_ethernet(|ethernet, fabric, cycle| {
+            ethernet
+                .transmitted(fabric, cycle)
+                .iter()
+                .map(|frame| hex(frame))
+                .collect()
+        });
         let snapshot = self.snapshot();
         let mut registers = serde_json::Map::with_capacity(64);
         for (bank, file) in [('A', snapshot.core.a), ('B', snapshot.core.b)] {
@@ -1301,8 +1161,8 @@ impl Machine {
             "exit_code": snapshot.exit_code,
             "registers": registers,
             "cio_output": String::from_utf8_lossy(&self.cio_output),
-            "tx_frames": self.transmitted.iter().map(|frame| hex(frame)).collect::<Vec<_>>(),
-            "net_dropped": net_dropped,
+            "tx_frames": tx_frames,
+            "net_dropped": self.ethernet.dropped(),
             "device": snapshot.device,
             "cores": snapshot.cores,
             "stats": snapshot.stats,
@@ -1605,15 +1465,6 @@ fn host_port(code: u8) -> Option<crate::hpi::HostPort> {
     }
 }
 
-fn hex(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        output.push(HEX[(byte >> 4) as usize] as char);
-        output.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    output
-}
 #[cfg(test)]
 mod tests {
     use super::*;

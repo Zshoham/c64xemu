@@ -2,9 +2,9 @@
 
 The EMAC, the MDIO module and the host backends behind them: `src/emac.rs` holds the MAC and its
 two DMA engines, `src/mdio.rs` the management interface and the PHY on the other end of it,
-`src/emic.rs` the C6472's per-core interrupt-control module, and `src/netio.rs` and `src/pcap.rs`
-the two ways a frame reaches something outside the emulator. This document is the model; the
-operator's view of the backends — which flag opens which socket, how to drive a peer — is
+`src/emic.rs` the C6472's per-core interrupt-control module, and `src/netio.rs` the Ethernet
+backend, including its concrete socket adapter and pcap I/O through `src/pcap.rs`. This document
+is the model; the operator's view — which flag opens which socket, how to drive a peer — is
 [Networking and host I/O](../guide/networking-and-host-io.md).
 
 ## Where the modules sit
@@ -371,27 +371,35 @@ the divider in CONTROL is stored and never consulted.
 
 ## How a frame crosses to the host
 
+The Ethernet backend, `Ethernet` in `src/netio.rs`, owns host-side frame lifetimes. The machine
+supplies its clock and asks for polling, inspection or finish; the fabric retains the MAC's
+descriptor, DMA and interrupt behavior. The concrete Unix-datagram `Bridge` is private to the
+backend, not a second interface front ends must coordinate.
+
 Transmit. `process_tx` pushes the assembled packet onto the MAC's `transmitted` vector.
-`Fabric::take_tx_frames` drains every MAC, `Machine::collect_frames` moves what it drained into
-the machine's own list — draining the MAC is destructive, so a state dump and the pcap written at
-exit report the same frames instead of stealing them from each other — and records each into the
-Ethernet history the dashboard reads. From there `Bridge::send` writes one datagram per frame to
-the peer socket, and `pcap::write` writes the whole list at `finish()`.
+`Ethernet::collect` drains every MAC through `Fabric::take_tx_frames`, retains the complete
+archive and records each frame into the separate bounded history the dashboard reads.
+Inspection does not consume the archive or advance the send cursor. Polling and finish share
+one handoff path, so repeated state dumps or finish calls do not resend frames. `pcap::write`
+writes the complete archive at finish, regardless of live-history eviction.
 
-Receive. `Bridge::receive` reads every datagram waiting on the socket, dropping anything shorter
-than an Ethernet header, and the frames go into `pending_receive`. They leave it only while
-`emac_rx_has_room` says the MAC's FIFO can take the next one, which is the back-pressure a real
-wire would have applied; `inject_frame_on` then hands it to the MAC's port. `--pcap-in` frames are
-injected at load instead, all at once.
+Receive. The socket adapter reads every waiting datagram, dropping anything shorter than an
+Ethernet header. The backend retains those frames until `Fabric::emac_rx_has_room` says the
+selected MAC's FIFO can take the next one, then `inject_frame_on` delivers it. `--pcap-in`
+frames are injected at load instead, all at once. Enabling history records that preload
+without injecting it again.
 
-The run loop looks on a cycle boundary, not from a thread: `service_network` is called from
-`Machine::resume_budget` and returns immediately unless the run clock has reached
-`next_net_poll`, which advances by `--net-poll` cycles (default 1024) each time. The batch of
-cycles the loop hands the CPU is clipped so it cannot run past the next poll. The clock is the
-focused core's cycle count, or the device's while a ROM boot holds core 0 — a held core retires
-nothing and could not pace a poll. One poll drains the socket, delivers what fits, collects
-transmitted frames, sends them, and flushes anything a full peer socket refused earlier.
-`--net-port` chooses which MAC of a C6472 the backend is wired to.
+The run loop polls on a cycle boundary, not from a thread. `Ethernet::service` does nothing
+until its `PollSchedule` is due, then advances it by `--net-poll` cycles (default 1024). The
+machine uses `poll_delay` to clip each batch to the next poll without inspecting socket or
+queue state; the HPI host link clips with its own `PollSchedule` the same way. The clock
+remains the focused core's cycle count, or the device's while a ROM boot holds core 0. One
+poll drains the socket, delivers what fits, collects transmitted frames, sends them, and
+flushes anything a full peer socket refused earlier. `--net-port` selects the MAC.
+
+Reload first collects what the old fabric transmitted, then preserves the host backlog, socket
+and complete TX archive, while resetting the poll deadline and live-history sequence and
+preloading the `--pcap-in` frames into the rebuilt fabric.
 
 ## What the suite pins
 

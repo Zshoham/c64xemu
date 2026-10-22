@@ -448,7 +448,7 @@ Every file in `src/`.
 | `mcbsp.rs` | The two multichannel buffered serial ports |
 | `mdio.rs` | The MDIO module and the PHY on the other end of it |
 | `memory.rs` | The memory hierarchy - L1P, L1D, L2, MAR bits, cache configuration - the backing store, and access timing |
-| `netio.rs` | The live host backends: the Ethernet `Bridge` and the HPI `HostLink`, both Unix datagram sockets |
+| `netio.rs` | The Ethernet backend: receive admission, TX capture and handoff, live history and polling, with a private Unix-datagram `Bridge`; the separate HPI `HostLink` adapter |
 | `pcap.rs` | pcap file reading and writing |
 | `pll.rs` | The PLL1 controller with its reset controller register, and PLL2 |
 | `port.rs` | The slave-port seam: `SlavePort`, `PortContext`, `PortWrite` |

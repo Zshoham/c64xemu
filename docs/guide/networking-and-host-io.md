@@ -9,9 +9,10 @@ The EMAC model itself — descriptor rings, filtering, interrupts — is
 ## Why Unix datagram sockets
 
 The emulator is single-threaded and cycle-stepped while a host network is asynchronous, so
-`src/netio.rs` polls the socket from the run loop at a fixed cycle interval and never touches
-descriptor memory itself: the frames it collects go through the same `inject_frame` path a pcap
-replay uses.
+the Ethernet backend in `src/netio.rs` polls the socket from the run loop at a fixed cycle
+interval and never touches descriptor memory itself: live frames and pcap input both enter
+through the fabric's MAC operations. The backend also owns transmit capture and bounded live
+history, so inspection cannot consume frames needed by the socket or the capture file.
 
 Keeping the socket here rather than opening a TAP device keeps the emulator free of ioctl
 bindings and of any privilege requirement. `tests/tools/tap_bridge.py` owns `/dev/net/tun` and

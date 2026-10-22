@@ -2675,29 +2675,14 @@ impl<'a> CoreBus<'a> {
         self.fabric.mm[self.core].interrupt_selectors()
     }
 
-    /// The host port, the Ethernet backend and the PHY are the device's, not this core's, but
-    /// a front end reaches them through whichever core it is driving.
+    /// The host port belongs to the device, not this core, but a front end reaches it through
+    /// whichever core it is driving.
     pub(crate) fn hpi_host_read(&mut self, port: HostPort) -> Option<u32> {
         self.fabric.hpi_host_read(port)
     }
 
     pub(crate) fn hpi_host_write(&mut self, port: HostPort, value: u32) {
         self.fabric.hpi_host_write(port, value);
-    }
-
-    pub(crate) fn take_tx_frames(&mut self) -> Vec<Vec<u8>> {
-        self.fabric.take_tx_frames()
-    }
-
-    /// Deliver a received frame to one of the device's MACs, which is the port the front end's
-    /// Ethernet backend is wired to.
-    pub(crate) fn inject_frame_on(&mut self, port: usize, frame: Vec<u8>) {
-        self.fabric.inject_frame_on(port, frame);
-    }
-
-    /// Whether the MAC the backend is wired to can take a frame of this length now.
-    pub(crate) fn emac_rx_has_room(&self, port: usize, length: usize) -> bool {
-        self.fabric.emac_rx_has_room(port, length)
     }
 
     /// Drive one conformance-vector operation at the device through this core.
