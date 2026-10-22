@@ -746,9 +746,8 @@ impl Machine {
     ///
     /// The core that answers is the one that reached the trap, which is not always the focused
     /// one: the handshake is per core while the buffer is a single address in the image.
-    /// Servicing only the focused core left every other core parked on the trap for good - the
-    /// run loop could not advance it, since the next batch found it due again at step 0, and
-    /// the guard that steps the focused core on the spot did not touch it.
+    /// Servicing only the focused core left every other core parked on the trap for good: the
+    /// next batch found it due again at its first cycle, so the run loop could never advance it.
     fn pump_cio(&mut self) -> Result<bool, String> {
         let Some((breakpoint, buffer)) = self.cio else {
             return Ok(false);
@@ -1011,17 +1010,7 @@ impl Machine {
                 batch = batch.min(limit.saturating_sub(current).max(1));
             }
             let cio = self.cio.map(|(breakpoint, _)| breakpoint);
-            let advanced = self.device.run_cycles(batch, cio, handled_cio);
-            if advanced == 0 {
-                // A newly reached CIO boundary or halt is handled at the top of the next pass.
-                // Stepping here is only a guard against an inconsistent boundary predicate.
-                if !cio.is_some_and(|address| self.device.cpu_mut().ready_to_fetch_at(address))
-                    && !self.device.cpu_mut().halted()
-                    && self.device.cpu_mut().fault().is_none()
-                {
-                    self.device.cpu_mut().step_cycle();
-                }
-            }
+            self.device.run_cycles(batch, cio, handled_cio);
         }
     }
 
@@ -1934,38 +1923,54 @@ mod tests {
         assert_eq!(machine.resume(&mut []).unwrap(), StopReason::Exit);
     }
 
-    /// The core that reached the CIO handshake answers it, whichever one that is. Servicing
-    /// only the focused core parked every other core on the trap for good - a secondary core's
-    /// `printf` on a C6472 never came back, because the run loop could not advance it.
+    /// The core that reached the CIO handshake answers it, whichever one that is, and both the
+    /// batched and the stepped run loop carry it on to the budget. Servicing only the focused
+    /// core parked every other core on the trap for good - a secondary core's `printf` on a
+    /// C6472 never came back, because the run loop could not advance it.
     #[test]
-    fn cio_is_answered_on_the_core_that_reached_the_trap() {
+    fn running_through_nonfocused_cio_reaches_the_cycle_budget() {
         const TRAP: u32 = 0x0080_0200;
         const BUFFER: u32 = 0x0080_1000;
-
-        let mut machine = Machine::bare(Cpu::new(0));
-        machine.device = Device::with_boot_mode(&crate::device::C6472, 0, Endian::Little, 0);
-
-        // A DT_WRITE request as the TI runtime lays one out: a length, the command, the file
-        // descriptor, the byte count and the data.
-        let mut request = Vec::new();
-        request.extend_from_slice(&5u32.to_le_bytes());
-        request.push(0xf3);
-        request.extend_from_slice(&1i16.to_le_bytes());
-        request.extend_from_slice(&5u16.to_le_bytes());
-        request.extend_from_slice(&[0; 4]);
-        request.extend_from_slice(b"hello");
-        machine
-            .device
-            .with_core(1, |cpu| cpu.host_write_bytes(BUFFER, &request));
-
-        machine.cio = Some((TRAP, BUFFER));
-        machine.device.with_core(0, |cpu| cpu.set_pc(0x40));
-        machine.device.with_core(1, |cpu| cpu.set_pc(TRAP));
-
-        assert!(machine.pump_cio().unwrap(), "no core was serviced");
-        assert_eq!(machine.cio_output(), b"hello");
-        assert_eq!(machine.focus(), 0, "servicing moved the focus");
-        assert_eq!(machine.device.core(0).pc(), 0x40, "the focused core moved");
-        assert_eq!(machine.device.core(1).pc(), TRAP, "the answered core moved");
+        for batched in [false, true] {
+            let mut machine = Machine::bare(Cpu::new(0));
+            machine.device = Device::new(&crate::device::C6472, 0, Endian::Little);
+            for core in 0..machine.device.cores() {
+                machine.device.with_core(core, |cpu| {
+                    cpu.write_words(0, &[0; 32]);
+                    cpu.set_pc(0x40);
+                });
+            }
+            let mut request = Vec::new();
+            request.extend_from_slice(&5u32.to_le_bytes());
+            request.push(0xf3);
+            request.extend_from_slice(&1i16.to_le_bytes());
+            request.extend_from_slice(&5u16.to_le_bytes());
+            request.extend_from_slice(&[0; 4]);
+            request.extend_from_slice(b"hello");
+            machine.device.with_core(1, |cpu| {
+                cpu.write_words(TRAP - 4, &[0; 16]);
+                cpu.host_write_bytes(BUFFER, &request);
+                cpu.set_pc(TRAP - 4);
+            });
+            machine.cio = Some((TRAP, BUFFER));
+            let mut conditions = vec![StopCondition::Budget(4)];
+            if !batched {
+                conditions.push(StopCondition::Packets(100));
+            }
+            assert_eq!(machine.run(&mut conditions).unwrap(), StopReason::Budget);
+            assert_eq!(machine.cio_output(), b"hello");
+            assert_eq!(machine.focus(), 0);
+            assert_eq!(machine.device.cycle(), 4);
+            assert_eq!(machine.cycles(), 4);
+            assert_eq!(machine.pc(), 0x50);
+            assert_eq!(machine.device.core(1).cycles(), 4);
+            assert_eq!(machine.device.core(1).pc(), TRAP + 12);
+            assert_eq!(
+                machine
+                    .device
+                    .with_core(1, |cpu| cpu.host_read_bytes(BUFFER, 6)),
+                [0, 0, 0, 0, 5, 0]
+            );
+        }
     }
 }

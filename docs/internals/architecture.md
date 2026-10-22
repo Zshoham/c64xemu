@@ -161,6 +161,11 @@ entry, a boot-controller release). Both predicates read only a core's own state,
 else changes inside a batch, so the masks always equal a fresh scan. Held-in-reset is fabric
 state and is read at the moment of the test, as the halt rule requires.
 
+For a positive request, a zero count means a batch boundary is already due, or the single
+core already has a fault. The machine returns to its stop checks and CIO handshake; it never
+repairs progress by stepping a CPU itself. CIO readiness deliberately includes held cores,
+matching the handshake scan, and answering it exempts the first device cycle of the next batch.
+
 Cores in the same cycle run in index order, and the ones that follow see the peripheral state
 the first core has already produced. Six cores are concurrent on silicon; this ordering is a
 choice the hardware does not make, taken because it is deterministic, which is worth more to a
@@ -424,7 +429,7 @@ Every file in `src/`.
 | `decode_cli.rs` | The `decode` subcommand |
 | `decoder.rs` | Family identification for 32-bit and compact encodings |
 | `devcfg.rs` | The C6455's chip-level and device-state control registers |
-| `device.rs` | The device profile, and `Device`: cores, focus, `step_cycle`, ROM boot strapping |
+| `device.rs` | The device profile, and `Device`: cores, focus, `step_cycle`/`run_cycles`, batch progress, ROM boot strapping |
 | `edma.rs` | The EDMA3 channel controller: PaRAM, shadow regions, queues, interrupts |
 | `edma_tc.rs` | The four EDMA3 transfer controllers |
 | `elf.rs` | C6000 EABI ELF loading: segments and symbols |

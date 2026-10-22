@@ -469,6 +469,11 @@ impl Device {
     /// except on the first cycle when `ignore_cio_once` says the machine has just answered
     /// that handshake and the core is still sitting on it.
     ///
+    /// For a nonzero request, zero means a boundary is already due (or the single core
+    /// already has a fault). Otherwise the device advances without caller-side stepping.
+    /// CIO includes held cores, matching the machine's handshake scan; its first-cycle
+    /// exemption still advances a device cycle even when the core at CIO cannot run.
+    ///
     /// A single core with no ROM boot runs itself: `Cpu::run_cycles` is the fast path, it ticks
     /// the device from inside its own cycle and counts in the core's cycles, and it leaves the
     /// device's cycle counter alone. Six cores, or a ROM boot - which is device state, and holds
@@ -713,6 +718,8 @@ mod tests {
         // exemption, and where the batch ends.
         type Case<'a> = (&'a [(usize, u32)], Option<u32>, bool, u64);
         let cases: &[Case] = &[
+            // An already-halted running core prevents any cycle, even with CIO exempted.
+            (&[(0, entry)], Some(entry), true, 0),
             // Core 3 is released onto its armed address after the first cycle.
             (&[(3, start)], None, false, 1),
             // A held core on an armed address is not a halt.
@@ -736,6 +743,33 @@ mod tests {
             }
             assert_eq!(batched.halted_core(), stepped.halted_core());
         }
+    }
+
+    #[test]
+    fn single_core_batches_report_existing_boundaries_without_advancing() {
+        let entry = 0x0080_0000;
+        let mut device = Device::new(&C6455, entry, Endian::Little);
+        device.cpu_mut().write_words(entry, &[0, 0x5645_4314]);
+        assert_eq!(device.run_cycles(0, None, false), 0);
+        assert_eq!(device.run_cycles(4, Some(entry), false), 0);
+        assert_eq!(device.cpu().cycles(), 0);
+        assert_eq!(device.cpu().pc(), entry);
+
+        device.cpu_mut().set_stop_on_fetch(vec![entry]);
+        assert_eq!(device.run_cycles(4, Some(entry), true), 0);
+        assert!(device.halted_core().is_some());
+        assert_eq!(device.cpu().cycles(), 0);
+
+        device.cpu_mut().set_stop_on_fetch(Vec::new());
+        assert_eq!(device.run_cycles(1, Some(entry), true), 1);
+        assert_eq!(device.cpu().pc(), entry + 4);
+        assert!(device.run_cycles(4, None, false) > 0);
+        assert!(device.cpu().fault().is_some());
+        let cycles = device.cpu().cycles();
+        let pc = device.cpu().pc();
+        assert_eq!(device.run_cycles(4, None, false), 0);
+        assert_eq!(device.cpu().cycles(), cycles);
+        assert_eq!(device.cpu().pc(), pc);
     }
 
     /// A held core executes nothing, but its memories still answer: that is how a host, or

@@ -383,7 +383,7 @@ pub struct Cpu {
     /// execution leaves it off; interactive front ends turn it on when they display the view.
     issue_view_enabled: bool,
     /// Addresses the CPU refuses to fetch at. When the PC reaches one with a clean pipeline
-    /// the CPU halts - `step_cycle` becomes a no-op - so a caller observes
+    /// the CPU halts - `step` becomes a no-op - so a caller observes
     /// `ready_to_fetch_at(address)` reliably, including when a branch resolves directly onto
     /// the address, which would otherwise fetch and advance past it in the same cycle.
     stop_on_fetch: Vec<u32>,
@@ -516,6 +516,7 @@ impl Cpu {
             }
         });
     }
+    #[cfg(test)]
     pub fn step_cycle(&mut self) {
         self.with_bus(|cpu, bus| cpu.step(bus));
     }
