@@ -1,9 +1,10 @@
-//! The C6455's host port interface, both sides of it.
+//! The host port interface of the C6455 and the C6472, both sides of it.
 //!
-//! SPRU969B: the host owns HPIC, HPID and the two address registers, and reaches DSP memory
-//! through the HPI's own DMA logic; the CPU has read-only access to almost all of it and exactly
-//! three things it may write - the software reset that clears the FIFOs, the HINT bit that
-//! interrupts the host, and a one to DSPINT that acknowledges an interrupt from the host.
+//! SPRU969B (C6455) and SPRUEG1B (C6472): the host owns HPIC, HPID and the two address
+//! registers, and reaches the device through the HPI's own DMA logic; the CPU has read-only
+//! access to almost all of it and exactly three things it may write - the software reset that
+//! clears the FIFOs, the HINT bit that interrupts the host, and a one to DSPINT that
+//! acknowledges an interrupt from the host.
 //!
 //! The host side is driven from outside the device model rather than by a pin interface: a host
 //! access names one of the four types the HCNTL pins select (Table 4) and the model performs it
@@ -11,8 +12,8 @@
 //! HPIA registers and their autoincrement, single and dual HPIA mode, the eight-word FIFOs with
 //! their four-word bursts and documented flush conditions, and the two interrupt handshakes.
 
-use crate::emac::DmaMemory;
 use crate::port::{PortContext, PortWrite, SlavePort};
+use crate::system::Fabric;
 #[cfg(test)]
 const TEST_CONTEXT: PortContext = PortContext {
     endian: crate::system::Endian::Little,
@@ -39,12 +40,27 @@ const HPIC_HPIARWSEL: u32 = 1 << 11;
 const FIFO_WORDS: usize = 8;
 const BURST_WORDS: usize = 4;
 
-/// BOOTMODE[3:0] 0001b is the C6455's host boot through the HPI (SPRS276M section 2.4).
+/// BOOTMODE[3:0] 0001b is the host boot through the HPI on both devices (SPRS276M section 2.4 for
+/// the C6455, SPRUEC6G section 4.3.2 for the C6472).
 pub(crate) const BOOTMODE_HPI: u8 = 1;
 
 /// Where the CPU starts when an HPI boot releases it: "the internal L2 SRAM located at
 /// 0x80 0000" (SPRS276M section 2.4).
 pub(crate) const HPI_BOOT_ENTRY: u32 = 0x0080_0000;
+
+/// Whether, and how, the device was strapped to HPI boot.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HpiBoot {
+    /// Not strapped: HPIRST comes up set and the firmware opens the port.
+    #[default]
+    Off,
+    /// The C6455's boot: the host's first DSPINT takes the held core out of reset (SPRS276M
+    /// section 2.4).
+    DspintRelease,
+    /// The C6472's boot: the host releases each core through BOOT_COMPLETE_STAT, and DSPINT is
+    /// an ordinary interrupt (SPRUEC6G section 4.3.2).
+    BootController,
+}
 
 /// The access types the host selects on HCNTL[1:0] (SPRU969B Table 4).
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -68,8 +84,10 @@ pub struct Hpi {
     /// The CPU's software reset. While it is set the FIFOs are held clear and every host access
     /// is held off by HRDY (SPRU969B section 8.3).
     hpirst: bool,
-    /// The device was strapped to HPI boot and the host has not yet raised the DSPINT that
-    /// brings the CPU out of reset (SPRS276M section 2.4).
+    /// How the device was strapped. Strapped at all, HPIRST comes up clear so the host can
+    /// reach memory before any code has run (SPRUEG1B Figure 22).
+    strap: HpiBoot,
+    /// A `DspintRelease` boot whose held CPU the host's first DSPINT has not yet released.
     boot_pending: bool,
     /// Host-configured HPIC bits.
     hwob: bool,
@@ -95,12 +113,13 @@ pub struct Hpi {
 
 impl Hpi {
     /// Reset leaves both interrupts cleared. HPIRST "defaults to 0 when HPI boot is selected;
-    /// otherwise it defaults to 1" (SPRU969B Figure 31): a booting host has to reach memory
-    /// before any code has run to clear it.
-    pub fn new(boot: bool) -> Self {
+    /// otherwise it defaults to 1" (SPRU969B Figure 31, SPRUEG1B Figure 22): a booting host has
+    /// to reach memory before any code has run to clear it.
+    pub fn new(strap: HpiBoot) -> Self {
         Self {
-            hpirst: !boot,
-            boot_pending: boot,
+            hpirst: strap == HpiBoot::Off,
+            strap,
+            boot_pending: strap == HpiBoot::DspintRelease,
             ..Self::default()
         }
     }
@@ -114,9 +133,14 @@ impl Hpi {
         std::mem::take(&mut self.boot_pending)
     }
 
-    /// Whether the device is strapped to an HPI boot the host has not finished.
+    /// Whether the device is strapped to an HPI boot the host has not finished with DSPINT.
     pub(crate) fn boot_pending(&self) -> bool {
         self.boot_pending
+    }
+
+    /// Whether the device was strapped to an HPI boot at all.
+    pub(crate) fn strapped(&self) -> bool {
+        self.strap != HpiBoot::Off
     }
 }
 
@@ -172,7 +196,7 @@ impl Hpi {
     // ---- the host's side -------------------------------------------------------------------
 
     /// A host read cycle. Returns None while the software reset holds the host off.
-    pub fn host_read(&mut self, port: HostPort, memory: &mut impl DmaMemory) -> Option<u32> {
+    pub fn host_read(&mut self, port: HostPort, bus: &mut Fabric) -> Option<u32> {
         if self.hpirst {
             return None;
         }
@@ -194,22 +218,22 @@ impl Hpi {
                 // A read without autoincrementing flushes the read FIFO and fetches the
                 // addressed word itself (SPRU969B section 6.3).
                 self.flush_read();
-                memory.dma_read_u32(self.hpiar << 2)
+                Self::fetch(bus, self.hpiar)
             }
             HostPort::DataAutoIncrement => {
                 // Reading while posted writes are outstanding flushes them first in single-HPIA
                 // mode, which is what keeps the host from reading stale memory (section 6.3).
                 if !self.dual_hpia && !self.write_fifo.is_empty() {
-                    self.flush_write(memory);
+                    self.flush_write(bus);
                 }
                 if self.read_fifo.is_empty() {
                     self.prefetch = self.hpiar;
-                    self.fill_read(memory, FIFO_WORDS);
+                    self.fill_read(bus, FIFO_WORDS);
                 }
                 let value = self.read_fifo.pop_front().unwrap_or(0);
                 self.advance(true);
                 if FIFO_WORDS - self.read_fifo.len() >= BURST_WORDS {
-                    self.fill_read(memory, BURST_WORDS);
+                    self.fill_read(bus, BURST_WORDS);
                 }
                 value
             }
@@ -219,7 +243,7 @@ impl Hpi {
 
     /// A host write cycle. Returns true when the host-to-CPU interrupt fires on this access, so
     /// the caller can raise the system event.
-    pub fn host_write(&mut self, port: HostPort, value: u32, memory: &mut impl DmaMemory) -> bool {
+    pub fn host_write(&mut self, port: HostPort, value: u32, bus: &mut Fabric) -> bool {
         if self.hpirst {
             return false;
         }
@@ -234,7 +258,7 @@ impl Hpi {
                 if value & HPIC_FETCH != 0 {
                     // A prefetch command flushes the read FIFO and starts filling it again.
                     self.flush_read();
-                    self.fill_read(memory, FIFO_WORDS);
+                    self.fill_read(bus, FIFO_WORDS);
                 }
                 // A zero-to-one transition on DSPINT is the interrupt; while it stands, further
                 // host writes do nothing (SPRU969B section 5.1).
@@ -251,11 +275,11 @@ impl Hpi {
                         self.hpiar = value;
                         self.flush_read();
                     } else {
-                        self.flush_write(memory);
+                        self.flush_write(bus);
                         self.hpiaw = value;
                     }
                 } else {
-                    self.flush_write(memory);
+                    self.flush_write(bus);
                     self.flush_read();
                     self.hpiar = value;
                     self.hpiaw = value;
@@ -264,8 +288,8 @@ impl Hpi {
             HostPort::Data => {
                 // A write without autoincrementing is a flush condition, so it reaches memory
                 // itself rather than waiting for a burst.
-                self.flush_write(memory);
-                memory.dma_write_u32(self.hpiaw << 2, value);
+                self.flush_write(bus);
+                bus.master_write32(self.hpiaw << 2, value);
             }
             HostPort::DataAutoIncrement => {
                 if !self.dual_hpia && !self.read_fifo.is_empty() {
@@ -279,7 +303,7 @@ impl Hpi {
                 // The DMA is not asked for anything until four words are posted, and then it
                 // moves them as one burst (SPRU969B section 6.2).
                 if self.write_fifo.len() >= BURST_WORDS {
-                    self.flush_write(memory);
+                    self.flush_write(bus);
                 }
             }
         }
@@ -295,7 +319,7 @@ impl Hpi {
         port: HostPort,
         value: u16,
         second: bool,
-        memory: &mut impl DmaMemory,
+        bus: &mut Fabric,
     ) -> bool {
         if self.hpirst {
             return false;
@@ -311,7 +335,7 @@ impl Hpi {
         } else {
             (u32::from(first) << 16) | u32::from(value)
         };
-        self.host_write(port, word, memory)
+        self.host_write(port, word, bus)
     }
 
     /// One halfword of a 16-bit multiplexed read cycle. The first halfword performs the access
@@ -321,7 +345,7 @@ impl Hpi {
         &mut self,
         port: HostPort,
         second: bool,
-        memory: &mut impl DmaMemory,
+        bus: &mut Fabric,
     ) -> Option<u16> {
         if self.hpirst {
             return None;
@@ -329,7 +353,7 @@ impl Hpi {
         let word = if second {
             self.half_read.take()?
         } else {
-            let word = self.host_read(port, memory)?;
+            let word = self.host_read(port, bus)?;
             self.half_read = Some(word);
             word
         };
@@ -367,10 +391,10 @@ impl Hpi {
     }
 
     /// Posted writes are forced to memory, in order, from the address the first one belongs to.
-    fn flush_write(&mut self, memory: &mut impl DmaMemory) {
+    fn flush_write(&mut self, bus: &mut Fabric) {
         let words = std::mem::take(&mut self.write_fifo);
         for (index, word) in words.into_iter().enumerate() {
-            memory.dma_write_u32((self.write_base + index as u32) << 2, word);
+            bus.master_write32((self.write_base + index as u32) << 2, word);
         }
         self.write_base = self.hpiaw;
     }
@@ -381,24 +405,28 @@ impl Hpi {
         self.prefetch = self.hpiar;
     }
 
-    fn fill_read(&mut self, memory: &mut impl DmaMemory, words: usize) {
+    fn fill_read(&mut self, bus: &mut Fabric, words: usize) {
         for _ in 0..words.min(FIFO_WORDS - self.read_fifo.len()) {
-            let word = memory.dma_read_u32(self.prefetch << 2);
+            let word = Self::fetch(bus, self.prefetch);
             self.read_fifo.push_back(word);
             self.prefetch = self.prefetch.wrapping_add(1);
         }
+    }
+
+    /// One word the DMA logic reads at a word address. The HPI is a system master with
+    /// privilege ID 0; a read the memory protection refuses brings back zero.
+    fn fetch(bus: &mut Fabric, word_address: u32) -> u32 {
+        bus.master_read32(word_address << 2).unwrap_or(0)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::port::SlavePort;
-    use crate::system::Fabric;
 
     #[test]
     fn the_cpu_sees_the_documented_reset_state() {
-        let mut hpi = Hpi::new(false);
+        let mut hpi = Hpi::new(HpiBoot::Off);
         // HPIRST comes up set, both interrupts clear, and the CPU reads zero for FETCH and HRDY
         // whatever the host would see (SPRU969B Table 8 and Figure 31).
         assert_eq!(hpi.read(HPIC, TEST_CONTEXT), Some(HPIC_HPIRST));
@@ -409,7 +437,7 @@ mod tests {
 
     #[test]
     fn the_cpu_may_raise_the_host_interrupt_and_acknowledge_its_own() {
-        let mut hpi = Hpi::new(false);
+        let mut hpi = Hpi::new(HpiBoot::Off);
         hpi.write(HPIC, HPIC_HINT, TEST_CONTEXT);
         assert_eq!(hpi.read(HPIC, TEST_CONTEXT), Some(HPIC_HINT));
         // A write of zero to either interrupt bit does nothing; only the host clears HINT.

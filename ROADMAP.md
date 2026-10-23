@@ -1329,11 +1329,27 @@ device case additionally pins:
 - that the host cannot raise another DSPINT until the application clears it, after which it is
   an ordinary interrupt.
 
-**[-] SRIO, UTOPIA and C6472 HPI boot.** SRIO still lacks a device model; UTOPIA's ATM master
-speaks the bus but not its boot protocol. The C6472's HPI boot (SPRUEC6G section 4.3.2) releases
-cores through BOOT_COMPLETE_STAT, a different protocol from the C6455's. `--device c6472
---boot-mode 1` is refused rather than run as if no boot were strapped. Not modelled either: the
-DSPINT event SPRS276M says HPI boot also records in EDMA ER bit 0.
+**[x] C6472 HPI boot.** *Done.* Mode 1 holds all six cores with HPIRST clear and the boot cache
+configuration on every core (SPRUEC6G section 4.3.2 and Table 21). HPI word accesses reach
+chip-level peripheral registers as well as memory, checked by memory protection as privilege
+ID 0; the megamodules' own registers stay the CPU's alone (SPRU871K section 5.3.1), for the
+HPI, the EDMA, the EMAC and the IDMA alike. The host loads each core through its global aliases,
+programs `DSP_BOOT_ADDRn`, then releases selected cores by setting their `BOOT_COMPLETE_STAT`
+bits. DSPINT is not a release mechanism on this device.
+
+`tests/tools/hpi_host.py --device c6472 --boot` loads and verifies ELF segments, including zero
+fill, for all six cores or a `--cores` subset, replicating core-local segments and writing
+shared ones once. `tests/test_hpiboot.py` boots all six to independently known results,
+releases just cores 0/3 or 2/4, uses both the L2 base and a nondefault 1 KB-aligned entry in
+both byte orders, and proves that loading alone or DSPINT alone executes nothing. Away from the
+L2 base the probe puts a guard there, so a core started at the default address rather than its
+programmed one fails the run. A native device case covers both byte orders, per-core cache
+straps, short final bursts, the host's exclusion from megamodule registers, selective release
+and set-only BC behavior.
+
+**[-] SRIO and UTOPIA boot.** SRIO still lacks a device model; UTOPIA's ATM master speaks the bus
+but not its boot protocol. Also not modelled: the DSPINT event SPRS276M says C6455 HPI boot
+records in EDMA ER bit 0.
 
 ## Ethernet and MDIO
 

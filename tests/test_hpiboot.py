@@ -1,7 +1,9 @@
-"""C6455 host boot: the positional ELF supplies symbols, never executable memory.
+"""Host boot through the HPI: the positional ELF supplies symbols, never executable memory.
 
-The host writes PT_LOAD code/data over --hpi-unix and releases the held CPU with DSPINT.
-Unlike Ethernet boot there is no boot table or entry field: execution starts at L2 base.
+On the C6455 the host writes PT_LOAD code/data over --hpi-unix and releases the held CPU with
+DSPINT; there is no boot table or entry field, so execution starts at L2 base. On the C6472 all
+six cores are held, DSPINT releases none, and the host writes each chosen core's image at its
+global alias, DSP_BOOT_ADDRn (entry >> 10) and the BCn bits of BOOT_COMPLETE_STAT.
 """
 
 from __future__ import annotations
@@ -15,32 +17,39 @@ import sys
 
 import pytest
 
-from common import ROOT
-from target_programs import build_target_program, load_programs
-from tools.hpi_host import L2_BASE, load_boot_image
-from tools.emac_boot import BootError, parse_elf
+from common import ROOT, RTS_INCLUDE_DIR
+from target_programs import Program, build_target_program, load_programs
+from tools.hpi_host import L2_BASE, load_boot_image, place_segments
+from tools.emac_boot import BootError, Image, Segment, parse_elf
 
 pytestmark = [pytest.mark.slow, pytest.mark.host]
 
 TOOL = ROOT / "tests/tools/hpi_host.py"
 LINKER = ROOT / "tests/firmware/hpi_boot/link.cmd"
+C6472_FIRMWARE = ROOT / "tests/firmware/hpi_boot"
 PROBE_ADDRESS = 0x0086_0001
 PROBE = bytes.fromhex("123456789abcdef00123")
+CORES = 6
+RESULTS = 0x0020_0000
+# The firmware's per-core result: 1 + 2 + ... + (10 + core), computed on that core.
+EXPECTED = [sum(range(1, 11 + core)) for core in range(CORES)]
+LOCAL_L2_END = 0x0089_8000
 
 
-def append_probe(image: Path) -> None:
-    """Add a final unaligned ten-byte load segment: three words, not a four-word DMA burst."""
+def append_probe(image: Path, address: int = PROBE_ADDRESS, payload: bytes = PROBE) -> None:
+    """Add a final load segment, by default an unaligned ten-byte one: three words, not a
+    four-word DMA burst."""
     elf = parse_elf(str(image))
     data = bytearray(elf.data)
     endian, size, count = elf.endian, elf.table_entry_size, len(elf.programs)
     table = bytes(data[elf.table_offset : elf.table_offset + size * count])
     probe_offset = len(data)
-    data.extend(PROBE)
+    data.extend(payload)
     table_offset = len(data)
     data.extend(table)
     data.extend(struct.pack(
-        endian + "IIIIIIII", 1, probe_offset, PROBE_ADDRESS, PROBE_ADDRESS,
-        len(PROBE), len(PROBE), 6, 1,
+        endian + "IIIIIIII", 1, probe_offset, address, address,
+        len(payload), len(payload), 6, 1,
     ) + bytes(size - 32))
     struct.pack_into(endian + "I", data, 28, table_offset)
     struct.pack_into(endian + "H", data, 44, count + 1)
@@ -59,7 +68,9 @@ def image(request: pytest.FixtureRequest, tmp_path_factory: pytest.TempPathFacto
     return built
 
 
-def hpiboot(candidate: Path, image: Path, workdir: Path, release: bool = True) -> tuple[dict, dict]:
+def hpiboot(
+    candidate: Path, image: Path, workdir: Path, release: bool = True, extra: tuple[str, ...] = (),
+) -> tuple[dict, dict]:
     state = workdir / "state.json"
     result = subprocess.run(
         [
@@ -67,6 +78,7 @@ def hpiboot(candidate: Path, image: Path, workdir: Path, release: bool = True) -
             "--boot", "--report", "--hpi-poll", "256", "--max-cycles", "100000000",
             "--state-out", str(state), "--timeout", "120",
             *([] if release else ["--no-dspint"]),
+            *extra,
         ],
         cwd=ROOT, capture_output=True, text=True, timeout=180,
     )
@@ -93,6 +105,7 @@ def test_c6455_boots_code_and_data_from_external_hpi_host(
     }
     assert state["device"] == "c6455"
     assert state["hpi_boot"]["entry"] == L2_BASE
+    assert state["hpi_boot"]["entries"] == [L2_BASE]
     assert state["exit_code"] == 55, "the transferred sum_loop computes 1 + ... + 10"
     assert state["fault"] is None
     assert len(state["cores"]) == 1
@@ -107,6 +120,7 @@ def test_c6455_hpi_load_without_dspint_executes_nothing(
     assert report["boot"]["verified"] is True
     assert report["boot"]["released"] is False
     assert state["hpi_boot"]["entry"] is None
+    assert state["hpi_boot"]["entries"] == [None]
     assert state["fault"] is None
     assert state["cycles"] == 0
     assert state["cores"][0]["held_in_reset"] is True
@@ -121,3 +135,147 @@ def test_host_rejects_an_elf_entry_that_hpi_boot_cannot_reach(image: Path, tmp_p
     moved.write_bytes(data)
     with pytest.raises(BootError, match="HPI boot requires ELF entry"):
         load_boot_image(str(moved))
+
+
+# ---- C6472: six cores held, released by BOOT_COMPLETE_STAT ------------------------------------
+
+
+@pytest.fixture(
+    scope="module",
+    params=[(0x0080_0000, "little"), (0x0081_0400, "little"), (0x0081_0400, "big")],
+    ids=["entry-l2-base", "entry-1kb", "entry-1kb-big-endian"],
+)
+def c6472_image(request: pytest.FixtureRequest, tmp_path_factory: pytest.TempPathFactory) -> tuple[Path, int]:
+    """The result probe linked so its startup, and so the ELF entry, is at the requested address.
+    Away from the base of L2, the probe's `guard` goes there, so a core started at the default
+    boot address rather than its programmed one publishes the guard's value instead of a sum."""
+    entry, order = request.param
+    workdir = tmp_path_factory.mktemp(f"hpiboot-c6472-{entry:08x}-{order}")
+    linker = (C6472_FIRMWARE / "c6472.cmd").read_text()
+    text, guard = ".text 0x00800000", ".guard      > L2"
+    assert text in linker and guard in linker
+    linker = linker.replace(text, f".text 0x{entry:08x}")
+    if entry != L2_BASE:
+        linker = linker.replace(guard, f".guard 0x{L2_BASE:08x}")
+    link_cmd = workdir / "c6472.cmd"
+    link_cmd.write_text(linker)
+    endian = ("--big_endian",) if order == "big" else ()
+    program = Program(
+        name="hpiboot_c6472", weight=0, sources=(str(C6472_FIRMWARE / "c6472.c"),),
+        includes=(str(RTS_INCLUDE_DIR),),
+        cflags=("-O1", *endian), link_flags=endian, entry="_start", max_cycles=0,
+        opt_levels=("-O1",), rts=False, expect={}, cio_output=None, rx_frames=(), tx_frames=None,
+        boot_table=None, boot_config=None, link_cmd=str(link_cmd),
+    )
+    built = build_target_program(program, workdir)
+    assert built is not None, "could not build the C6472 host-boot probe"
+    if entry != L2_BASE:
+        segments = parse_elf(str(built)).image(0).segments
+        assert any(segment.address == L2_BASE for segment in segments), "no guard at L2 base"
+    return built, entry
+
+
+def c6472_boot(
+    candidate: Path, image: Path, workdir: Path, cores: tuple[int, ...] | None = None,
+    extra: tuple[str, ...] = (),
+) -> tuple[dict, dict, list[int]]:
+    """Boot over the HPI and return the report, the state and the shared mailbox at exit. The
+    dump reads memory as little-endian words; the mailbox holds words in the image's order."""
+    report, state = hpiboot(candidate, image, workdir, extra=(
+        "--device", "c6472", "--dump", f"{RESULTS:#010x}:{4 * CORES}",
+        *(["--cores", ",".join(map(str, cores))] if cores else []), *extra,
+    ))
+    order = report["boot"]["byteorder"]
+    mailbox = [
+        int.from_bytes(word.to_bytes(4, "little"), order)
+        for word in report["dumps"][f"{RESULTS:#010x}"]
+    ]
+    return report, state, mailbox
+
+
+def assert_only_these_cores_ran(state: dict, cores: tuple[int, ...], entry: int) -> None:
+    assert state["device"] == "c6472"
+    assert state["fault"] is None
+    assert len(state["cores"]) == CORES
+    assert state["hpi_boot"]["entry"] == state["hpi_boot"]["entries"][0]
+    assert state["hpi_boot"]["entries"] == [entry if core in cores else None for core in range(CORES)]
+    for core in range(CORES):
+        snapshot = state["cores"][core]
+        assert snapshot["fault"] is None
+        assert snapshot["held_in_reset"] is (core not in cores), f"core {core}"
+        assert (snapshot["cycles"] > 0) is (core in cores), f"core {core}"
+
+
+def test_c6472_boots_all_six_cores_independently(
+    candidate_binary: Path, c6472_image: tuple[Path, int], tmp_path: Path,
+) -> None:
+    image, entry = c6472_image
+    report, state, mailbox = c6472_boot(candidate_binary, image, tmp_path)
+    loaded, order = load_boot_image(str(image), "c6472")
+    assert loaded.entry == entry
+    assert report["boot"]["cores"] == list(range(CORES))
+    assert report["boot"]["released"] is True
+    assert report["boot"]["verified"] is True
+    assert report["boot"]["byteorder"] == order
+    assert state["exit_code"] == 0b111111, "the leader saw every core's result before exiting"
+    assert mailbox == EXPECTED
+    assert_only_these_cores_ran(state, tuple(range(CORES)), entry)
+
+
+@pytest.mark.parametrize("cores", [(0, 3), (2, 4)])
+def test_c6472_releases_only_the_selected_cores(
+    candidate_binary: Path, c6472_image: tuple[Path, int], tmp_path: Path, cores: tuple[int, ...],
+) -> None:
+    image, entry = c6472_image
+    report, state, mailbox = c6472_boot(candidate_binary, image, tmp_path, cores)
+    assert report["boot"]["cores"] == list(cores)
+    assert state["cores"][min(cores)]["halted"], "the selected leader reached the exit"
+    assert mailbox == [EXPECTED[core] if core in cores else 0 for core in range(CORES)]
+    assert_only_these_cores_ran(state, cores, entry)
+
+
+@pytest.mark.parametrize("extra", [(), ("--dspint",)], ids=["loaded", "dspint-only"])
+def test_c6472_hpi_load_and_dspint_do_not_release_a_core(
+    candidate_binary: Path, c6472_image: tuple[Path, int], tmp_path: Path, extra: tuple[str, ...],
+) -> None:
+    image, entry = c6472_image
+    report, state, mailbox = c6472_boot(candidate_binary, image, tmp_path, extra=("--no-release", *extra))
+    assert report["boot"]["verified"] is True
+    assert report["boot"]["released"] is False
+    assert mailbox == [0] * CORES
+    assert state["cycles"] == 0
+    assert_only_these_cores_ran(state, (), entry)
+
+
+def test_c6472_host_rejects_entries_and_segments_that_cannot_boot(
+    c6472_image: tuple[Path, int], tmp_path: Path,
+) -> None:
+    image, entry = c6472_image
+    elf = parse_elf(str(image))
+    for name, address, message in (
+        ("misaligned", entry + 4, "1 KB-aligned"),
+        ("outside", LOCAL_L2_END, "1 KB-aligned"),
+        ("below", 0x0020_0000, "1 KB-aligned"),
+    ):
+        data = bytearray(elf.data)
+        struct.pack_into(elf.endian + "I", data, 24, address)
+        bad = tmp_path / f"{name}.out"
+        bad.write_bytes(data)
+        with pytest.raises(BootError, match=message):
+            load_boot_image(str(bad), "c6472")
+
+    # A segment that starts in L2 and runs past its end would land in another core's memory
+    # through the alias arithmetic: its tail must be refused, not wrapped.
+    overflowing = tmp_path / "overflow.out"
+    overflowing.write_bytes(elf.data)
+    append_probe(overflowing, LOCAL_L2_END - 4, bytes(8))
+    with pytest.raises(BootError, match="not wholly inside one core-local window"):
+        load_boot_image(str(overflowing), "c6472")
+
+
+def test_c6472_host_replicates_local_segments_and_writes_shared_ones_once() -> None:
+    code = Segment(0x0080_0400, b"code")
+    shared = Segment(0x0020_0000, b"data")
+    placements = place_segments(Image(0, code.address, (code, shared)), (1, 4))
+    assert placements == [(0x1180_0400, b"code"), (0x1480_0400, b"code"), (0x0020_0000, b"data")]
+

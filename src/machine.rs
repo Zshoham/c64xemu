@@ -54,9 +54,9 @@ pub struct MachineArgs {
     /// Which device to emulate: the single-core c6455, or the six-core c6472
     #[arg(long, default_value = "c6455", value_name = "NAME")]
     pub device: String,
-    /// The BOOTMODE pins: C6455 mode 1 boots through --hpi-unix, mode 5 reads --i2c-eeprom;
-    /// C6472 modes 9 and 10 boot over MAC port 0 or 1. Mode 0 starts every core; other C6472
-    /// modes start core 0, which releases the rest through BOOT_COMPLETE_STAT
+    /// The BOOTMODE pins: mode 1 boots through --hpi-unix on either device; C6455 mode 5
+    /// reads --i2c-eeprom. C6472 modes 9 and 10 boot over MAC port 0 or 1. Mode 0 starts
+    /// every core; other C6472 ROM modes start core 0, which releases the remaining cores
     #[arg(long, default_value_t = 0, value_name = "MODE")]
     pub boot_mode: u8,
     /// The serial EEPROM image on the I2C bus, which boot mode 5 reads its boot parameters and
@@ -150,7 +150,7 @@ enum Load {
     Segments(Vec<Segment>),
     /// The table bytes, where they sit, and the entry point the bootloader reported.
     BootTable(Vec<u8>, u32, u32),
-    /// A ROM boot loads nothing from the ELF: the host, bus or network supplies the image,
+    /// An external boot loads nothing from the ELF: the host, bus or network supplies the image,
     /// and the ELF on the command line supplies only symbols.
     Wire,
 }
@@ -304,7 +304,7 @@ impl Machine {
         };
         let profile = DeviceProfile::named(&args.device)
             .ok_or_else(|| format!("unknown device {}", args.device))?;
-        let hpi_boot = hpi_boot_mode(profile, args.boot_mode)?;
+        let hpi_boot = args.boot_mode == crate::hpi::BOOTMODE_HPI;
         if hpi_boot {
             if args.hpi_unix.is_none() {
                 return Err(format!(
@@ -1206,9 +1206,12 @@ impl Machine {
                 "error": boot.error,
             });
         }
-        if hpi_boot_mode(self.profile, self.boot_mode) == Ok(true) {
+        if self.boot_mode == crate::hpi::BOOTMODE_HPI {
             state["hpi_boot"] = json!({
-                "entry": self.device.hpi_boot_entry(),
+                "entry": self.device.hpi_boot_entry(0),
+                "entries": (0..self.cores())
+                    .map(|core| self.device.hpi_boot_entry(core))
+                    .collect::<Vec<_>>(),
             });
         }
         if profile {
@@ -1421,26 +1424,6 @@ fn cio_handshake(image: &Image) -> Option<(u32, u32)> {
         .get("__CIOBUF_")
         .or_else(|| image.symbols.get("_CIOBUF_"))?;
     Some((*breakpoint, *buffer))
-}
-
-/// Whether the strapped boot mode is the C6455's HPI boot, a hardware boot that holds the CPU in
-/// reset until the host's DSPINT (SPRS276M section 2.4). The device-state block is what enables
-/// the port for it, so that is the profile fact it follows. The C6472's mode 1 is an HPI boot
-/// too, but a different protocol - the host releases the cores through BOOT_COMPLETE_STAT
-/// (SPRUEC6G section 4.3.2) - which this model does not have, so it is refused rather than run
-/// as if no boot were strapped.
-fn hpi_boot_mode(profile: &'static DeviceProfile, boot_mode: u8) -> Result<bool, String> {
-    if boot_mode != crate::hpi::BOOTMODE_HPI {
-        Ok(false)
-    } else if profile.has_device_config {
-        Ok(true)
-    } else {
-        Err(format!(
-            "boot mode {boot_mode} is the {}'s HPI boot (SPRUEC6G section 4.3.2), which this \
-             model does not implement",
-            profile.name
-        ))
-    }
 }
 
 /// The MAC port register base an Ethernet boot uses, when the strapped boot mode asks for one:

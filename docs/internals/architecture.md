@@ -92,7 +92,7 @@ cores, it calls `fabric.tick(self.cycle)`. The peripherals run even with every c
 reset, which is how a host boots the device through the HPI while the cores wait. It then
 advances the ROM boot if one is strapped, and finally applies the device-level effects of the
 cycle in `apply_device_requests`. Those effects are: cores released by the boot controller, the
-power/sleep controller or an HPI boot's DSPINT (set to their `boot_address`, where the device has
+power/sleep controller or a C6455 HPI boot's DSPINT (set to their `boot_address`, where the device has
 one, and let out of reset), and cores whose NMI pin the chip-level registers drove.
 
 `Fabric::tick(cycle)` is guarded, and the guard is the whole tick model:
@@ -240,9 +240,10 @@ Given an address and a requester, this is which module answers:
 | CPU load or store outside `0x0180_0000..0xa000_0000` | `Fabric::memory(core)` → L1D, L2, `Backing` |
 | CPU access inside that band | port walk → `Megamodule::cfg_*` → memory, as above |
 | CPU access to a restricted page | `Fabric::check_access` first; a violation latches MPFAR/MPFSR and raises the unit's event |
-| DMA master to memory (`is_memory`) | `Fabric::dma_read32`/`dma_write32` → `dma_bytes`/`dma_store`, with the L2 snoop |
-| DMA master to a register aperture | `Fabric::dma_register_read`/`dma_register_write` → `read32`/`write32` as the reset core |
-| HPI host side | `Fabric::hpi_host_read`/`hpi_host_write` through `lend_hpi`, then the same paths as any other master |
+| Word-wide master (HPI, IDMA) to memory (`is_memory`) | `Fabric::master_read32`/`master_write32` → privilege-ID-0 protection check → `dma_word`/`dma_store_word`, with the L2 snoop |
+| `DmaMemory` master (EDMA3, EMAC) to memory | `dma_read_bytes`/`dma_write_bytes` → protection check → `dma_bytes`/`dma_store`; `dma_read_u32`/`dma_write_u32` (EMAC descriptors) → `dma_word`/`dma_store_word` directly; both with the L2 snoop |
+| `master_*32` or `dma_*_bytes` to the configuration space | `Fabric::master_register_read`/`master_register_write`: the port walk; the megamodule registers (`0x0180_0000..0x01c0_0000`) read zero and ignore writes (SPRU871K section 5.3.1); anything else is device memory |
+| HPI host side | `Fabric::hpi_host_read`/`hpi_host_write` through `lend_hpi`, then `master_read32`/`master_write32` |
 | Debugger or front-end read | `Fabric::host_read_bytes` - backing plus `host_snoop_read`, disturbing no cache state |
 
 A master that moves data - either MAC, the EDMA3, the HPI host side - is moved out of its slot

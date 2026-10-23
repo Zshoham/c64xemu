@@ -29,7 +29,7 @@ use crate::emic::{EmacInterruptControl, Sources as EmacSources};
 use crate::emifa::Emifa;
 use crate::events::Destination;
 use crate::gpio::Gpio;
-use crate::hpi::{HostPort, Hpi};
+use crate::hpi::{HostPort, Hpi, HpiBoot};
 use crate::i2c::I2c;
 use crate::idma::{Idma, Source as IdmaSource};
 use crate::mcbsp::Mcbsp;
@@ -139,6 +139,11 @@ const ACTIVE_ALL: u8 =
 fn directly_routed_memory(address: u32) -> bool {
     !(0x0180_0000..0xa000_0000).contains(&address)
 }
+
+/// The megamodule's internal configuration space, "C64x+ Megamodule Registers" at 0180 0000h -
+/// 01BF FFFFh (SPRS276M Table 2-2): its interrupt controller, cache, memory protection and
+/// power-down registers.
+const MEGAMODULE_REGISTERS: std::ops::Range<u32> = 0x0180_0000..0x01c0_0000;
 
 fn mux_uses_combiner(value: u32) -> bool {
     (0..4).any(|slot| ((value >> (slot * 8)) & 0x7f) < 4)
@@ -1011,8 +1016,16 @@ impl Shared {
     }
 
     fn new(profile: &'static DeviceProfile, endian: Endian, boot_mode: u8) -> Self {
-        // HPI boot is the C6455's: the device-state block is what enables the port for it.
-        let hpi_boot = profile.has_device_config && boot_mode == crate::hpi::BOOTMODE_HPI;
+        // HPI boot is mode 1 on both devices. Whether the host's DSPINT ends it is the C6455's
+        // rule (SPRS276M section 2.4); the C6472's host releases each core through the boot
+        // controller instead (SPRUEC6G section 4.3.2).
+        let hpi_boot = if boot_mode != crate::hpi::BOOTMODE_HPI {
+            HpiBoot::Off
+        } else if profile.has_boot_controller {
+            HpiBoot::BootController
+        } else {
+            HpiBoot::DspintRelease
+        };
         Self {
             backing: Backing::new(profile.map, endian),
             mdio: Mdio::with_version(profile.mdio_version),
@@ -1055,7 +1068,7 @@ impl Shared {
             },
             devcfg: profile
                 .has_device_config
-                .then(|| Clocked::new(DeviceConfig::new(hpi_boot))),
+                .then(|| Clocked::new(DeviceConfig::new(hpi_boot != HpiBoot::Off))),
             pll2: Pll2::default(),
             chipcfg: profile.has_boot_controller.then(|| {
                 ChipConfig::new(
@@ -1693,12 +1706,12 @@ impl Fabric {
             let steps = self.mm[core].idma.tick();
             for step in steps.into_iter().flatten() {
                 let value = match step.source {
-                    Some(IdmaSource::Address(address)) => self.dma_read32(address),
+                    Some(IdmaSource::Address(address)) => self.master_read32(address),
                     Some(IdmaSource::Fill(value)) => Some(value),
                     None => None,
                 };
                 if let Some(value) = value {
-                    self.dma_write32(step.destination, value);
+                    self.master_write32(step.destination, value);
                 }
                 if let Some(event) = step.completion_event {
                     self.mm[core].raise_event(event);
@@ -2097,9 +2110,11 @@ impl Fabric {
         }
     }
 
-    /// The host has raised DSPINT. The first one after an HPI boot reset is what "causes boot
-    /// configuration logic to bring the CPU out of the 'stalled' state" (SPRS276M section 2.4);
-    /// it is the same system event as every later one, which the held core does not receive.
+    /// The host has raised DSPINT. On a C6455 the first one after an HPI boot reset is what
+    /// "causes boot configuration logic to bring the CPU out of the 'stalled' state" (SPRS276M
+    /// section 2.4); on a C6472 it releases nothing, the host's BOOT_COMPLETE_STAT write does
+    /// (SPRUEC6G section 4.3.2). Either way it is the same system event as every later one,
+    /// which a held core does not receive.
     fn host_interrupt(&mut self) {
         self.raise(Destination::All, self.profile.events.hpi);
         if self.shared.hpi.take_boot_release() {
@@ -2374,30 +2389,70 @@ impl Fabric {
     // DMA masters.
     // ------------------------------------------------------------------
 
-    /// One word for a DMA master. Peripheral registers answer through their slave port; memory
-    /// follows the snoop protocol the hierarchy owns.
-    fn dma_read32(&mut self, address: u32) -> Option<u32> {
+    /// One word for a system master that moves a word at a time - the HPI's DMA logic, and the
+    /// IDMA the CPU programs. Both carry privilege ID 0 (SPRS276M section 5.2, SPRS612G Table
+    /// 5-3), which is what memory protection judges them by; memory follows the snoop protocol
+    /// the hierarchy owns, and the configuration space answers as `master_register_read` says.
+    /// `None` when protection refuses the read.
+    pub(crate) fn master_read32(&mut self, address: u32) -> Option<u32> {
         if !is_memory(address) {
-            return Some(self.read32(self.profile.reset_core, address));
+            return Some(self.master_register_read(address));
         }
         if !self.check_dma_access(address, Permission::Read, 0) {
             return None;
         }
-        let bytes: [u8; 4] = self.dma_bytes(address, 4).try_into().unwrap();
-        Some(match self.shared.backing.endian() {
-            Endian::Little => u32::from_le_bytes(bytes),
-            Endian::Big => u32::from_be_bytes(bytes),
-        })
+        Some(self.dma_word(address))
     }
 
-    fn dma_write32(&mut self, address: u32, value: u32) {
+    pub(crate) fn master_write32(&mut self, address: u32, value: u32) {
         if !is_memory(address) {
-            self.write32(self.profile.reset_core, address, value);
+            self.master_register_write(address, value);
             return;
         }
         if !self.check_dma_access(address, Permission::Write, 0) {
             return;
         }
+        self.dma_store_word(address, value);
+    }
+
+    /// A system master's word in the configuration space. A chip-level peripheral answers
+    /// through its slave port, with every effect a CPU access would have. The megamodules' own
+    /// registers - interrupt controller, cache and protection configuration - are "only
+    /// accessible by the CPU" (SPRU871K section 5.3.1): a master reads zero there and its
+    /// writes go nowhere. Whatever else the configuration space holds that no port claims is
+    /// device memory, reached as any other memory is.
+    fn master_register_read(&mut self, address: u32) -> u32 {
+        self.shared.touched();
+        let context = self.port_context();
+        if let Some(value) = self.peripheral_read(address, context) {
+            return value;
+        }
+        if MEGAMODULE_REGISTERS.contains(&address) {
+            return 0;
+        }
+        self.dma_word(address)
+    }
+
+    fn master_register_write(&mut self, address: u32, value: u32) {
+        self.shared.touched();
+        let context = self.port_context();
+        if self.peripheral_write(address, value, context) || MEGAMODULE_REGISTERS.contains(&address)
+        {
+            return;
+        }
+        self.dma_store_word(address, value);
+    }
+
+    /// A memory word in the device's byte order, as a DMA master sees it.
+    fn dma_word(&mut self, address: u32) -> u32 {
+        let bytes: [u8; 4] = self.dma_bytes(address, 4).try_into().unwrap();
+        match self.shared.backing.endian() {
+            Endian::Little => u32::from_le_bytes(bytes),
+            Endian::Big => u32::from_be_bytes(bytes),
+        }
+    }
+
+    fn dma_store_word(&mut self, address: u32, value: u32) {
         let bytes = match self.shared.backing.endian() {
             Endian::Little => value.to_le_bytes(),
             Endian::Big => value.to_be_bytes(),
@@ -2457,7 +2512,7 @@ impl Fabric {
         let mut bytes = Vec::with_capacity(length);
         while bytes.len() < length {
             let byte_address = address.wrapping_add(bytes.len() as u32);
-            let word = self.read32(self.profile.reset_core, byte_address & !3);
+            let word = self.master_register_read(byte_address & !3);
             let word = if self.shared.backing.endian_big() {
                 word.to_be_bytes()
             } else {
@@ -2473,14 +2528,14 @@ impl Fabric {
         bytes
     }
 
-    /// Write a peripheral register aperture for a DMA master, assembling whole words around
-    /// the bytes the transfer supplies.
+    /// Write the configuration space for a DMA master, assembling whole words around the bytes
+    /// the transfer supplies.
     fn dma_register_write(&mut self, address: u32, bytes: &[u8]) {
         let mut written = 0usize;
         while written < bytes.len() {
             let byte_address = address.wrapping_add(written as u32);
             let word_address = byte_address & !3;
-            let current = self.read32(self.profile.reset_core, word_address);
+            let current = self.master_register_read(word_address);
             let mut word = if self.shared.backing.endian_big() {
                 current.to_be_bytes()
             } else {
@@ -2498,7 +2553,7 @@ impl Fabric {
             } else {
                 u32::from_le_bytes(word)
             };
-            self.write32(self.profile.reset_core, word_address, value);
+            self.master_register_write(word_address, value);
         }
     }
 }
@@ -2534,19 +2589,11 @@ impl EmacDmaMemory for Fabric {
     }
 
     fn dma_read_u32(&mut self, address: u32) -> u32 {
-        let bytes: [u8; 4] = self.dma_bytes(address, 4).try_into().unwrap();
-        match self.shared.backing.endian() {
-            Endian::Little => u32::from_le_bytes(bytes),
-            Endian::Big => u32::from_be_bytes(bytes),
-        }
+        self.dma_word(address)
     }
 
     fn dma_write_u32(&mut self, address: u32, value: u32) {
-        let bytes = match self.shared.backing.endian() {
-            Endian::Little => value.to_le_bytes(),
-            Endian::Big => value.to_be_bytes(),
-        };
-        self.dma_store(address, &bytes);
+        self.dma_store_word(address, value);
     }
 }
 
@@ -2846,9 +2893,10 @@ impl Fabric {
     }
 
     /// Whether a core is held in reset at power-up: with a boot controller, every core but the
-    /// one the boot mode starts (SPRS612G section 2.4.1); strapped to HPI boot, the one core
-    /// there is, until the host's DSPINT (SPRS276M section 2.4: "the CPU is actually held in
-    /// reset until a DSP interrupt is generated by the host").
+    /// one the boot mode starts (SPRS612G section 2.4.1; a C6472 strapped to HPI boot starts
+    /// none, SPRUEC6G section 4.3.2); a C6455 strapped to HPI boot, the one core there is,
+    /// until the host's DSPINT (SPRS276M section 2.4: "the CPU is actually held in reset until
+    /// a DSP interrupt is generated by the host").
     pub(crate) fn apply_reset_holds(&mut self) {
         if self.shared.hpi.boot_pending() {
             self.mm[self.profile.reset_core].held_in_reset = true;
@@ -2867,6 +2915,13 @@ impl Fabric {
     /// Whether the device is strapped to an HPI boot the host has not yet ended with DSPINT.
     pub(crate) fn hpi_boot_pending(&self) -> bool {
         self.shared.hpi.boot_pending()
+    }
+
+    /// Whether the device was strapped to HPI boot, which holds for the device's lifetime: the
+    /// C6455's DSPINT ends the hold on its core and the C6472's host ends each core's own, but
+    /// neither makes the device any less one that booted this way.
+    pub(crate) fn hpi_boot_strapped(&self) -> bool {
+        self.shared.hpi.strapped()
     }
 
     /// The shared L2 ROM image, which is where the boot controller starts core 0 for every ROM
@@ -3189,22 +3244,22 @@ mod tests {
                     // Where the SRAM ends once this much of the window has become cache.
                     let split = base + bytes - cache;
                     if cache > 0 {
-                        fabric.dma_write32(split, 0xfeed_face);
+                        fabric.master_write32(split, 0xfeed_face);
                     }
                     if cache < bytes {
-                        fabric.dma_write32(split - 4, 0xfeed_face);
+                        fabric.master_write32(split - 4, 0xfeed_face);
                     }
                     fabric.write32(0, register, mode);
                     if cache > 0 {
                         // The first word the cache took holds nothing and keeps nothing.
-                        assert_eq!(fabric.dma_read32(split), Some(0), "{register:#x} {mode}");
-                        fabric.dma_write32(split, 0x0bad_c0de);
-                        assert_eq!(fabric.dma_read32(split), Some(0), "{register:#x} {mode}");
+                        assert_eq!(fabric.master_read32(split), Some(0), "{register:#x} {mode}");
+                        fabric.master_write32(split, 0x0bad_c0de);
+                        assert_eq!(fabric.master_read32(split), Some(0), "{register:#x} {mode}");
                     }
                     if cache < bytes {
                         // The last word below it is still the SRAM it always was.
                         assert_eq!(
-                            fabric.dma_read32(split - 4),
+                            fabric.master_read32(split - 4),
                             Some(0xfeed_face),
                             "{register:#x} {mode}"
                         );

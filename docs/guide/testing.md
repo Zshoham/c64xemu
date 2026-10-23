@@ -41,7 +41,7 @@ than an empty run. Collected counts today:
 | `programs` | 1868 | TI-compiled target program cases |
 | `network` | 28 | NDK firmware and host TCP peer cases |
 | `rtos` | 9 | TI-RTOS firmware cases |
-| `host` | 10 | HPI host-to-firmware and HPI boot integration cases |
+| `host` | 29 | HPI mailbox and C6455/C6472 HPI boot integration cases |
 | `differential` | 3 | binutils and TI disassembler differentials |
 | `slow` | — | cases that compile target programs or execute full firmware |
 | `high_bandwidth` | 5 | paced TCP cases at 1024 kbps and above, deselected in CI |

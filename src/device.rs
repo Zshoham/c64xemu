@@ -247,9 +247,13 @@ pub struct Device {
     /// The ROM bootloader's boot, once a front end has strapped the device to one. It outlives
     /// the boot it performed: what it did is what a front end reports afterwards.
     rom_boot: Option<RomBoot>,
-    /// Strapped to the C6455's HPI boot, which is hardware rather than ROM: core 0 is held in
-    /// reset until the host's DSPINT, then starts at the base of L2 (SPRS276M section 2.4).
+    /// Strapped to HPI boot, which is hardware rather than ROM: the cores are held in reset for
+    /// the host. The C6455's one core starts at the base of L2 on the host's DSPINT (SPRS276M
+    /// section 2.4); each C6472 core starts at its DSP_BOOT_ADDR when the host sets its BC bit
+    /// in BOOT_COMPLETE_STAT (SPRUEC6G section 4.3.2).
     hpi_boot: bool,
+    /// Where the host's release started each core of an HPI boot, `None` while it is held.
+    hpi_entries: [Option<u32>; crate::bootctl::MAX_CORES],
 }
 
 /// The two boundaries a batch of device cycles ends at, kept as bit masks over the cores and
@@ -319,10 +323,9 @@ impl Device {
         Self::with_boot_mode(profile, entry, endian, 0)
     }
 
-    /// A device strapped to a boot mode: 0 starts every core at once, and any other mode runs
-    /// core 0 and holds the rest until it releases them (SPRS612G section 2.4.1). Strapped to
-    /// HPI boot, the core starts held at the base of L2, wherever `entry` says: the host loads
-    /// the image, and nothing in that boot names an entry point (SPRS276M section 2.4).
+    /// A device strapped to a boot mode: mode 0 releases every core, HPI boot holds every
+    /// core for the host, and C6472 ROM modes run core 0 while the others wait. The C6455's
+    /// HPI entry is fixed at L2 base; C6472 cores start at their programmed boot addresses.
     pub fn with_boot_mode(
         profile: &'static DeviceProfile,
         entry: u32,
@@ -331,8 +334,14 @@ impl Device {
     ) -> Self {
         let mut fabric = Box::new(Fabric::with_boot_mode(profile, boot_mode));
         fabric.apply_reset_holds();
-        let hpi_boot = fabric.hpi_boot_pending();
-        let entry = if hpi_boot { HPI_BOOT_ENTRY } else { entry };
+        let hpi_boot = fabric.hpi_boot_strapped();
+        // A DSPINT-released core starts at the base of L2 wherever `entry` says. A C6472 core's
+        // start address is not set until the host releases it, from its DSP_BOOT_ADDR.
+        let entry = if fabric.hpi_boot_pending() {
+            HPI_BOOT_ENTRY
+        } else {
+            entry
+        };
         let mut cpus: Vec<Cpu> = Vec::with_capacity(profile.cores());
         for core in (0..profile.cores()).rev() {
             // Each core in turn takes the fabric to be built with, and the last one built -
@@ -345,12 +354,15 @@ impl Device {
         cpus.reverse();
         cpus[profile.reset_core].attach(fabric);
         if hpi_boot {
-            // SPRUEC6G Table 2: an HPI boot leaves 32 KB of each L1 cache and all of L2 as
-            // SRAM. Written through the registers, like every other cache configuration.
-            let mut bus = cpus[profile.reset_core].bus_mut();
-            bus.write32(L1PCFG, 4);
-            bus.write32(L1DCFG, 4);
-            bus.write32(L2CFG, 0);
+            // SPRUEC6G Table 2 and Table 21: an HPI boot leaves 32 KB of each L1 cache and all
+            // of L2 as SRAM, in every core there is. Written through the registers, like every
+            // other cache configuration.
+            let fabric = cpus[profile.reset_core].fabric_mut();
+            for core in 0..profile.cores() {
+                fabric.write32(core, L1PCFG, 4);
+                fabric.write32(core, L1DCFG, 4);
+                fabric.write32(core, L2CFG, 0);
+            }
         }
         Self {
             cpus,
@@ -358,6 +370,7 @@ impl Device {
             cycle: 0,
             rom_boot: None,
             hpi_boot,
+            hpi_entries: [None; crate::bootctl::MAX_CORES],
         }
     }
 
@@ -381,9 +394,11 @@ impl Device {
         self.rom_boot = Some(RomBoot::I2c(I2cBoot::new(index, endian)));
     }
 
-    /// Where an HPI boot started core 0, once the host's DSPINT has released it.
-    pub fn hpi_boot_entry(&self) -> Option<u32> {
-        (self.hpi_boot && !self.held_in_reset(0)).then_some(HPI_BOOT_ENTRY)
+    /// Where the host's release started a core of an HPI boot, once it has: the base of L2 for
+    /// the C6455's core 0, the core's DSP_BOOT_ADDR as the host left it for the C6472's. `None`
+    /// while the core is still held, and for a core that no HPI boot released.
+    pub fn hpi_boot_entry(&self, core: usize) -> Option<u32> {
+        self.hpi_entries.get(core).copied().flatten()
     }
 
     /// What the I2C boot has done, when the device was strapped to one.
@@ -593,11 +608,18 @@ impl Device {
             if core == 0 && self.rom_boot.is_some() {
                 continue;
             }
-            if let Some(address) = fabric.boot_address(core) {
+            let held = fabric.held_in_reset(core);
+            let address = fabric.boot_address(core);
+            if let Some(address) = address {
                 self.cpus[core].set_pc(address);
                 if let Some(boundaries) = boundaries.as_deref_mut() {
                     boundaries.observe(core, &self.cpus[core]);
                 }
+            }
+            if self.hpi_boot && held {
+                // A C6455 has no boot controller, and its core is already waiting at the base
+                // of L2.
+                self.hpi_entries[core] = Some(address.unwrap_or(HPI_BOOT_ENTRY));
             }
             fabric.set_held_in_reset(core, false);
         }
@@ -621,6 +643,7 @@ impl Device {
             cycle: 0,
             rom_boot: None,
             hpi_boot: false,
+            hpi_entries: [None; crate::bootctl::MAX_CORES],
         }
     }
 }
@@ -672,7 +695,7 @@ mod tests {
             assert_eq!(bus.read32(L1DCFG) & 7, 4);
             assert_eq!(bus.read32(L2CFG) & 7, 0);
             assert!(device.held_in_reset(0));
-            assert_eq!(device.hpi_boot_entry(), None);
+            assert_eq!(device.hpi_boot_entry(0), None);
 
             // Three posted words cannot complete a four-word DMA burst. The host must flush
             // its final short burst; the boot ending does not do it.
@@ -709,7 +732,7 @@ mod tests {
                 0,
                 "release does not execute a packet"
             );
-            assert_eq!(device.hpi_boot_entry(), Some(0x0080_0000));
+            assert_eq!(device.hpi_boot_entry(0), Some(0x0080_0000));
             // The CPU leaves reset with interrupts disabled, and DSPINT stays set until the
             // application clears it.
             assert_eq!(device.core(0).read_control(CSR) & 1, 0, "GIE");
@@ -747,6 +770,201 @@ mod tests {
             assert_ne!(device.core(0).read_control(IFR) & INT15, 0);
             assert!(!device.held_in_reset(0));
             assert!(device.core(0).cycles() > cycles, "the core was not reset");
+        }
+    }
+
+    /// The host's side of a C6472 HPI boot, one word-addressed access at a time. Rewriting the
+    /// address register at the end flushes whatever short burst is still posted.
+    fn host_load(device: &mut Device, address: u32, words: &[u32]) {
+        use crate::hpi::HostPort;
+        device
+            .fabric()
+            .hpi_host_write(HostPort::Address, address >> 2);
+        for &word in words {
+            device
+                .fabric()
+                .hpi_host_write(HostPort::DataAutoIncrement, word);
+        }
+        device
+            .fabric()
+            .hpi_host_write(HostPort::Address, address >> 2);
+    }
+
+    fn host_set(device: &mut Device, address: u32, value: u32) {
+        use crate::hpi::HostPort;
+        device
+            .fabric()
+            .hpi_host_write(HostPort::Address, address >> 2);
+        device.fabric().hpi_host_write(HostPort::Data, value);
+    }
+
+    fn host_get(device: &mut Device, address: u32) -> u32 {
+        use crate::hpi::HostPort;
+        device
+            .fabric()
+            .hpi_host_write(HostPort::Address, address >> 2);
+        device.fabric().hpi_host_read(HostPort::Data).unwrap()
+    }
+
+    fn run(device: &mut Device, cycles: u32) {
+        for _ in 0..cycles {
+            device.step_cycle();
+        }
+    }
+
+    /// SPRUEC6G section 4.3.2: with HPI boot every C6472 core is held in reset while the host
+    /// initialises memory and configuration registers, and only a 0 to 1 transition of a BCn bit
+    /// in BOOT_COMPLETE_STAT releases core n, at the address in its DSP_BOOT_ADDRn. DSPINT is an
+    /// ordinary interrupt here (the C6455's DSPINT release does not exist on this device).
+    #[test]
+    fn c6472_hpi_boot_releases_only_the_cores_the_host_names() {
+        use crate::hpi::{HostPort, BOOTMODE_HPI};
+        const HPIC_DSPINT: u32 = 1 << 1;
+        const HPIC_HRDY: u32 = 1 << 3;
+        /// MVK .L1 0,A4 with its constant in bits 22-18, and ADD .L1 1,A4,A4.
+        const MVK_A4: u32 = 0x0200_a358;
+        const ADD_A4: u32 = 0x0210_2058;
+
+        // Core n's image leaves 2 * (n + 1) in A4 and then runs on through the zeroed memory
+        // after it, which is NOPs, so a wrong core, a wrong address or a restart is told apart.
+        // It is n + 2 words long, so most images end in a short burst the host has to flush.
+        let image = |core: usize| {
+            let mut words = vec![ADD_A4; core + 2];
+            words[0] = MVK_A4 | ((core as u32 + 1) << 18);
+            words
+        };
+        let result = |core: usize| 2 * (core as u32 + 1);
+        let global = |core: usize, local: u32| 0x1000_0000 + ((core as u32) << 24) + local;
+        // DSP_BOOT_ADDRn is the start address shifted right by ten, so the start has to be
+        // aligned to 1 KB (section 3.9.5): cores 0 and 3 take two such addresses that are not
+        // the default, the rest keep the base of L2.
+        let entry = |core: usize| match core {
+            0 => 0x0080_4000,
+            3 => 0x0080_8400,
+            _ => 0x0080_0000,
+        };
+
+        for endian in [Endian::Little, Endian::Big] {
+            let mut device = Device::with_boot_mode(&C6472, 0x0080_0000, endian, BOOTMODE_HPI);
+            // The port is open before any cycle has run, and every core is held with the cache
+            // settings of Table 21: 32 KB of L1P and L1D, and no L2 cache.
+            assert_eq!(
+                device.fabric().hpi_host_read(HostPort::Control),
+                Some(HPIC_HRDY)
+            );
+            for core in 0..6 {
+                assert!(device.held_in_reset(core), "core {core}");
+                assert_eq!(device.hpi_boot_entry(core), None);
+                device.with_core(core, |cpu| {
+                    let mut bus = cpu.bus_mut();
+                    assert_eq!(bus.read32(L1PCFG) & 7, 4, "core {core}");
+                    assert_eq!(bus.read32(L1DCFG) & 7, 4, "core {core}");
+                    assert_eq!(bus.read32(L2CFG) & 7, 0, "core {core}");
+                });
+            }
+
+            // Loading all six images through the global aliases runs no core.
+            for core in 0..6 {
+                host_load(&mut device, global(core, entry(core)), &image(core));
+            }
+            run(&mut device, 100);
+            for core in 0..6 {
+                assert!(device.held_in_reset(core), "loading released core {core}");
+                assert_eq!(device.core(core).cycles(), 0);
+            }
+            // What the host wrote is what it reads back, registers included.
+            assert_eq!(host_get(&mut device, global(3, 0x0080_8400)), image(3)[0]);
+            assert_eq!(host_get(&mut device, BOOT_COMPLETE_STAT), 0);
+            // The megamodule's own registers are the CPU's alone (SPRU871K section 5.3.1): the
+            // host neither reads core 0's cache configuration nor changes it.
+            assert_eq!(host_get(&mut device, L1DCFG), 0);
+            host_set(&mut device, L1DCFG, 0);
+            device.with_core(0, |cpu| assert_eq!(cpu.bus_mut().read32(L1DCFG) & 7, 4));
+
+            // DSPINT is not a release.
+            device
+                .fabric()
+                .hpi_host_write(HostPort::Control, HPIC_DSPINT);
+            run(&mut device, 50);
+            assert_eq!(
+                device.fabric().hpi_host_read(HostPort::Control),
+                Some(HPIC_HRDY | HPIC_DSPINT)
+            );
+            for core in 0..6 {
+                assert!(device.held_in_reset(core), "DSPINT released core {core}");
+                assert_eq!(device.hpi_boot_entry(core), None);
+                assert_eq!(device.core(core).cycles(), 0);
+            }
+
+            // Address registers alone release nothing either; BC0 and BC3 release those two.
+            host_set(&mut device, DSP_BOOT_ADDR0, entry(0) >> 10);
+            host_set(&mut device, DSP_BOOT_ADDR0 + 0x20 * 3, entry(3) >> 10);
+            assert_eq!(host_get(&mut device, DSP_BOOT_ADDR0), entry(0) >> 10);
+            run(&mut device, 10);
+            assert!((0..6).all(|core| device.held_in_reset(core)));
+            host_set(&mut device, BOOT_COMPLETE_STAT, 0b001001);
+            assert_eq!(host_get(&mut device, BOOT_COMPLETE_STAT), 0b001001);
+            device.step_cycle();
+            for core in [0, 3] {
+                assert!(!device.held_in_reset(core), "core {core}");
+                assert_eq!(device.core(core).pc(), entry(core), "core {core}");
+                assert_eq!(device.core(core).cycles(), 0);
+                assert_eq!(device.hpi_boot_entry(core), Some(entry(core)));
+            }
+            for core in [1, 2, 4, 5] {
+                assert!(device.held_in_reset(core), "core {core}");
+                assert_eq!(device.hpi_boot_entry(core), None);
+            }
+            run(&mut device, 300);
+            for core in [0, 3] {
+                assert_eq!(
+                    device.core(core).register('A', 4),
+                    result(core),
+                    "core {core}"
+                );
+                assert!(device.core(core).pc() > entry(core) + 32);
+            }
+            for core in [1, 2, 4, 5] {
+                assert!(device.held_in_reset(core), "core {core}");
+                assert_eq!(device.core(core).cycles(), 0);
+                assert_eq!(device.core(core).register('A', 4), 0);
+            }
+
+            // BCn is set-only: writing the same bits again, writing zero, or moving the boot
+            // address afterwards is no transition and restarts nothing.
+            let progress = [device.core(0).pc(), device.core(3).pc()];
+            host_set(&mut device, BOOT_COMPLETE_STAT, 0b001001);
+            host_set(&mut device, BOOT_COMPLETE_STAT, 0);
+            host_set(&mut device, DSP_BOOT_ADDR0, 0x0080_0000 >> 10);
+            host_set(&mut device, BOOT_COMPLETE_STAT, 0b000001);
+            device.step_cycle();
+            assert!(device.core(0).pc() >= progress[0], "core 0 restarted");
+            assert!(device.core(3).pc() >= progress[1], "core 3 restarted");
+            assert_eq!(device.hpi_boot_entry(0), Some(entry(0)));
+            assert_eq!(device.hpi_boot_entry(3), Some(entry(3)));
+            assert_eq!(host_get(&mut device, BOOT_COMPLETE_STAT), 0b001001);
+
+            // The rest go at the default start, and only the edges release anything.
+            host_set(&mut device, DSP_BOOT_ADDR0, entry(0) >> 10);
+            host_set(&mut device, BOOT_COMPLETE_STAT, 0b111111);
+            device.step_cycle();
+            for core in [1, 2, 4, 5] {
+                assert!(!device.held_in_reset(core), "core {core}");
+                assert_eq!(device.core(core).pc(), 0x0080_0000, "core {core}");
+                assert_eq!(device.hpi_boot_entry(core), Some(0x0080_0000));
+            }
+            assert!(device.core(0).pc() >= progress[0], "core 0 restarted");
+            assert!(device.core(3).pc() >= progress[1], "core 3 restarted");
+            run(&mut device, 300);
+            for core in 0..6 {
+                assert_eq!(
+                    device.core(core).register('A', 4),
+                    result(core),
+                    "core {core}"
+                );
+            }
+            // The clock stays the device's for as long as the device booted this way.
+            assert!(device.boot_holds_core_zero());
         }
     }
 

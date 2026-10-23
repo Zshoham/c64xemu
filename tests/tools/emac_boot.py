@@ -277,10 +277,12 @@ def load_elf(core: int, path: str) -> Image:
     return parse_elf(path).image(core)
 
 
-def global_alias(core: int, address: int) -> int:
+def global_alias(core: int, address: int, rom_scratch: bool = True) -> int:
+    """The global address of core-local `address`. `rom_scratch` also refuses what core 0's ROM
+    boot code keeps for itself, which only a boot running that code needs."""
     for base, size in LOCAL_WINDOWS:
         if base <= address < base + size:
-            if core == 0 and BOOT_SCRATCH[0] <= address < BOOT_SCRATCH[1]:
+            if rom_scratch and core == 0 and BOOT_SCRATCH[0] <= address < BOOT_SCRATCH[1]:
                 raise BootError(
                     f"0x{address:08x} is inside the L2 the boot code is using for its receive "
                     "ring; link core 0's image below "

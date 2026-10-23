@@ -166,7 +166,14 @@ verifies the ELF load segments, flushes partial FIFO bursts, then raises DSPINT.
 image's entry at L2 base; the host tool rejects other entry points. `--no-dspint` loads and
 verifies without releasing the CPU. `--state-out FILE` records the final state, including
 `hpi_boot.entry`, which is null until release. Mailbox mode remains the host tool's default.
-The C6472's mode 1 is a different HPI boot protocol and is refused.
+
+On the C6472, mode 1 holds all six cores with the HPI enabled (SPRUEC6G section 4.3.2).
+The host loads each selected core through its global aliases, programs `DSP_BOOT_ADDRn`
+(entry address >> 10), then sets its bit in `BOOT_COMPLETE_STAT`. DSPINT does not release cores.
+`tests/tools/hpi_host.py --device c6472 --boot --image IMAGE --cores 0,3 --report`
+boots just cores 0 and 3; omit `--cores` to boot all six. The image's entry must be 1 KB aligned
+in local L2. `--no-release` loads without releasing any core. State includes `hpi_boot.entries`,
+one entry per core, null until that core is released; `hpi_boot.entry` describes core 0.
 
 **Booting over Ethernet.** The C6472's ROM Ethernet boot (SPRUEC6G section 4.3.5), which is how a
 board with no boot EEPROM comes up: `c64xemu run IMAGE --device c6472 --boot-mode 9` loads nothing

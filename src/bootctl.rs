@@ -84,7 +84,7 @@ const BOOT_ADDR_L2RAM: u32 = 0x0000_2000;
 const BOOT_ADDR_ROM: u32 = 0x0000_0400;
 
 /// The device supports six megamodules; BOOT_COMPLETE_STAT has exactly six BC bits.
-const MAX_CORES: usize = 6;
+pub(crate) const MAX_CORES: usize = 6;
 
 /// The C6472 boot controller register file.
 ///
