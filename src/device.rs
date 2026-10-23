@@ -773,6 +773,123 @@ mod tests {
         }
     }
 
+    /// SPRS276M section 7.4.1 and Table 7-3 note 2: the C6455's DSPINT is EDMA3 event DSP_EVT,
+    /// so the one ending an HPI boot is waiting in ER bit 0 when the firmware starts, and an
+    /// enabled channel 0 transfers on it - the stale boot event as soon as the channel is
+    /// enabled, and every later host DSPINT after that, alongside the CPU interrupt.
+    #[test]
+    fn c6455_dspint_is_edma_event_zero_from_the_boot_on() {
+        use crate::hpi::{HostPort, BOOTMODE_HPI};
+        const HPIC: u32 = 0x0288_0030;
+        const HPIC_DSPINT: u32 = 1 << 1;
+        const ER: u32 = 0x02a0_1000;
+        const ECR: u32 = 0x02a0_1008;
+        const EER: u32 = 0x02a0_1020;
+        const EECR: u32 = 0x02a0_1028;
+        const EESR: u32 = 0x02a0_1030;
+        const EMR: u32 = 0x02a0_0300;
+        const IPR: u32 = 0x02a0_1068;
+        const ICR: u32 = 0x02a0_1070;
+        const PARAM0: u32 = 0x02a0_4000;
+        const EVTFLAG0: u32 = 0x0180_0000;
+        const EVTCLR0: u32 = 0x0180_0040;
+        /// TCINTEN with TCC 0: completion sets IPR bit 0.
+        const OPT_TCINTEN: u32 = 1 << 20;
+        const SOURCE: u32 = 0x0080_8000;
+        const FIRST: u32 = 0x0080_9000;
+        const SECOND: u32 = 0x0080_a000;
+        let words = [0x1111_1111u32, 0x2222_2222, 0x3333_3333, 0x4444_4444];
+
+        // One A-synchronised 16-byte copy on PaRAM set 0, which channel 0 maps to at reset.
+        fn program(device: &mut Device, source: u32, destination: u32) {
+            let mut bus = device.cpu_mut().bus_mut();
+            let set = [
+                OPT_TCINTEN,
+                source,
+                (1 << 16) | 16,
+                destination,
+                0,
+                0xffff,
+                0,
+                1,
+            ];
+            for (index, word) in set.into_iter().enumerate() {
+                bus.write32(PARAM0 + 4 * index as u32, word);
+            }
+        }
+        let copied = |device: &mut Device, at: u32| {
+            let mut bus = device.cpu_mut().bus_mut();
+            (0..4).map(|i| bus.read32(at + 4 * i)).collect::<Vec<_>>()
+        };
+
+        let mut device = Device::with_boot_mode(&C6455, 0x0080_0000, Endian::Little, BOOTMODE_HPI);
+        host_load(&mut device, SOURCE, &words);
+        assert_eq!(host_get(&mut device, ER), 0, "loading is no event");
+        device
+            .fabric()
+            .hpi_host_write(HostPort::Control, HPIC_DSPINT);
+        device.step_cycle();
+        assert!(!device.held_in_reset(0));
+
+        // What the firmware finds: the boot's event pending, nothing enabled, nothing missed,
+        // and no transfer.
+        run(&mut device, 20);
+        {
+            let mut bus = device.cpu_mut().bus_mut();
+            assert_eq!(bus.read32(ER), 1);
+            assert_eq!(bus.read32(EER), 0);
+            assert_eq!(bus.read32(EMR), 0);
+            assert_eq!(bus.read32(IPR), 0);
+        }
+
+        // Enabling channel 0 without clearing ER first runs the transfer on the stale event.
+        program(&mut device, SOURCE, FIRST);
+        device.cpu_mut().bus_mut().write32(EESR, 1);
+        run(&mut device, 200);
+        assert_eq!(copied(&mut device, FIRST), words);
+        {
+            let mut bus = device.cpu_mut().bus_mut();
+            assert_eq!(bus.read32(ER), 0, "serviced");
+            assert_eq!(bus.read32(IPR), 1);
+            assert_eq!(bus.read32(EMR), 0);
+            bus.write32(ICR, 1);
+            // Acknowledge the boot DSPINT, without which the host cannot raise another.
+            bus.write32(HPIC, HPIC_DSPINT);
+            // Forget the boot's system event so the next one is seen fresh.
+            bus.write32(EVTCLR0, u32::MAX);
+        }
+        program(&mut device, SOURCE, SECOND);
+        // Let the channel controller go dormant: nothing but the host's DSPINT can wake it.
+        run(&mut device, 50);
+
+        // The next host DSPINT is the system event and the channel 0 trigger at once.
+        device
+            .fabric()
+            .hpi_host_write(HostPort::Control, HPIC_DSPINT);
+        run(&mut device, 200);
+        assert_eq!(copied(&mut device, SECOND), words);
+        {
+            let mut bus = device.cpu_mut().bus_mut();
+            assert_eq!(bus.read32(IPR), 1);
+            assert_eq!(bus.read32(EMR), 0);
+            assert_ne!(bus.read32(EVTFLAG0) & (1 << 15), 0, "DSPINT system event");
+
+            // With the channel disabled the event is only latched, and ECR clears it.
+            bus.write32(ICR, 1);
+            bus.write32(HPIC, HPIC_DSPINT);
+            bus.write32(EECR, 1);
+        }
+        device
+            .fabric()
+            .hpi_host_write(HostPort::Control, HPIC_DSPINT);
+        run(&mut device, 50);
+        let mut bus = device.cpu_mut().bus_mut();
+        assert_eq!(bus.read32(ER), 1);
+        assert_eq!(bus.read32(IPR), 0);
+        bus.write32(ECR, 1);
+        assert_eq!(bus.read32(ER), 0);
+    }
+
     /// The host's side of a C6472 HPI boot, one word-addressed access at a time. Rewriting the
     /// address register at the end flushes whatever short burst is still posted.
     fn host_load(device: &mut Device, address: u32, words: &[u32]) {
@@ -895,6 +1012,10 @@ mod tests {
                 assert_eq!(device.hpi_boot_entry(core), None);
                 assert_eq!(device.core(core).cycles(), 0);
             }
+            // Nor an EDMA3 event: channel 0 is GPINT0 here, and no channel is the HPI's.
+            device.with_core(0, |cpu| {
+                assert_eq!(cpu.bus_mut().read32(0x02a0_1000), 0, "ER")
+            });
 
             // Address registers alone release nothing either; BC0 and BC3 release those two.
             host_set(&mut device, DSP_BOOT_ADDR0, entry(0) >> 10);

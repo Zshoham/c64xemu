@@ -2114,9 +2114,16 @@ impl Fabric {
     /// "causes boot configuration logic to bring the CPU out of the 'stalled' state" (SPRS276M
     /// section 2.4); on a C6472 it releases nothing, the host's BOOT_COMPLETE_STAT write does
     /// (SPRUEC6G section 4.3.2). Either way it is the same system event as every later one,
-    /// which a held core does not receive.
+    /// which a held core does not receive. On a C6455 every DSPINT is also EDMA3 event
+    /// DSP_EVT, so the boot leaves ER bit 0 set for the firmware to clear (SPRS276M section
+    /// 7.4.1); the channel controller is not held with the core.
     fn host_interrupt(&mut self) {
         self.raise(Destination::All, self.profile.events.hpi);
+        if let Some(channel) = self.profile.events.hpi_channel {
+            self.shared.edma.as_mut().unwrap().trigger_event(channel);
+            // The event may have queued a transfer; wake the channel controller.
+            self.shared.touched();
+        }
         if self.shared.hpi.take_boot_release() {
             self.pending_release |= 1 << self.profile.reset_core;
         }

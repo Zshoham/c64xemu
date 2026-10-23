@@ -1329,6 +1329,16 @@ device case additionally pins:
 - that the host cannot raise another DSPINT until the application clears it, after which it is
   an ordinary interrupt.
 
+Every DSPINT is also EDMA3 event DSP_EVT, channel 0 (SPRS276M section 7.4.1 and Table 7-3
+note 2), so the boot's DSPINT leaves ER bit 0 set for the firmware; the channel controller is
+not held with the core. `c6455_dspint_is_edma_event_zero_from_the_boot_on` checks that the
+released firmware finds ER bit 0 pending with nothing enabled, missed or transferred, and that
+enabling channel 0 without ECR runs a transfer on that stale event. It then checks that each
+later host DSPINT both raises system event 15 and triggers an enabled channel 0, even after the
+channel controller went dormant. A disabled channel only latches the event, and ECR clears it.
+The C6472 maps no EDMA3 channel to the HPI (SPRS612G Table 7-4), and its case confirms DSPINT
+leaves ER clear.
+
 **[x] C6472 HPI boot.** *Done.* Mode 1 holds all six cores with HPIRST clear and the boot cache
 configuration on every core (SPRUEC6G section 4.3.2 and Table 21). HPI word accesses reach
 chip-level peripheral registers as well as memory, checked by memory protection as privilege
@@ -1348,8 +1358,7 @@ straps, short final bursts, the host's exclusion from megamodule registers, sele
 and set-only BC behavior.
 
 **[-] SRIO and UTOPIA boot.** SRIO still lacks a device model; UTOPIA's ATM master speaks the bus
-but not its boot protocol. Also not modelled: the DSPINT event SPRS276M says C6455 HPI boot
-records in EDMA ER bit 0.
+but not its boot protocol.
 
 ## Ethernet and MDIO
 

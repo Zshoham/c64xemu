@@ -41,8 +41,10 @@ pub(crate) struct EmacEvents {
 
 pub(crate) struct EventMap {
     family: Family,
-    /// The host-to-CPU interrupt the HPI raises when the host sets DSPINT.
+    /// The host-to-CPU interrupt the HPI raises when the host sets DSPINT, and the EDMA3
+    /// channel that interrupt also triggers where the device wires one.
     pub(crate) hpi: usize,
+    pub(crate) hpi_channel: Option<usize>,
     /// The I2C module's CPU interrupt and its receive/transmit EDMA3 channels.
     pub(crate) i2c: usize,
     pub(crate) i2c_channels: (usize, usize),
@@ -78,6 +80,9 @@ pub(crate) struct EventMap {
 pub(crate) const C6455_EVENTS: EventMap = EventMap {
     family: Family::C6455,
     hpi: 15,
+    // DSP_EVT: every host DSPINT, the one ending an HPI boot included, is synchronisation
+    // event 0 (SPRS276M section 7.4.1 and Table 7-3 note 2).
+    hpi_channel: Some(0),
     i2c: 16,
     i2c_channels: (44, 45),
     emac: [
@@ -114,6 +119,8 @@ pub(crate) const C6455_EVENTS: EventMap = EventMap {
 pub(crate) const C6472_EVENTS: EventMap = EventMap {
     family: Family::C6472,
     hpi: 85,
+    // Table 7-4 gives the HPI no synchronisation event; channel 0 is GPINT0.
+    hpi_channel: None,
     i2c: 72,
     i2c_channels: (20, 21),
     emac: [
