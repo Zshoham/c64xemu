@@ -147,6 +147,17 @@ RCPP and XCPP stay clear and an enabled section with a non-zero clock count reac
 clock-failure condition after that many peripheral clocks (SPRUE48 Table 8). The cell path is
 modelled against an external ATM master pulling cells out of the transmit queue.
 
+That master reaches the slave through the UTOPIA Level 2 address phase (SPRUE48 sections 3.1 and
+3.7). With UCR.MPHY set, the reset state, the slave decodes the master's PHY address against
+UCR.SLID: polled at that address it drives UXCLAV with whether a complete cell is queued and
+URCLAV with whether a cell fits, and only a transfer selected at that address moves a cell. At
+any other address, and in a section held in reset, the pins stay high-impedance and the cell
+stays where it is - the master is talking to another PHY. SLID 1Fh is the null PHY no address
+reaches, and the address a case leaves unnamed is 1Fh too, the level the pins are pulled to
+(Table 4). With MPHY clear the bus is not decoded at all. The conformance harness drives this with
+`utopia_master_poll`, `utopia_master_read` and `utopia_master_write`, each taking an optional
+five-bit `address`.
+
 Under the SYSCLK3 schedule the port is stepped on every edge while an enabled section's event or
 UINT is asserted - the device tick treats an asserted UINT as movement on every edge - and
 otherwise only on the edge a section's clock count runs out; its idle counters are derived in

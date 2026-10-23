@@ -1077,9 +1077,9 @@ second DMA access. Still open: the read-burst timeout counter, which nothing on 
 HRDY long enough to reach - the entry in *What is still not modelled* says why a case could only
 assert that it never fires.
 
-**[~] UTOPIA 2.** *Done, including the cell path against an external ATM master.* UCR keeps its
-reserved one above BEND and comes up multi-PHY, CDR starts both clock
-watches at 255 peripheral clocks, and EIER/EIPR pair up with only the four clock bits
+**[x] UTOPIA 2.** *Done, including the cell path and its multi-PHY address phase against an
+external ATM master.* UCR keeps its reserved one above BEND and comes up multi-PHY, CDR starts
+both clock watches at 255 peripheral clocks, and EIER/EIPR pair up with only the four clock bits
 write-one-to-clear. Because nothing drives UXCLK or URCLK here, the clock-present bits stay clear
 and an enabled section with a non-zero count always fails its detector after that many SYSCLK3
 cycles, which is CPU/6; the failure reaches CPU event 36 only once EIER allows it. The transmit
@@ -1100,9 +1100,21 @@ read of one. A write to a full queue is held rather than lost - the manual says 
 until space appears and that data is not overwritten - and XQSP reports the outstanding stall
 until the held word lands. UCR.BEND decides which end of a word the first wire byte comes from.
 Four `memory:utopia-*` cases pin the two directions, the stall and its release, the two-cell
-limit refusing a third cell, and the user-defined cell lengths. What the cell path does not need
-and does not model is the multi-PHY address phase - SLID is stored and reported, and this master
-addresses its one slave directly - which is the entry in *What is still not modelled*.
+limit refusing a third cell, and the user-defined cell lengths.
+
+The master reaches the queues through the multi-PHY address phase (SPRUE48 sections 3.1, 3.2,
+3.4 and 3.7). With UCR.MPHY set - the reset state - the slave decodes the PHY address the master
+drives against SLID: polled there it drives UXCLAV with whether a complete cell is queued and
+URCLAV with whether one fits, and only a transfer selected there moves a cell. Any other address,
+or a section held in reset, leaves both pins high-impedance and the queues untouched, which is
+all the slave sees of the master serving a different PHY - so no second slave model is needed to
+observe the rule. SLID 1Fh is the null PHY that no address reaches (Table 7), and an address the
+case does not name is 1Fh, where the pins are pulled at reset (Table 4). With MPHY clear the bus
+is not decoded. `memory:utopia-multi-phy-address-phase` pins the decode, the refused transfers to
+other addresses and single-PHY ignoring the bus; the unit test
+`only_the_slave_id_answers_the_address_phase` sweeps all 32 addresses and the null SLID. Pin-level
+timing - CLAV answering one UxCLK after the address, URCLAV dropping four clocks before a cell
+ends - is below the cell-level transactions this master performs and is not modelled.
 
 **[~] Device configuration.** *Done.* The chip-level block reports DEVSTAT with the straps a board
 that populates this memory map would set - EMIFA and DDR2 enabled, LENDIAN following the loaded
@@ -1803,12 +1815,6 @@ Every entry here is `[-]`: an inventory, not a plan, and nothing below is in pro
 says what the device would have to do, and - the part that decides whether it is worth doing at
 all - where an expectation independent of this emulator would come from. A section item that names
 one of these entries carries `[~]` rather than `[-]`, because its modelled half is real.
-
-**[-] UTOPIA 2's multi-PHY address phase.** The cell path is modelled, so what is left of this entry
-is the pin-level polling: SLID, the address bus and the cell-available handshake that lets a
-master pick one slave out of several. The model's master addresses the one slave directly, so
-SLID is stored and reported but decides nothing. Modelling the phase needs a second slave to
-choose between, which is a second device model rather than a missing rule.
 
 **[-] McBSP's multichannel selection and companding.** Both ports are modelled - see the peripheral
 section - but three of their features are stored without deciding anything, because each needs a

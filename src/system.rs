@@ -3073,16 +3073,38 @@ impl Fabric {
                 self.hpi_host_write(port, value);
                 Ok(None)
             }
-            // The external ATM master on the UTOPIA pins: it polls the transmit queue for a
-            // cell and offers cells to the receive queue. Like a register access, it acts on the
-            // port as of the current edge and leaves it to be planned again.
+            // The external ATM master on the UTOPIA pins. It drives a PHY address onto the
+            // address bus - the pulled-up null PHY 1Fh when the case names none - and polls the
+            // addressed slave's cell-available pin, or selects that address and takes a cell from
+            // the transmit queue or offers one to the receive queue. Like a register access, it
+            // acts on the port as of the current edge and leaves it to be planned again.
+            "utopia_master_poll" => {
+                let address = utopia_address(operation)?;
+                let transmit = match string_field(operation, "direction")? {
+                    "transmit" => true,
+                    "receive" => false,
+                    other => return Err(format!("unknown UTOPIA direction {other:?}")),
+                };
+                let edge = self.shared.sysclk3_edge;
+                let clav = self.shared.utopia.as_mut().and_then(|utopia| {
+                    let utopia = utopia.at(edge, true);
+                    if transmit {
+                        utopia.master_poll_transmit(address)
+                    } else {
+                        utopia.master_poll_receive(address)
+                    }
+                });
+                self.shared.reschedule(Port::Utopia);
+                Ok(Some(clav.map_or(Value::Null, Value::Bool)))
+            }
             "utopia_master_read" => {
+                let address = utopia_address(operation)?;
                 let edge = self.shared.sysclk3_edge;
                 let cell = self
                     .shared
                     .utopia
                     .as_mut()
-                    .and_then(|utopia| utopia.at(edge, true).master_take_cell());
+                    .and_then(|utopia| utopia.at(edge, true).master_take_cell(address));
                 self.shared.reschedule(Port::Utopia);
                 self.latch_utopia_interrupt();
                 Ok(Some(match cell {
@@ -3091,13 +3113,13 @@ impl Fabric {
                 }))
             }
             "utopia_master_write" => {
+                let address = utopia_address(operation)?;
                 let bytes = decode_hex(string_field(operation, "hex")?)?;
                 let edge = self.shared.sysclk3_edge;
-                let accepted = self
-                    .shared
-                    .utopia
-                    .as_mut()
-                    .is_some_and(|utopia| utopia.at(edge, true).master_send_cell(&bytes));
+                let accepted =
+                    self.shared.utopia.as_mut().is_some_and(|utopia| {
+                        utopia.at(edge, true).master_send_cell(address, &bytes)
+                    });
                 self.shared.reschedule(Port::Utopia);
                 self.latch_utopia_interrupt();
                 Ok(Some(json!(accepted)))
@@ -3158,6 +3180,18 @@ fn host_port(name: &str) -> Result<HostPort, String> {
         "hpid" => Ok(HostPort::Data),
         "hpid_auto" => Ok(HostPort::DataAutoIncrement),
         other => Err(format!("unknown HPI host port {other}")),
+    }
+}
+
+/// The PHY address a UTOPIA master operation drives: five bits, the null PHY when unnamed.
+#[cfg(test)]
+fn utopia_address(operation: &Value) -> Result<u8, String> {
+    match operation.get("address") {
+        None => Ok(crate::utopia::NULL_PHY),
+        Some(_) => match u32_field(operation, "address")? {
+            address @ 0..=0x1f => Ok(address as u8),
+            address => Err(format!("UTOPIA address {address} is wider than five bits")),
+        },
     }
 }
 

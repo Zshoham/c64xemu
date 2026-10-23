@@ -21,6 +21,14 @@
 //! transmit queue is held rather than dropped - the manual says the write stalls until space
 //! appears and that data is not overwritten - and XQSP reports it meanwhile; a read from an empty
 //! receive queue raises RQSP.
+//!
+//! The master reaches the queues through the UTOPIA Level 2 address phase (SPRUE48 sections 3.1,
+//! 3.2, 3.4 and 3.7). In multi-PHY mode (UCR.MPHY, the reset state) the slave answers only the
+//! address UCR.SLID names: polled at that address it drives UXCLAV/URCLAV with whether it has a
+//! cell to send or room for one, and selected there it transfers; at any other address its
+//! outputs stay high-impedance and the master's transfer goes to some other slave. 1Fh is the
+//! null PHY address, which the address pins are pulled to at reset (Table 4) and no slave
+//! answers. In single-PHY mode the address bus is not decoded at all.
 use crate::port::{PortContext, PortWrite, SlavePort};
 use crate::sysclk3::Sysclk3Block;
 #[cfg(test)]
@@ -39,14 +47,32 @@ const RECEIVE_QUEUE: u32 = 0x3c00_0000;
 const TRANSMIT_QUEUE: u32 = 0x3c00_0400;
 const QUEUE_WINDOW: u32 = 0x400;
 
-/// UCR bit 31 selects big-endian cell assembly, bits 30-29 read back the reserved one, MPHY in
-/// bit 14 comes up set, and everything else resets clear (SPRUE48 Figure 15).
+/// UCR's fields (SPRUE48 Figure 15 and Table 7): BEND in bit 31 selects big-endian cell assembly,
+/// bits 30-29 read back the reserved one, SLID in 28-24 is the multi-PHY slave address, XUDC in
+/// 21-18 and RUDC in 5-2 are the user-defined-cell header bytes, UXEN in 16 and UREN in 0 take
+/// each section out of reset, and MPHY in 14 comes up set. Everything else resets clear.
+const UCR_BEND: u32 = 1 << 31;
 const UCR_RESERVED_ONES: u32 = 1 << 29;
-const UCR_WRITABLE: u32 =
-    (1 << 31) | (0x1f << 24) | (0xf << 18) | (1 << 16) | (1 << 14) | (0xf << 2) | 1;
-const UCR_RESET: u32 = UCR_RESERVED_ONES | (1 << 14);
+const UCR_SLID_SHIFT: u32 = 24;
+const UCR_XUDC_SHIFT: u32 = 18;
 const UCR_UXEN: u32 = 1 << 16;
+const UCR_MPHY: u32 = 1 << 14;
+const UCR_RUDC_SHIFT: u32 = 2;
 const UCR_UREN: u32 = 1 << 0;
+/// SLID is five bits, XUDC and RUDC four.
+const UCR_SLID_BITS: u32 = 0x1f;
+const UCR_UDC_BITS: u32 = 0xf;
+const UCR_WRITABLE: u32 = UCR_BEND
+    | (UCR_SLID_BITS << UCR_SLID_SHIFT)
+    | (UCR_UDC_BITS << UCR_XUDC_SHIFT)
+    | UCR_UXEN
+    | UCR_MPHY
+    | (UCR_UDC_BITS << UCR_RUDC_SHIFT)
+    | UCR_UREN;
+const UCR_RESET: u32 = UCR_RESERVED_ONES | UCR_MPHY;
+/// The address no PHY answers (SPRUE48 Table 7), and where the pulled-up pins sit (Table 4).
+#[cfg(test)]
+pub const NULL_PHY: u8 = 0x1f;
 
 /// Both clock counts reset to the maximum wait of 255 peripheral clocks (SPRUE48 Figure 16).
 const CDR_RESET: u32 = (0xff << 16) | 0xff;
@@ -67,10 +93,6 @@ const EIPR_CLEARABLE: u32 = XCPP | XCFP | RCPP | RCFP;
 
 #[cfg(test)]
 const CLOCK_DIVIDER: u32 = 6;
-/// UCR's user-defined-cell fields: extra header bytes on top of the standard 53-byte cell.
-const UCR_XUDC_SHIFT: u32 = 18;
-#[cfg(test)]
-const UCR_RUDC_SHIFT: u32 = 2;
 /// A standard ATM cell is a five-byte header and a 48-byte payload (SPRUE48 section 2).
 const CELL_BYTES: usize = 53;
 /// Both queues hold two cells (SPRS276M section 7.19.1).
@@ -190,12 +212,12 @@ impl Utopia {
     /// The wire length of a transmitted cell: the standard 53 bytes plus the user-defined header
     /// bytes XUDC asks for, which are one to eleven (SPRUE48 Table 7).
     fn transmit_cell_bytes(&self) -> usize {
-        CELL_BYTES + ((self.control >> UCR_XUDC_SHIFT) & 0xf).min(11) as usize
+        CELL_BYTES + ((self.control >> UCR_XUDC_SHIFT) & UCR_UDC_BITS).min(11) as usize
     }
 
     #[cfg(test)]
     fn receive_cell_bytes(&self) -> usize {
-        CELL_BYTES + ((self.control >> UCR_RUDC_SHIFT) & 0xf).min(11) as usize
+        CELL_BYTES + ((self.control >> UCR_RUDC_SHIFT) & UCR_UDC_BITS).min(11) as usize
     }
 
     /// How many of the two cell slots are taken: complete cells, plus the one being written.
@@ -263,12 +285,43 @@ impl Utopia {
         }
     }
 
-    /// The master polls for a cell and takes it if the transmitter has one, which is what UXCLAV
-    /// answers (SPRUE48 section 3.3). The cell comes off the wire in the byte order UCR.BEND
-    /// selects, and a write the queue had stalled lands in the space that frees up.
+    /// The address phase: whether a master driving `address` onto UXADDR/URADDR is talking to
+    /// this slave. Multi-PHY decodes the address against SLID, and SLID 1Fh is the null PHY no
+    /// address reaches; single-PHY ignores the bus (SPRUE48 sections 3.7 and 12.1).
     #[cfg(test)]
-    pub fn master_take_cell(&mut self) -> Option<Vec<u8>> {
-        if self.control & UCR_UXEN == 0 {
+    fn addressed(&self, address: u8) -> bool {
+        if self.control & UCR_MPHY == 0 {
+            return true;
+        }
+        let slave = ((self.control >> UCR_SLID_SHIFT) & UCR_SLID_BITS) as u8;
+        slave != NULL_PHY && u32::from(address) & UCR_SLID_BITS == u32::from(slave)
+    }
+
+    /// UXCLAV as the master samples it after polling `address`: `None` while the pin is
+    /// high-impedance - another slave's address, or a transmitter held in reset, whose outputs
+    /// are tri-stated (SPRUE48 section 9) - and otherwise whether a complete cell is queued
+    /// (sections 3.2 and 3.3).
+    #[cfg(test)]
+    pub fn master_poll_transmit(&self, address: u8) -> Option<bool> {
+        (self.control & UCR_UXEN != 0 && self.addressed(address))
+            .then_some(!self.transmit_cells.is_empty())
+    }
+
+    /// URCLAV the same way: driven only at this slave's address, and set while the receive
+    /// queue has room for a whole cell (sections 3.4 and 3.5).
+    #[cfg(test)]
+    pub fn master_poll_receive(&self, address: u8) -> Option<bool> {
+        (self.control & UCR_UREN != 0 && self.addressed(address))
+            .then_some(self.receive_cells.len() < QUEUE_CELLS)
+    }
+
+    /// The master selects `address` with UXENB and takes a cell if this slave is the one
+    /// addressed and UXCLAV said it had one (SPRUE48 section 3.2). The cell comes off the wire in
+    /// the byte order UCR.BEND selects, and a write the queue had stalled lands in the space that
+    /// frees up.
+    #[cfg(test)]
+    pub fn master_take_cell(&mut self, address: u8) -> Option<Vec<u8>> {
+        if self.master_poll_transmit(address) != Some(true) {
             return None;
         }
         let packet = self.transmit_cells.pop_front()?;
@@ -287,12 +340,12 @@ impl Utopia {
         Some(bytes)
     }
 
-    /// The master offers a cell, which the receiver takes if it has room for one - the URCLAV
-    /// answer of SPRUE48 section 3.5. A short cell is padded, a long one truncated to what RUDC
-    /// says the interface expects.
+    /// The master selects `address` with URENB and sends a cell, which this slave takes only if
+    /// it is the one addressed and URCLAV said it had room (SPRUE48 section 3.4). A short cell
+    /// is padded, a long one truncated to what RUDC says the interface expects.
     #[cfg(test)]
-    pub fn master_send_cell(&mut self, bytes: &[u8]) -> bool {
-        if self.control & UCR_UREN == 0 || self.receive_cells.len() >= QUEUE_CELLS {
+    pub fn master_send_cell(&mut self, address: u8, bytes: &[u8]) -> bool {
+        if self.master_poll_receive(address) != Some(true) {
             return false;
         }
         let wire = self.receive_cell_bytes();
@@ -310,7 +363,7 @@ impl Utopia {
     /// UCR.BEND decides which end of a word the first byte on the wire sits at (SPRUE48 Table 7).
     #[cfg(test)]
     fn word_bytes(&self, word: u32) -> [u8; 4] {
-        if self.control & (1 << 31) != 0 {
+        if self.control & UCR_BEND != 0 {
             word.to_be_bytes()
         } else {
             word.to_le_bytes()
@@ -319,7 +372,7 @@ impl Utopia {
 
     #[cfg(test)]
     fn bytes_word(&self, bytes: [u8; 4]) -> u32 {
-        if self.control & (1 << 31) != 0 {
+        if self.control & UCR_BEND != 0 {
             u32::from_be_bytes(bytes)
         } else {
             u32::from_le_bytes(bytes)
@@ -499,6 +552,46 @@ mod tests {
         assert_eq!(utopia.read(EIPR, TEST_CONTEXT), Some(RQSP));
         // A disabled transmitter raises no synchronisation event at all.
         assert_eq!(clocks(&mut utopia, 4), 0);
+    }
+
+    #[test]
+    fn only_the_slave_id_answers_the_address_phase() {
+        // SPRUE48 sections 3.1 and 3.7: in multi-PHY mode the slave drives its cell-available
+        // pins at its own address only, and leaves them high-impedance for every other one.
+        let cell = [0x5a; CELL_BYTES];
+        let mut utopia = Utopia::default();
+        let slave = 0x0b;
+        let control = UCR_RESET | (slave << UCR_SLID_SHIFT) | UCR_UXEN | UCR_UREN;
+        utopia.write(UCR, control, TEST_CONTEXT);
+        for _ in 0..packet_words(CELL_BYTES) {
+            utopia.write(TRANSMIT_QUEUE, 0x1122_3344, TEST_CONTEXT);
+        }
+        for address in 0..=NULL_PHY {
+            let answer = (u32::from(address) == slave).then_some(true);
+            assert_eq!(utopia.master_poll_transmit(address), answer, "{address:#x}");
+            assert_eq!(utopia.master_poll_receive(address), answer, "{address:#x}");
+        }
+        // Selecting another PHY moves nothing: the cell waits for this slave's address, and the
+        // receive queue does not take a cell meant for someone else.
+        assert_eq!(utopia.master_take_cell(0x0a), None);
+        assert!(!utopia.master_send_cell(0x0c, &cell));
+        assert_eq!(
+            utopia.master_take_cell(0x0b).map(|bytes| bytes.len()),
+            Some(CELL_BYTES)
+        );
+        assert_eq!(utopia.master_poll_transmit(0x0b), Some(false));
+        assert!(utopia.master_send_cell(0x0b, &cell));
+        assert!(utopia.master_send_cell(0x0b, &cell));
+        assert_eq!(utopia.master_poll_receive(0x0b), Some(false));
+
+        // SLID 1Fh is the null PHY, which no address reaches - not even 1Fh itself.
+        utopia.write(UCR, control | (0x1f << UCR_SLID_SHIFT), TEST_CONTEXT);
+        assert!((0..=NULL_PHY).all(|address| utopia.master_poll_receive(address).is_none()));
+        // Single-PHY mode does not decode the bus, and a section in reset tri-states its pin.
+        utopia.write(UCR, control & !UCR_MPHY & !UCR_UXEN, TEST_CONTEXT);
+        assert_eq!(utopia.master_poll_receive(0x03), Some(false));
+        assert_eq!(utopia.master_poll_receive(NULL_PHY), Some(false));
+        assert_eq!(utopia.master_poll_transmit(slave as u8), None);
     }
 
     #[test]
