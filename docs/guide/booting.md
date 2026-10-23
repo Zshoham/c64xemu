@@ -105,6 +105,10 @@ clear the DSPINT, otherwise, no more DSPINTs can be received". Every DSPINT afte
 ordinary interrupt for the application (system event 15). The one that ended the boot arrived
 while the core was in reset, so it is not pending in IFR.
 
+On the C6455 every DSPINT also raises EDMA3 event DSP_EVT (channel 0), including the interrupt
+ending boot (SPRS276M section 7.4.1). Firmware must clear ER bit 0 before enabling channel 0
+if it does not want that pending boot event to initiate a transfer.
+
 `tests/tools/hpi_host.py --boot --image IMAGE` is a host for the C6455 boot. It writes each
 `PT_LOAD` segment, padded with zeros to its memory size, and reads it back to verify it.
 It flushes the final partial FIFO burst by rewriting HPIA, then raises DSPINT.
@@ -120,11 +124,21 @@ with the entry address shifted right by 10, then sets the selected BCn bits in
 `BOOT_COMPLETE_STAT`. Each rising BCn releases that core at its programmed entry.
 Unselected cores remain held. DSPINT alone never releases a C6472 core.
 
-On either device the HPI reaches chip-level peripheral registers (on the C6472, the boot
-controller's among them) as well as memory, and memory protection judges it as privilege ID 0.
-The megamodule registers at `0x0180_0000`-`0x01BF_FFFF` (cache configuration, interrupt
-controller, memory protection) are the CPU's alone (SPRU871K section 5.3.1): the host reads zero
-there and its writes are dropped.
+On either device allowed HPI accesses reach chip-level peripheral registers and memory;
+memory protection judges the HPI as privilege ID 0. The megamodule registers at
+`0x0180_0000`-`0x01BF_FFFF` (cache configuration, interrupt controller and memory protection)
+are the CPU's alone (SPRU871K section 5.3.1).
+
+The C6455 additionally excludes Device Configuration, including Device State Control
+(`0x02A80000`-`0x02AFFFFF`), PLL1 (`0x029A0000`-`0x029BFFFF`) and PLL2
+(`0x029C0000`-`0x029CFFFF`) from host access (SPRS276M section 4.3, Table 5-11 and sections
+7.7.3/7.8.3). These exclusions apply after boot too. The C6472 permits PLL1/PLL2 and boot-controller
+access, but excludes PLL3 at `0x029C0400`-`0x029C07FF` (SPRS612G section 7.10.3).
+
+Forbidden reads return zero and writes are ignored, without holding off the host. For the
+host-inaccessible configuration windows the manuals do not specify a read value or response
+timing: this is deterministic emulator policy, not behavior firmware should rely on in hardware.
+The host filter does not change CPU or IDMA access.
 
 `tests/tools/hpi_host.py --device c6472 --boot --image IMAGE --cores 0,3 --report`
 loads and verifies the image for cores 0 and 3, programs their entries, then releases them

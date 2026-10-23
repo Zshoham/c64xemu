@@ -16,6 +16,7 @@ use crate::memory::{L1DCFG, L1PCFG, L2CFG};
 use crate::romboot::{BootParameters, EmacBoot, Progress};
 use crate::space::{AddressMap, C6455_MAP, C6472_MAP};
 use crate::system::{Endian, Fabric};
+use std::ops::Range;
 
 /// One memory protection region: the local window a unit protects, the size of a page, and the
 /// range of MPPA register indices that cover it (SPRU871K chapter 8; the page geometry is
@@ -65,6 +66,9 @@ pub(crate) struct DeviceProfile {
     /// of it - the megamodule revision below, for one - is its own field rather than something
     /// derived from this one.
     pub(crate) has_boot_controller: bool,
+    /// Configuration windows, reserved tails included, that an external host (HPI) cannot
+    /// reach; accesses there never arrive at a register.
+    pub(crate) host_excluded: &'static [Range<u32>],
     /// Which core runs at reset with no boot controller involved.
     pub(crate) reset_core: usize,
     /// The JTAG/device identification register value.
@@ -156,6 +160,20 @@ const C6472_TIMERS: &[u32] = &[
     0x0269_0000,
 ];
 
+/// The C6455 host cannot reach the chip-level registers (Table 5-11) or Device State Control
+/// (SPRS276M sections 2.4.1 and 4.3), nor the PLL1 and PLL2 controllers (sections 7.7.3 and
+/// 7.8.3: "can only be accessed using the CPU or the emulator").
+const C6455_HOST_EXCLUDED: &[Range<u32>] = &[
+    0x029a_0000..0x029c_0000,
+    0x029c_0000..0x029d_0000,
+    0x02a8_0000..0x02b0_0000,
+];
+
+/// The C6472 restricts only PLL3 (SPRS612G section 7.10.3). Its PLL1/PLL2 controllers and boot
+/// controller are host-programmable before a core is released (SPRUEC6G section 4.3.2).
+#[allow(clippy::single_range_in_vec_init)] // A list of windows that has one entry.
+const C6472_HOST_EXCLUDED: &[Range<u32>] = &[0x029c_0400..0x029c_0800];
+
 pub(crate) const C6455: DeviceProfile = DeviceProfile {
     name: "c6455",
     map: &C6455_MAP,
@@ -170,6 +188,7 @@ pub(crate) const C6455: DeviceProfile = DeviceProfile {
     has_emifa: true,
     has_device_config: true,
     has_boot_controller: false,
+    host_excluded: C6455_HOST_EXCLUDED,
     reset_core: 0,
     jtag_id: 0x0009_202f,
     megamodule_revision: 0x0001_0000,
@@ -194,6 +213,7 @@ pub(crate) const C6472: DeviceProfile = DeviceProfile {
     has_emifa: false,
     has_device_config: false,
     has_boot_controller: true,
+    host_excluded: C6472_HOST_EXCLUDED,
     reset_core: 0,
     jtag_id: 0x0009_102f,
     megamodule_revision: 0x0001_0003,
@@ -890,6 +910,66 @@ mod tests {
         assert_eq!(bus.read32(ER), 0);
     }
 
+    /// SPRS276M sections 2.4.1, 4.3, 7.7.3 and 7.8.3: Device Configuration and PLL1/PLL2 are
+    /// the C64x+ megamodule's alone, so the host is shut out while the CPU and IDMA are not.
+    #[test]
+    fn c6455_hpi_cannot_change_state_or_pll_registers() {
+        use crate::hpi::{HostPort, BOOTMODE_HPI};
+
+        for endian in [Endian::Little, Endian::Big] {
+            for boot_mode in [0, BOOTMODE_HPI] {
+                let mut device = Device::with_boot_mode(&C6455, 0x0080_0000, endian, boot_mode);
+                // Normal mailbox operation opens the HPI from the CPU; boot opens it at reset.
+                if boot_mode == 0 {
+                    device.cpu_mut().bus_mut().write32(0x0288_0030, 0);
+                }
+                for (address, initial, attempted) in [
+                    (0x02a8_0004, 0x311, 0x100),             // PRI_ALLOC
+                    (0x02ac_0004, 0xf0f0_f0f0, 0x0f0a_0b00), // PERLOCK
+                    (0x02ac_0054, 1, 0),                     // EMUBUFPD
+                    (0x029a_0110, 9, 7),                     // PLL1 PLLM
+                    (0x029c_0118, 0x8001, 0x8004),           // PLL2 PLLDIV1
+                ] {
+                    device.cpu_mut().bus_mut().write32(address, initial);
+                    assert_eq!(device.cpu_mut().bus_mut().read32(address), initial);
+                    // Forbidden reads must not expose CPU-visible register state.
+                    // Zero is the emulator's explicit response policy, not a TI reset value.
+                    assert_eq!(host_get(&mut device, address), 0);
+                    device
+                        .fabric()
+                        .hpi_host_write(HostPort::Address, address >> 2);
+                    assert_eq!(
+                        device.fabric().hpi_host_read(HostPort::DataAutoIncrement),
+                        Some(0)
+                    );
+                    host_set(&mut device, address, attempted);
+                    assert_eq!(
+                        device.cpu_mut().bus_mut().read32(address),
+                        initial,
+                        "non-incrementing host write reached {address:#x}"
+                    );
+                    // Both a full burst and a short burst flushed by HPIA must be excluded.
+                    for count in [4, 1] {
+                        host_load(&mut device, address, &[attempted; 4][..count]);
+                        assert_eq!(
+                            device.cpu_mut().bus_mut().read32(address),
+                            initial,
+                            "posted host write reached {address:#x}"
+                        );
+                    }
+                    // The host filter must not leak into the IDMA's word-access path.
+                    device.fabric().master_write32(address, attempted);
+                    assert_eq!(device.cpu_mut().bus_mut().read32(address), attempted);
+                    assert_eq!(device.fabric().master_read32(address), Some(attempted));
+                }
+                // The port remains usable for boot-image memory after denied accesses.
+                host_set(&mut device, 0x0080_1000, 0x1234_5678);
+                assert_eq!(host_get(&mut device, 0x0080_1000), 0x1234_5678);
+                assert_eq!(device.cpu_mut().bus_mut().read32(0x0080_1000), 0x1234_5678);
+            }
+        }
+    }
+
     /// The host's side of a C6472 HPI boot, one word-addressed access at a time. Rewriting the
     /// address register at the end flushes whatever short burst is still posted.
     fn host_load(device: &mut Device, address: u32, words: &[u32]) {
@@ -979,6 +1059,21 @@ mod tests {
                     assert_eq!(bus.read32(L2CFG) & 7, 0, "core {core}");
                 });
             }
+            // Unlike the C6455, this host can configure PLL1 before releasing a core
+            // (SPRUEC6G section 4.3.2). Do not apply the C6455 exclusion to this chip.
+            host_set(&mut device, 0x029a_0110, 7);
+            assert_eq!(host_get(&mut device, 0x029a_0110), 7);
+            device.with_core(0, |cpu| {
+                assert_eq!(cpu.bus_mut().read32(0x029a_0110), 7);
+            });
+            // SPRS612G section 7.10.3 separately excludes PLL3. It is not yet a
+            // register model, but the host must not reach its backing storage either.
+            device.with_core(0, |cpu| cpu.bus_mut().write32(0x029c_0500, 0x40));
+            host_set(&mut device, 0x029c_0500, 1);
+            assert_eq!(host_get(&mut device, 0x029c_0500), 0);
+            device.with_core(0, |cpu| {
+                assert_eq!(cpu.bus_mut().read32(0x029c_0500), 0x40);
+            });
 
             // Loading all six images through the global aliases runs no core.
             for core in 0..6 {

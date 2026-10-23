@@ -1061,8 +1061,8 @@ against dual-HPIA mode keeping the directions apart, the eight-word FIFOs with t
 bursts - three posted words stay in the write FIFO and the fourth commits all four - the flush
 that a non-autoincrement access forces, the two interrupt handshakes with their zero-to-one and
 write-one-to-clear rules, and the software reset holding every host access off until the CPU
-releases it. The HPI's DMA goes through the same path every other master uses, so a host write
-into L2 SRAM is snooped into a line the CPU is holding, which `cache:hpi-write-snoops-a-resident-l1d-line`
+releases it. Allowed HPI memory accesses use the shared DMA path, so a host write into L2 SRAM
+is snooped into a line the CPU is holding, which `cache:hpi-write-snoops-a-resident-l1d-line`
 pins. A process on the host drives all of it: `--hpi-unix` gives the run loop a datagram socket where
 one datagram is one host access, and `tools/hpi_host.py` uses it to exchange a mailbox with
 `firmware/hpi_mailbox`, which takes DSPINT as a real CPU interrupt through INTMUX and answers with
@@ -1356,6 +1356,26 @@ L2 base the probe puts a guard there, so a core started at the default address r
 programmed one fails the run. A native device case covers both byte orders, per-core cache
 straps, short final bursts, the host's exclusion from megamodule registers, selective release
 and set-only BC behavior.
+
+**[x] HPI host configuration access restrictions.** *Done.* The C6455 host cannot reach
+Device Configuration (including Device State Control) or PLL1/PLL2 registers
+(SPRS276M section 4.3, Table 5-11 and sections 7.7.3/7.8.3). The filter covers the whole
+decoded windows, including reserved tails, before any register access or side effect.
+It applies to direct HPID accesses, posted bursts and prefetched reads, during boot and
+ordinary mailbox operation. The CPU and IDMA word-access path remain unchanged.
+
+The C6472 keeps PLL1/PLL2 and its boot controller accessible; only PLL3 is additionally
+excluded, following the specific CPU/emulator-only note in SPRS612G section 7.10.3.
+Neither data manual specifies the response to a forbidden host access. The emulator completes
+reads with zero and ignores writes without stalling; these are explicit emulator conventions,
+not guaranteed silicon values or timing.
+
+`c6455_hpi_cannot_change_state_or_pll_registers` checks isolation in both byte orders and boot
+straps, including full and short write bursts and direct/prefetched reads. The C6472 boot case
+checks that PLL1 remains writable, PLL3 is excluded and selective core release still works.
+Together with the DSPINT/EDMA event coverage above, this closes the documented functional
+HPI boot work for both profiles. The HPI peripheral's separate timing and privilege limitations
+are not a claim of complete pin-level or system-interconnect emulation.
 
 **[-] SRIO and UTOPIA boot.** SRIO still lacks a device model; UTOPIA's ATM master speaks the bus
 but not its boot protocol.

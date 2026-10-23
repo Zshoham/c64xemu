@@ -2080,8 +2080,32 @@ impl Fabric {
     // The host side.
     // ------------------------------------------------------------------
 
-    /// An external host's read cycle on the HPI. The transfer goes through the same DMA path
-    /// every other master uses, so the snoop rules apply to it too.
+    /// Whether an external host's access can reach `address` (`DeviceProfile::host_excluded`).
+    fn hpi_accessible(&self, address: u32) -> bool {
+        !self
+            .profile
+            .host_excluded
+            .iter()
+            .any(|window| window.contains(&address))
+    }
+
+    /// A denied host read does not reach a peripheral. HPI completes it with zero:
+    /// a deterministic emulator policy, not a hardware read value specified by TI.
+    pub(crate) fn hpi_read32(&mut self, address: u32) -> Option<u32> {
+        if !self.hpi_accessible(address) {
+            return None;
+        }
+        self.master_read32(address)
+    }
+
+    pub(crate) fn hpi_write32(&mut self, address: u32, value: u32) {
+        if self.hpi_accessible(address) {
+            self.master_write32(address, value);
+        }
+    }
+
+    /// An external host's read cycle on the HPI. Outside the profile's host-excluded windows the
+    /// transfer goes through the same DMA path every other master uses, so the snoop rules apply.
     pub fn hpi_host_read(&mut self, port: HostPort) -> Option<u32> {
         self.lend_hpi(|hpi, fabric| hpi.host_read(port, fabric))
     }

@@ -243,7 +243,7 @@ Given an address and a requester, this is which module answers:
 | Word-wide master (HPI, IDMA) to memory (`is_memory`) | `Fabric::master_read32`/`master_write32` → privilege-ID-0 protection check → `dma_word`/`dma_store_word`, with the L2 snoop |
 | `DmaMemory` master (EDMA3, EMAC) to memory | `dma_read_bytes`/`dma_write_bytes` → protection check → `dma_bytes`/`dma_store`; `dma_read_u32`/`dma_write_u32` (EMAC descriptors) → `dma_word`/`dma_store_word` directly; both with the L2 snoop |
 | `master_*32` or `dma_*_bytes` to the configuration space | `Fabric::master_register_read`/`master_register_write`: the port walk; the megamodule registers (`0x0180_0000..0x01c0_0000`) read zero and ignore writes (SPRU871K section 5.3.1); anything else is device memory |
-| HPI host side | `Fabric::hpi_host_read`/`hpi_host_write` through `lend_hpi`, then `master_read32`/`master_write32` |
+| HPI host side | `Fabric::hpi_host_read`/`hpi_host_write` through `lend_hpi` → `hpi_read32`/`hpi_write32`, which drop accesses inside `DeviceProfile::host_excluded` (denied reads complete with zero) → `master_read32`/`master_write32` |
 | Debugger or front-end read | `Fabric::host_read_bytes` - backing plus `host_snoop_read`, disturbing no cache state |
 
 A master that moves data - either MAC, the EDMA3, the HPI host side - is moved out of its slot
@@ -281,6 +281,7 @@ value to one of the two constants.
 | `mpu_regions` | Memory protection page geometry of one megamodule: unit, base, page size, MPPA index range |
 | `has_mcbsp`, `has_utopia`, `has_emifa`, `has_device_config` | Peripherals a device either has or does not |
 | `has_boot_controller` | The C6472 block set: boot controller, chip-level registers, power/sleep controller, shared-memory controller and its per-core profilers |
+| `host_excluded` | Configuration windows an external host cannot reach: the HPI filter |
 | `reset_core` | Which core runs at reset with no boot controller involved |
 | `jtag_id`, `megamodule_revision`, `mdio_version` | The identification registers |
 
@@ -295,6 +296,7 @@ value to one of the two constants.
 | MPU geometry | L2 32 x 64 KB, each L1 32 x 1 KB | L2 19 x 32 KB plus 12 x 64 KB shared, each L1 16 x 2 KB |
 | McBSP / UTOPIA / EMIFA / device configuration | yes / yes / yes / yes | no / yes / no / no |
 | Boot controller block set | absent | present |
+| Host-excluded windows | chip-level and device-state registers, PLL1, PLL2 | PLL3 |
 | `jtag_id` | `0x0009_202f` | `0x0009_102f` |
 | `megamodule_revision` | `0x0001_0000` | `0x0001_0003` |
 | `mdio_version` | `0x0007_0102` | `0x0007_0103` |

@@ -289,7 +289,7 @@ impl Hpi {
                 // A write without autoincrementing is a flush condition, so it reaches memory
                 // itself rather than waiting for a burst.
                 self.flush_write(bus);
-                bus.master_write32(self.hpiaw << 2, value);
+                bus.hpi_write32(self.hpiaw << 2, value);
             }
             HostPort::DataAutoIncrement => {
                 if !self.dual_hpia && !self.read_fifo.is_empty() {
@@ -394,7 +394,7 @@ impl Hpi {
     fn flush_write(&mut self, bus: &mut Fabric) {
         let words = std::mem::take(&mut self.write_fifo);
         for (index, word) in words.into_iter().enumerate() {
-            bus.master_write32((self.write_base + index as u32) << 2, word);
+            bus.hpi_write32((self.write_base + index as u32) << 2, word);
         }
         self.write_base = self.hpiaw;
     }
@@ -413,10 +413,12 @@ impl Hpi {
         }
     }
 
-    /// One word the DMA logic reads at a word address. The HPI is a system master with
-    /// privilege ID 0; a read the memory protection refuses brings back zero.
+    /// One word the DMA logic reads at a word address, with privilege ID 0.
+    /// A refused read completes with zero and no HRDY hold-off. For host-inaccessible
+    /// register windows TI specifies no response; zero is the emulator's policy,
+    /// not a promised silicon value.
     fn fetch(bus: &mut Fabric, word_address: u32) -> u32 {
-        bus.master_read32(word_address << 2).unwrap_or(0)
+        bus.hpi_read32(word_address << 2).unwrap_or(0)
     }
 }
 
