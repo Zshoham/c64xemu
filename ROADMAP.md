@@ -17,7 +17,7 @@ across the firmware and program images compared with `dis6x` on seven dimensions
 functional unit, cross-path marking, predicate, memory data path, every memory access's address
 operand, and every operand list the model reads, 285856 of them.
 
-There is no `[ ]` item left, and the method at the head of *Where to look next* is what the last
+EMAC descriptor memory protection remains open, and the method at the head of *Where to look next* is what the last
 two rounds have been: **two rules each modelled and each pinned, with nothing asking what they do
 together.** It has now found six defects. The cache manual's worked examples found a 4% error
 between a correct miss cost and a correct write buffer. Making a cache size carve its SRAM
@@ -611,9 +611,21 @@ supervisor read/write permission. `memory_protection` drives a CPU write without
 The four-word protection key, exact KEYR/LOCK/UNLOCK sequence and lock status are modelled
 for every memory unit; a wrong key leaves the lock engaged and raises the unit's protection
 event. `memory:protection-lock-sequence` checks both failed and successful unlocks. EMAC
-descriptor and buffer traffic now uses external-master AIDX, records FID 6 and raises each
-unit's DMA-side protection event; `memory:emac-obeys-aidx` proves a denied transmit source
-returns no protected data.
+buffer traffic carries PrivID 0 in user mode - SPRS612G Table 5-3 gives every
+peripheral master but the HPI and SRIO PrivID 0 (SPRS276M section 5.2 gives every C6455 master
+ID 0), and section 5.2 says the EMACs "always" transfer in user mode - and raises each unit's
+DMA-side protection event. `memory:emac-reads-with-user-privilege-refused` has a page granting
+AID0 and only supervisor permissions withhold the transmit source and record PrivID 0 with UR;
+`memory:emac-reads-with-user-privilege-granted` has a page granting AID0 and only UR send it.
+This replaced an earlier AIDX/supervisor model of the EMAC that neither manual supports.
+
+**[ ] EMAC descriptor memory protection.** Packet-buffer transfers use the protection check,
+but descriptor word reads and writes still take the unchecked `dma_word`/`dma_store_word` path.
+Descriptors in protected L2 can therefore be read or have ownership updated without the required
+PrivID 0 user permission or a fault. Route the EMAC's descriptor accesses through the same
+protection policy without changing EDMA3's access mode. The checks are a transmit descriptor
+without UR that sends nothing and records a read fault, and one with UR but without UW whose
+ownership remains unchanged and whose completion write records a write fault.
 
 **[x] Which fault a protection block keeps.** *Fixed defect, and the method's sixth find.* Each
 unit's fault registers hold one fault, and both halves of the model latched one - the CPU path on
@@ -1761,9 +1773,9 @@ independent checksum oracle.
 ## Where to look next
 
 Priority only, in rough order of expected yield: every entry names an item above and the item
-carries the box, so nothing here can disagree with an item's state. There is no `[ ]` item left,
-which is why this list is now methods rather than tasks. The last several rounds of defects came
-from four of them, in this order of what they have actually paid.
+carries the box, so nothing here can disagree with an item's state. The open `[ ]` items are
+concrete work with their expectations in hand; beyond them, the last several rounds of defects
+came from these methods, in this order of what they have actually paid.
 
 1. **Where two solved rules meet and no case asks what they do together.** This keeps earning
    more than anything else on the list, and it is now the only one that has been run

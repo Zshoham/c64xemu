@@ -313,11 +313,17 @@ common case is one boolean test on the access path.
 `Fabric::check_access` checks a CPU access against the page of whichever local memory holds it,
 consulting LOCAL plus the supervisor or user permission bit — the AID fields gate DMA masters by
 requester id, and the CPU is the local requester. `check_dma_access` checks the AID bit for the
-requester id (IDs 0–5 have their own bit, 6 and above share AIDX) and the supervisor permission.
+requester id (IDs 0–5 have their own bit, 6 and above share AIDX) and the permission bit for the
+requester's privilege mode: IDMA and the HPI's DMA are ID 0 supervisor, the EMACs and the UTOPIA
+PDMA ID 0 user (SPRS612G section 5.2 and Table 5-3), and the EDMA3's transfers AIDX supervisor.
 A refused access is discarded, and `record_mpu_fault` latches the address in MPFAR and the
 attempted permission in MPFSR and raises the unit's system event: 124, 120, 122 for a CPU fault
 on L2, L1P, L1D, and 125, 121, 123 for a requester's. That event reaches the CPU as `EXCEP`
 through the exception combiner — see [Interrupts and exceptions](interrupts.md).
+
+The EMAC's packet-buffer transfers cross this check, but its descriptor word accesses still
+bypass it through `dma_word`/`dma_store_word`. Protection of descriptors in L2 is not enforced;
+the remaining work is recorded in the roadmap's *EMAC descriptor memory protection* item.
 
 A unit holds its first fault and raises nothing further until software clears it (SPRU871K
 8.4.2.1.3). The one exception is per-unit and quoted rather than generalised: L1P (2.9.2.3.3) and

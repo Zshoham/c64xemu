@@ -1557,7 +1557,7 @@ impl Fabric {
             let mut emac_active = false;
             for index in 0..self.shared.emacs {
                 if self.shared.emac[index].as_ref().unwrap().active() {
-                    self.lend_emac(index, |emac, fabric| emac.tick(fabric));
+                    self.lend_emac(index, |emac, fabric| emac.tick(&mut EmacMaster(fabric)));
                     moved = true;
                 }
                 emac_active |= self.shared.emac[index].as_ref().unwrap().active();
@@ -2258,11 +2258,18 @@ impl Fabric {
         false
     }
 
-    /// DMA accesses carry a requestor PrivID rather than LOCAL. Direct CPU programming of
-    /// IDMA uses ID 0; external masters such as EMAC map through AIDX (IDs >= 6). The unit
-    /// consulted belongs to whichever megamodule owns the memory, which on a multicore device
-    /// is decided by the global address the master used.
-    fn check_dma_access(&mut self, address: u32, permission: Permission, id: u8) -> bool {
+    /// DMA accesses carry a requestor PrivID rather than LOCAL, and the privilege mode the
+    /// master transfers in. IDMA, the HPI's DMA, the UTOPIA PDMA and the EMACs use ID 0; the
+    /// EDMA3's transfers are judged as an external master (AIDX, IDs >= 6). The unit consulted
+    /// belongs to whichever megamodule owns the memory, which on a multicore device is decided by
+    /// the global address the master used.
+    fn check_dma_access(
+        &mut self,
+        address: u32,
+        permission: Permission,
+        id: u8,
+        user: bool,
+    ) -> bool {
         if !(0..self.cores).any(|core| self.mm[core].mpu_dma_restrictive) {
             return true;
         }
@@ -2270,7 +2277,7 @@ impl Fabric {
             return true;
         };
         let attributes = self.mm[core].mpu_pages[unit][page];
-        let permission_bit = permission_bit(permission, false);
+        let permission_bit = permission_bit(permission, user);
         let allowed_id = if id < 6 {
             1 << (10 + u32::from(id))
         } else {
@@ -2429,18 +2436,24 @@ impl Fabric {
         if !is_memory(address) {
             return Some(self.master_register_read(address));
         }
-        if !self.check_dma_access(address, Permission::Read, 0) {
+        if !self.check_dma_access(address, Permission::Read, 0, false) {
             return None;
         }
         Some(self.dma_word(address))
     }
 
     pub(crate) fn master_write32(&mut self, address: u32, value: u32) {
+        self.master_write32_as(address, value, false);
+    }
+
+    /// `master_write32` for a master whose transfers carry `user` privilege rather than the
+    /// supervisor's, with PrivID 0.
+    fn master_write32_as(&mut self, address: u32, value: u32, user: bool) {
         if !is_memory(address) {
             self.master_register_write(address, value);
             return;
         }
-        if !self.check_dma_access(address, Permission::Write, 0) {
+        if !self.check_dma_access(address, Permission::Write, 0, user) {
             return;
         }
         self.dma_store_word(address, value);
@@ -2587,36 +2600,47 @@ impl Fabric {
             self.master_register_write(word_address, value);
         }
     }
-}
 
-impl EmacDmaMemory for Fabric {
-    fn dma_read_bytes(&mut self, address: u32, length: usize) -> Vec<u8> {
-        // A DMA access inside a peripheral aperture reaches that peripheral's register through
-        // its slave port, with all the side effects a CPU read would have, rather than the
-        // memory map behind it.
+    /// `length` bytes for a byte-moving system master that carries PrivID `id` in `user` or
+    /// supervisor mode. A DMA access inside a peripheral aperture reaches that peripheral's
+    /// register through its slave port, with all the side effects a CPU read would have, rather
+    /// than the memory map behind it; a protected byte refuses the whole access.
+    fn requestor_read_bytes(&mut self, address: u32, length: usize, id: u8, user: bool) -> Vec<u8> {
         if !is_memory(address) {
             return self.dma_register_read(address, length);
         }
         for offset in 0..length {
             let byte_address = address.wrapping_add(offset as u32);
-            if !self.check_dma_access(byte_address, Permission::Read, 6) {
+            if !self.check_dma_access(byte_address, Permission::Read, id, user) {
                 return vec![0; length];
             }
         }
         self.dma_bytes(address, length)
     }
 
-    fn dma_write_bytes(&mut self, address: u32, bytes: &[u8]) {
+    fn requestor_write_bytes(&mut self, address: u32, bytes: &[u8], id: u8, user: bool) {
         if !is_memory(address) {
             self.dma_register_write(address, bytes);
             return;
         }
         for offset in 0..bytes.len() {
-            if !self.check_dma_access(address.wrapping_add(offset as u32), Permission::Write, 6) {
+            let byte_address = address.wrapping_add(offset as u32);
+            if !self.check_dma_access(byte_address, Permission::Write, id, user) {
                 return;
             }
         }
         self.dma_store(address, bytes);
+    }
+}
+
+/// The EDMA3's transfers, judged as an external master (AIDX) in supervisor mode.
+impl EmacDmaMemory for Fabric {
+    fn dma_read_bytes(&mut self, address: u32, length: usize) -> Vec<u8> {
+        self.requestor_read_bytes(address, length, 6, false)
+    }
+
+    fn dma_write_bytes(&mut self, address: u32, bytes: &[u8]) {
+        self.requestor_write_bytes(address, bytes, 6, false);
     }
 
     fn dma_read_u32(&mut self, address: u32) -> u32 {
@@ -2625,6 +2649,31 @@ impl EmacDmaMemory for Fabric {
 
     fn dma_write_u32(&mut self, address: u32, value: u32) {
         self.dma_store_word(address, value);
+    }
+}
+
+/// The fabric as an EMAC's DMA sees it. Every peripheral master but the HPI and SRIO carries
+/// PrivID 0 (SPRS612G Table 5-3; on the C6455 every system master does, SPRS276M section 5.2),
+/// and the EMACs always transfer in user mode (SPRS612G section 5.2: "For most peripheral
+/// masters (EMAC0, EMAC1, UTOPIA, TSIP0, TSIP1, and TSIP2), the privilege mode is always user
+/// mode").
+struct EmacMaster<'a>(&'a mut Fabric);
+
+impl EmacDmaMemory for EmacMaster<'_> {
+    fn dma_read_bytes(&mut self, address: u32, length: usize) -> Vec<u8> {
+        self.0.requestor_read_bytes(address, length, 0, true)
+    }
+
+    fn dma_write_bytes(&mut self, address: u32, bytes: &[u8]) {
+        self.0.requestor_write_bytes(address, bytes, 0, true);
+    }
+
+    fn dma_read_u32(&mut self, address: u32) -> u32 {
+        self.0.dma_word(address)
+    }
+
+    fn dma_write_u32(&mut self, address: u32, value: u32) {
+        self.0.dma_store_word(address, value);
     }
 }
 
