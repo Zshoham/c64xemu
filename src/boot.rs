@@ -21,6 +21,8 @@ use crate::system::Endian;
 /// A section count large enough for any real image; a malformed table hits it instead of looping.
 const MAX_SECTIONS: usize = 4096;
 const MAX_ENTRIES: usize = 4096;
+/// The boot exit address the ROM defaults to: the base of L2.
+const DEFAULT_ENTRY: u32 = 0x0080_0000;
 
 /// What the bootloader needs from the machine it is loading.
 pub trait BootMemory {
@@ -111,9 +113,17 @@ impl BootStream {
         }
     }
 
-    /// The entry point the table named, once its terminating zero count has arrived.
+    /// Where the ROM branches once the terminating zero count has arrived: the table's entry
+    /// point, or the base of L2 when the table names 0. SPRUEC6G section 3.3.4 gives 0x800000
+    /// as the default entry point and its Figure 3 tests the boot exit address against zero
+    /// before branching; every ROM boot here shares that rule [INFERENCE: the C6472 chapter
+    /// does not restate it].
     pub fn entry(&self) -> Option<u32> {
-        matches!(self.state, State::Done).then_some(self.entry)
+        matches!(self.state, State::Done).then_some(if self.entry == 0 {
+            DEFAULT_ENTRY
+        } else {
+            self.entry
+        })
     }
 
     /// Process `bytes` and report whether the table has ended. Bytes that follow the terminator
@@ -384,6 +394,17 @@ mod tests {
             memory.bytes_at(0x0080_0000, 4),
             vec![0x11, 0x22, 0x33, 0x44]
         );
+    }
+
+    #[test]
+    fn a_table_that_names_entry_zero_exits_to_the_base_of_l2() {
+        let mut memory = Memory::default();
+        let mut stream = BootStream::new(Endian::Little);
+        let bytes = table_bytes(&[0, 4, 0x0080_0100, 0x1122_3344], Endian::Little);
+        assert_eq!(stream.feed(&bytes, &mut memory), Ok(false));
+        assert_eq!(stream.entry(), None, "no exit before the terminator");
+        assert_eq!(stream.feed(&[0; 4], &mut memory), Ok(true));
+        assert_eq!(stream.entry(), Some(0x0080_0000));
     }
 
     #[test]

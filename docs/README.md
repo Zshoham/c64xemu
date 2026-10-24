@@ -12,7 +12,7 @@ This directory holds three kinds of material, one per subdirectory.
 |---|---|
 | [Getting started](guide/getting-started.md) | Building the emulator, what a fresh checkout provisions, and a first run end to end. |
 | [Command line](guide/command-line.md) | Every `run`, `debug` and `decode` option, the state report, memory dumps, the performance report, and exit codes. |
-| [Booting an image](guide/booting.md) | ELF loading, boot tables and boot configuration tables, the I2C EEPROM boot, and the Ethernet boot with its host side. |
+| [Booting an image](guide/booting.md) | ELF loading, boot/configuration tables, HPI host boot, I2C EEPROM boot, and Ethernet and UTOPIA boot with external hosts. |
 | [Debugging](guide/debugging.md) | The console REPL, the browser dashboard, the GDB stub, execution traces, profiling and fault diagnosis. |
 | [Networking and host I/O](guide/networking-and-host-io.md) | pcap injection and capture, the live Unix-socket Ethernet backend, the TCP peer and TAP bridge, the HPI host side, and CIO. |
 | [The six-core device](guide/multicore.md) | Running `--device c6472`: core release, focus, inter-processor interrupts, shared memory, and one Ethernet connection across six cores. |

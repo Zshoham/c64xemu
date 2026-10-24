@@ -35,6 +35,7 @@ use crate::idma::{Idma, Source as IdmaSource};
 use crate::mcbsp::Mcbsp;
 use crate::mdio::Mdio;
 use crate::memory::{is_memory, AccessTiming, Backing, BoundHierarchy, LineFill, MemoryHierarchy};
+use crate::pdma::{Pdma, MAX_BURST_WORDS};
 use crate::pll::{Pll, Pll2};
 use crate::port::{PortContext, PortWrite, SlavePort};
 use crate::psc::PowerSleep;
@@ -42,7 +43,7 @@ use crate::smc::{SharedMemory, SharedMemoryProfiler};
 use crate::space::{Placement, Requester};
 use crate::sysclk3::Clocked;
 use crate::timer::Timer;
-use crate::utopia::Utopia;
+use crate::utopia::{Utopia, WireCell};
 #[cfg(test)]
 use serde_json::{json, Value};
 
@@ -693,6 +694,7 @@ pub(crate) enum Port {
     Emifa,
     Mcbsp(usize),
     Utopia,
+    Pdma,
     Devcfg,
     Pll2,
     TransferController(usize),
@@ -758,6 +760,7 @@ impl Port {
             | Port::Ddr2
             | Port::Emifa
             | Port::Mcbsp(_)
+            | Port::Pdma
             | Port::Devcfg
             | Port::Pll2
             | Port::Mdio
@@ -787,6 +790,8 @@ pub(crate) struct Shared {
     ddr2: Ddr2,
     emifa: Option<Emifa>,
     utopia: Option<Clocked<Utopia>>,
+    /// The UTOPIA's PDMA, on a device whose UTOPIA has one (`pdma.rs`).
+    pdma: Option<Pdma>,
     mcbsp: Vec<Mcbsp>,
     devcfg: Option<Clocked<DeviceConfig>>,
     pll2: Pll2,
@@ -863,8 +868,11 @@ impl Shared {
         if profile.has_mcbsp {
             ports.extend((0..2).map(Port::Mcbsp));
         }
-        if profile.has_utopia {
+        if profile.utopia.is_some() {
             ports.push(Port::Utopia);
+        }
+        if profile.has_utopia_pdma() {
+            ports.push(Port::Pdma);
         }
         if profile.has_device_config {
             ports.push(Port::Devcfg);
@@ -912,6 +920,7 @@ impl Shared {
             Port::Emifa => self.emifa.as_mut()?,
             Port::Mcbsp(index) => &mut self.mcbsp[index],
             Port::Utopia => self.utopia.as_mut()?.at(edge, true),
+            Port::Pdma => self.pdma.as_mut()?,
             Port::Devcfg => self.devcfg.as_mut()?.at(edge, true),
             Port::Pll2 => &mut self.pll2,
             Port::TransferController(index) => &mut self.transfer_controllers[index],
@@ -1057,7 +1066,10 @@ impl Shared {
             hpi: Hpi::new(hpi_boot),
             ddr2: Ddr2::default(),
             emifa: profile.has_emifa.then(Emifa::default),
-            utopia: profile.has_utopia.then(|| Clocked::new(Utopia::default())),
+            utopia: profile
+                .utopia
+                .map(|utopia| Clocked::new(Utopia::new(utopia))),
+            pdma: profile.has_utopia_pdma().then(Pdma::default),
             mcbsp: if profile.has_mcbsp {
                 vec![
                     Mcbsp::new(0x028c_0000, 0x3000_0000, 0x3000_0010),
@@ -2014,8 +2026,9 @@ impl Fabric {
 
     /// One SYSCLK3 edge of the UTOPIA port if it is due, reporting whether it moved: a
     /// clock-detect section that failed latches an error the interrupt is a level on, and a
-    /// cell either way arms an EDMA channel. A port with both directions disabled cannot do
-    /// either, and a port that is not due does neither and has no interrupt asserted.
+    /// cell either way arms an EDMA channel - or, on a device whose UTOPIA has a PDMA, is
+    /// delivered by it. A port with both directions disabled cannot do either, and a port that
+    /// is not due does neither and has no interrupt asserted.
     fn tick_utopia(&mut self) -> bool {
         let edge = self.shared.sysclk3_edge;
         let Some(utopia) = self.shared.utopia.as_mut() else {
@@ -2026,6 +2039,12 @@ impl Fabric {
         }
         let events = utopia.step(edge, true, Utopia::tick_sysclk3);
         let moved = events.receive || events.transmit || utopia.at(edge, true).interrupt_pending();
+        if let Some(interrupt) = self.profile.events.utopia_pdma_receive {
+            if events.receive {
+                self.service_utopia_receive(interrupt);
+            }
+            return moved;
+        }
         let Some((receive, transmit)) = self.profile.events.utopia_channels else {
             return moved;
         };
@@ -2036,6 +2055,46 @@ impl Fabric {
             self.shared.edma.as_mut().unwrap().trigger_event(transmit);
         }
         moved
+    }
+
+    /// UREVT is asserted: the PDMA takes the event if a receive channel is set up for it, reads
+    /// one burst out of the receive queue, writes it through the switch into memory the way any
+    /// DMA master does, and raises `interrupt` in the core the channel's SINT names when the
+    /// transfer control asks for one (SPRUEG2E sections 4.3 and 6.2). Memory the DMA
+    /// protection refuses is not written. The UTOPIA is planned again from the queue the burst
+    /// left, because the read cleared the event.
+    fn service_utopia_receive(&mut self, interrupt: usize) {
+        let edge = self.shared.sysclk3_edge;
+        let (Some(utopia), Some(pdma)) = (self.shared.utopia.as_mut(), self.shared.pdma.as_mut())
+        else {
+            return;
+        };
+        let utopia_block = utopia.at(edge, true);
+        let event = utopia_block
+            .receive_event_route()
+            .map(|id| crate::pdma::ReceiveEvent {
+                id,
+                generation: utopia_block.receive_generation(),
+            });
+        let Some(burst) = pdma.receive_event(event) else {
+            return;
+        };
+        let mut words = [0u32; MAX_BURST_WORDS];
+        for word in &mut words[..burst.words] {
+            *word = utopia_block.read_receive_queue();
+        }
+        utopia.plan(true);
+        let delivery = pdma.deliver_receive(burst, &words[..burst.words]);
+        // The PDMA is a switch master like any other: memory under protection and the snoop
+        // protocol, a register through its port. UTOPIA transfers are always user mode, with
+        // PrivID 0 (SPRS612G section 5.2: "For most peripheral masters (EMAC0, EMAC1, UTOPIA,
+        // TSIP0, TSIP1, and TSIP2), the privilege mode is always user mode").
+        for &(address, word) in delivery.stores() {
+            self.master_write32_as(address, word, true);
+        }
+        if let Some(core) = delivery.interrupt {
+            self.raise(Destination::Core(core), interrupt);
+        }
     }
 
     /// The UTOPIA error interrupt, which is a level, so it answers whether it is asserting.
@@ -2183,6 +2242,67 @@ impl Fabric {
         if let Some(chip) = self.shared.chipcfg.as_mut() {
             chip.fuse_mac_id(mac);
         }
+    }
+
+    /// Strap the pins a UTOPIA boot reads: the PHY ID on CFGGP[4:0] and the UTOPIA_EN pins for
+    /// an 8- or 16-bit port. A device without a chip-level register file has no such pins.
+    pub(crate) fn strap_utopia(&mut self, phy: u8, wide: bool) {
+        if let Some(chip) = self.shared.chipcfg.as_mut() {
+            chip.strap_utopia(phy, wide);
+        }
+    }
+
+    /// URCLAV as an external ATM master sees it after polling `address` on URADDR: `None` while
+    /// the pin is high-impedance, otherwise whether the receive queue has room for a whole cell.
+    pub fn utopia_master_poll_receive(&mut self, address: u8) -> Option<bool> {
+        let edge = self.shared.sysclk3_edge;
+        self.shared
+            .utopia
+            .as_mut()?
+            .at(edge, true)
+            .master_poll_receive(address)
+    }
+
+    /// The master selects `address` and sends one cell's wire bytes into the receive queue. The
+    /// cell is taken only if the slave answered that address with room for it; where the PDMA
+    /// delivers it, and the interrupt that tells the CPU, follow on the SYSCLK3 edges the device
+    /// ticks through.
+    pub fn utopia_master_send_cell(&mut self, address: u8, bytes: &[u8]) -> bool {
+        let edge = self.shared.sysclk3_edge;
+        let Some(utopia) = self.shared.utopia.as_mut() else {
+            return false;
+        };
+        let accepted = utopia.at(edge, true).master_send_cell(address, bytes);
+        self.shared.touched();
+        self.shared.reschedule(Port::Utopia);
+        accepted
+    }
+
+    /// UXCLAV as an external ATM master sees it after polling `address` on UXADDR: `None` while
+    /// the pin is high-impedance, otherwise whether a complete cell is waiting to be sent.
+    pub fn utopia_master_poll_transmit(&mut self, address: u8) -> Option<bool> {
+        let edge = self.shared.sysclk3_edge;
+        self.shared
+            .utopia
+            .as_mut()?
+            .at(edge, true)
+            .master_poll_transmit(address)
+    }
+
+    /// The master selects `address` and takes the cell the transmit queue holds, if the slave
+    /// answered that address with one. A write the full queue had stalled lands in the space it
+    /// frees, and the transmit event that follows is the device's to raise on its next edge.
+    pub fn utopia_master_take_cell(&mut self, address: u8) -> Option<WireCell> {
+        let edge = self.shared.sysclk3_edge;
+        let cell = self
+            .shared
+            .utopia
+            .as_mut()?
+            .at(edge, true)
+            .master_take_cell(address);
+        self.shared.touched();
+        self.shared.reschedule(Port::Utopia);
+        cell
     }
 
     pub(crate) fn take_tx_frames(&mut self) -> Vec<Vec<u8>> {
@@ -3157,7 +3277,7 @@ impl Fabric {
                 self.shared.reschedule(Port::Utopia);
                 self.latch_utopia_interrupt();
                 Ok(Some(match cell {
-                    Some(bytes) => json!(encode_hex(&bytes)),
+                    Some(cell) => json!(encode_hex(cell.bytes())),
                     None => Value::Null,
                 }))
             }
@@ -3631,6 +3751,12 @@ mod tests {
             (0x02cc_0000, Port::Emac(1)),
             (0x02c8_1000, Port::Emic(0)),
             (0x02cc_1000, Port::Emic(1)),
+            // The UTOPIA's configuration and PDMA windows (SPRS612G Tables 7-142 and 7-143).
+            (0x02b4_0000, Port::Utopia),
+            (0x02b4_0020, Port::Utopia),
+            (0x02b4_0104, Port::Utopia),
+            (0x02bc_0000, Port::Pdma),
+            (0x02bc_0180, Port::Pdma),
             (0x02c8_1800, Port::Mdio),
             // Twelve timers on 64 KB boundaries from 0x025E 0000: 0-5 belong to the
             // megamodules, 6-11 are shared (SPRS612G section 7.16.2).
@@ -3828,12 +3954,15 @@ mod tests {
                     (0x3400_0010, 4),
                 ]);
             }
-            if profile.has_utopia {
+            if profile.utopia.is_some() {
                 windows.extend([
                     (0x02b4_0000, 0x20),
                     (0x3c00_0000, 0x400),
                     (0x3c00_0400, 0x400),
                 ]);
+            }
+            if profile.has_utopia_pdma() {
+                windows.extend([(0x02b4_0020, 0x24), (0x02b4_0100, 8), (0x02bc_0000, 0x200)]);
             }
             if profile.has_device_config {
                 windows.extend([(0x02a8_0000, 0x0c), (0x02ac_0000, 0x58)]);
@@ -4243,5 +4372,174 @@ mod tests {
             raised[0] > 200 && raised[1] > 20,
             "matches seen: {raised:?}"
         );
+    }
+
+    mod utopia_pdma {
+        use super::*;
+
+        const UTOPIA: u32 = 0x02b4_0000;
+        const PDMA: u32 = 0x02bc_0000;
+        const RXC0: u32 = PDMA + 0x180;
+        const L1D: u32 = 0x10f0_0000;
+        const SLAVE: u8 = 3;
+        const PACKET_BYTES: u32 = 56;
+        const PRINT: usize = 30;
+
+        /// A C6472 with its UTOPIA enabled as slave 3 in 8-bit, multi-PHY mode (little-endian
+        /// assembly, as the device is) and channel 8 programmed as the boot ROM does: ABU into a
+        /// four-cell buffer in core 0's L1D, 32-bit elements, interrupt at half and end.
+        fn receiver(enable_channel: bool) -> Fabric {
+            let mut fabric = Fabric::new(&crate::device::C6472);
+            fabric.master_write32(UTOPIA, (u32::from(SLAVE) << 24) | (1 << 14) | 1);
+            let group = (2 << 22) | (1 << 20) | (1 << 17) | (1 << 16) | (13 << 12) | (1 << 11);
+            fabric.master_write32(PDMA + 0x64, group | (13 << 4));
+            fabric.master_write32(RXC0, L1D);
+            fabric.master_write32(RXC0 + 4, crate::pdma::RECEIVE_QUEUE_PORT);
+            fabric.master_write32(RXC0 + 8, 4 * PACKET_BYTES);
+            fabric.master_write32(PDMA + 4, 1 << 31);
+            if enable_channel {
+                enable(&mut fabric);
+            }
+            fabric
+        }
+
+        fn enable(fabric: &mut Fabric) {
+            let control = (1 << 31) | (1 << 28) | (1 << 27) | (2 << 22) | (2 << 20);
+            fabric.master_write32(RXC0 + 12, control);
+        }
+
+        /// A standard cell whose payload words are recognisable: header bytes 0xa0+cell, then
+        /// bytes counting up from the cell number.
+        fn cell(number: u8) -> Vec<u8> {
+            let mut cell = vec![0xa0 + number; 5];
+            cell.extend((0..48).map(|i| number.wrapping_mul(0x10).wrapping_add(i)));
+            cell
+        }
+
+        fn run(fabric: &mut Fabric, cycles: u32) {
+            for _ in 0..cycles {
+                fabric.tick_once();
+            }
+        }
+
+        fn print_flagged(fabric: &Fabric) -> bool {
+            fabric.megamodule(0).event_flag_registers()[PRINT / 32] & (1 << (PRINT % 32)) != 0
+        }
+
+        fn clear_print(fabric: &mut Fabric) {
+            fabric.write32(0, EVTCLR0, 1 << PRINT);
+        }
+
+        fn word(fabric: &mut Fabric, address: u32) -> u32 {
+            fabric.master_read32(address).unwrap()
+        }
+
+        #[test]
+        fn cells_reach_l1d_through_channel_eight_and_interrupt_at_half_and_full() {
+            let mut fabric = receiver(true);
+            for number in 0..4u8 {
+                assert_eq!(fabric.utopia_master_poll_receive(SLAVE), Some(true));
+                assert!(fabric.utopia_master_send_cell(SLAVE, &cell(number)));
+                run(&mut fabric, 60);
+                let at = L1D + u32::from(number) * PACKET_BYTES;
+                // Three dummy bytes, Header 1, then the payload at byte 8 of the packet.
+                assert_eq!(word(&mut fabric, at), u32::from(0xa0 + number) << 24);
+                assert_eq!(
+                    word(&mut fabric, at + 8),
+                    u32::from_le_bytes(std::array::from_fn(|i| {
+                        number.wrapping_mul(0x10).wrapping_add(i as u8)
+                    }))
+                );
+                // The write pointer reads back through the proxy, and a cell that has been
+                // moved leaves room for the next one.
+                let next = (u32::from(number) + 1) % 4;
+                assert_eq!(word(&mut fabric, RXC0), L1D + next * PACKET_BYTES);
+                assert_eq!(fabric.utopia_master_poll_receive(SLAVE), Some(true));
+                // Half way through (the second cell) and at the end (the fourth).
+                let interrupted = number == 1 || number == 3;
+                assert_eq!(print_flagged(&fabric), interrupted, "cell {number}");
+                clear_print(&mut fabric);
+            }
+        }
+
+        #[test]
+        fn the_pdma_writes_with_user_privilege() {
+            // SPRS612G section 5.2: UTOPIA transfers are always user mode, PrivID 0. L1DMPPA16
+            // guards core 0's first 2 KB of L1D, where the buffer starts; every attribute keeps
+            // AID0, the local bit and supervisor read, so the result can be read back.
+            const L1DMPPA16: u32 = 0x0184_ae40;
+            const L1DMPFAR: u32 = 0x0184_ac00;
+            const L1DMPFSR: u32 = 0x0184_ac04;
+            const AID0: u32 = 1 << 10;
+            const LOCAL: u32 = 1 << 8;
+            const SR: u32 = 1 << 5;
+            const SW: u32 = 1 << 4;
+            const UW: u32 = 1 << 1;
+            for (attributes, lands) in [
+                (AID0 | LOCAL | SR | SW, false),
+                (AID0 | LOCAL | SR | UW, true),
+            ] {
+                let mut fabric = receiver(true);
+                fabric.write32(0, L1DMPPA16, attributes);
+                assert!(fabric.utopia_master_send_cell(SLAVE, &cell(1)));
+                run(&mut fabric, 60);
+                let first = word(&mut fabric, L1D);
+                let status = fabric.read32(0, L1DMPFSR);
+                if lands {
+                    assert_eq!(first, 0xa1 << 24, "user write granted");
+                    assert_eq!(status, 0, "no fault");
+                } else {
+                    assert_eq!(first, 0, "user write refused although supervisor may write");
+                    assert_eq!(fabric.read32(0, L1DMPFAR), L1D);
+                    assert_eq!(status, UW, "PrivID 0, user write");
+                }
+            }
+        }
+
+        #[test]
+        fn a_disabled_channel_backs_two_cells_up_and_then_takes_them() {
+            let mut fabric = receiver(false);
+            assert!(fabric.utopia_master_send_cell(SLAVE, &cell(0)));
+            assert!(fabric.utopia_master_send_cell(SLAVE, &cell(1)));
+            assert_eq!(fabric.utopia_master_poll_receive(SLAVE), Some(false));
+            assert!(!fabric.utopia_master_send_cell(SLAVE, &cell(2)));
+            run(&mut fabric, 120);
+            // Nothing moved: the cells are still in the queue, and the PDMA counted the event.
+            assert_eq!(fabric.utopia_master_poll_receive(SLAVE), Some(false));
+            assert_eq!(word(&mut fabric, L1D), 0);
+            assert!(!print_flagged(&fabric));
+            assert_eq!(word(&mut fabric, PDMA + 0x24) & 0xffff, 1);
+            // Programming the channel releases the event the peripheral was holding, cell by cell.
+            enable(&mut fabric);
+            run(&mut fabric, 120);
+            assert_eq!(word(&mut fabric, L1D) >> 24, 0xa0);
+            assert_eq!(word(&mut fabric, L1D + PACKET_BYTES) >> 24, 0xa1);
+            assert_eq!(fabric.utopia_master_poll_receive(SLAVE), Some(true));
+            assert!(
+                print_flagged(&fabric),
+                "the second cell reaches the half-buffer mark"
+            );
+        }
+
+        #[test]
+        fn disabling_the_channel_stops_delivery_and_a_wrong_phy_is_not_heard() {
+            let mut fabric = receiver(true);
+            assert_eq!(fabric.utopia_master_poll_receive(SLAVE + 1), None);
+            assert!(!fabric.utopia_master_send_cell(SLAVE + 1, &cell(5)));
+            run(&mut fabric, 60);
+            assert_eq!(word(&mut fabric, L1D), 0);
+            assert_eq!(fabric.utopia_master_poll_receive(SLAVE), Some(true));
+            // The ROM's last step: a TCR write with STRT clear.
+            fabric.master_write32(RXC0 + 12, 0);
+            assert!(fabric.utopia_master_send_cell(SLAVE, &cell(1)));
+            run(&mut fabric, 60);
+            assert_eq!(word(&mut fabric, L1D), 0);
+            assert_eq!(word(&mut fabric, RXC0), L1D);
+            assert_eq!(word(&mut fabric, RXC0 + 12), 0);
+            // The cell is still waiting, and nothing is flagged.
+            assert!(!print_flagged(&fabric));
+            assert!(fabric.utopia_master_send_cell(SLAVE, &cell(2)));
+            assert_eq!(fabric.utopia_master_poll_receive(SLAVE), Some(false));
+        }
     }
 }

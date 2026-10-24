@@ -16,6 +16,8 @@ use crate::memory::{L1DCFG, L1PCFG, L2CFG};
 use crate::romboot::{BootParameters, EmacBoot, Progress};
 use crate::space::{AddressMap, C6455_MAP, C6472_MAP};
 use crate::system::{Endian, Fabric};
+use crate::utopia::{UtopiaProfile, C6455_UTOPIA, C6472_UTOPIA};
+use crate::utopiaboot::{Progress as UtopiaProgress, UtopiaBoot};
 use std::ops::Range;
 
 /// One memory protection region: the local window a unit protects, the size of a page, and the
@@ -53,7 +55,8 @@ pub(crate) struct DeviceProfile {
     pub(crate) mpu_regions: &'static [MpuRegion],
     /// Peripherals a device either has or does not.
     pub(crate) has_mcbsp: bool,
-    pub(crate) has_utopia: bool,
+    /// The UTOPIA 2 port and what it has: CPU queue windows, or the SPRUEG2E PDMA.
+    pub(crate) utopia: Option<&'static UtopiaProfile>,
     pub(crate) has_emifa: bool,
     /// The C6455's device configuration block at 0x02AC_0000.
     pub(crate) has_device_config: bool,
@@ -184,7 +187,7 @@ pub(crate) const C6455: DeviceProfile = DeviceProfile {
     megamodule_timers: 0,
     mpu_regions: C6455_MPU_REGIONS,
     has_mcbsp: true,
-    has_utopia: true,
+    utopia: Some(&C6455_UTOPIA),
     has_emifa: true,
     has_device_config: true,
     has_boot_controller: false,
@@ -208,7 +211,7 @@ pub(crate) const C6472: DeviceProfile = DeviceProfile {
     mpu_regions: C6472_MPU_REGIONS,
     // Three TSIPs replace the McBSPs, and the UTOPIA is a slave port with its own PDMA.
     has_mcbsp: false,
-    has_utopia: true,
+    utopia: Some(&C6472_UTOPIA),
     // The C6472 has no asynchronous EMIF: DDR2 is its only external memory.
     has_emifa: false,
     has_device_config: false,
@@ -223,6 +226,11 @@ pub(crate) const C6472: DeviceProfile = DeviceProfile {
 impl DeviceProfile {
     pub(crate) fn cores(&self) -> usize {
         self.map.cores
+    }
+
+    /// Whether the UTOPIA's queues are serviced by the SPRUEG2E PDMA.
+    pub(crate) fn has_utopia_pdma(&self) -> bool {
+        self.utopia.is_some_and(|utopia| utopia.pdma)
     }
 
     /// The profile a `--device` value names.
@@ -240,6 +248,7 @@ impl DeviceProfile {
 enum RomBoot {
     Emac(EmacBoot),
     I2c(I2cBoot),
+    Utopia(UtopiaBoot),
 }
 
 impl RomBoot {
@@ -248,6 +257,7 @@ impl RomBoot {
         match self {
             Self::Emac(boot) => boot.tick(fabric),
             Self::I2c(boot) => boot.tick(fabric),
+            Self::Utopia(boot) => boot.tick(fabric),
         }
     }
 }
@@ -414,6 +424,28 @@ impl Device {
         self.rom_boot = Some(RomBoot::I2c(I2cBoot::new(index, endian)));
     }
 
+    /// Strap the device to the ROM bootloader's UTOPIA boot, BOOTMODE 5-8 (SPRUEC6G section
+    /// 4.3.4), with `phy` on CFGGP[4:0] as the PHY ID the port answers to. The mode picks the
+    /// port width and PLL multiplier; the ATM master that sends the cells reaches the receive
+    /// queue through `Fabric::utopia_master_poll_receive` and `utopia_master_send_cell`. Core 0
+    /// is held while the boot code runs in its place, and the other cores stay held until the
+    /// boot table releases them.
+    pub fn begin_utopia_boot(&mut self, mode: u8, phy: u8) {
+        let endian = self.fabric().endian();
+        let boot = UtopiaBoot::new(mode, phy, endian);
+        self.fabric().strap_utopia(phy, boot.is_wide());
+        self.fabric().set_held_in_reset(0, true);
+        self.rom_boot = Some(RomBoot::Utopia(boot));
+    }
+
+    /// What the UTOPIA boot has done, when the device was strapped to one.
+    pub fn utopia_boot(&self) -> Option<UtopiaProgress> {
+        match self.rom_boot.as_ref()? {
+            RomBoot::Utopia(boot) => Some(boot.progress()),
+            _ => None,
+        }
+    }
+
     /// Where the host's release started a core of an HPI boot, once it has: the base of L2 for
     /// the C6455's core 0, the core's DSP_BOOT_ADDR as the host left it for the C6472's. `None`
     /// while the core is still held, and for a core that no HPI boot released.
@@ -425,7 +457,7 @@ impl Device {
     pub fn i2c_boot(&self) -> Option<I2cProgress> {
         match self.rom_boot.as_ref()? {
             RomBoot::I2c(boot) => Some(boot.progress()),
-            RomBoot::Emac(_) => None,
+            _ => None,
         }
     }
 
@@ -452,7 +484,7 @@ impl Device {
     pub fn ethernet_boot(&self) -> Option<Progress> {
         match self.rom_boot.as_ref()? {
             RomBoot::Emac(boot) => Some(boot.progress()),
-            RomBoot::I2c(_) => None,
+            _ => None,
         }
     }
 
@@ -1523,5 +1555,376 @@ mod tests {
             device.step_cycle();
         }
         assert!(count(&mut device, TIMER1) > gated, "the timer counts again");
+    }
+
+    /// SPRUEC6G section 4.3.4: the UTOPIA boot of the C6472, driven the way an external ATM
+    /// master drives it - through the receive queue, one cell at a time, with the ROM taking the
+    /// cells off the PDMA's buffer when an interrupt wakes it.
+    mod utopia_boot {
+        use super::*;
+        use crate::utopiaboot::Progress as UtopiaProgress;
+
+        const PHY: u8 = 0x15;
+        const DEVSTAT: u32 = 0x02a8_0000;
+        const UCR: u32 = 0x02b4_0000;
+        const UCR_BEND: u32 = 1 << 31;
+        const UCR_SLID: u32 = 0x1f << 24;
+        const UCR_MPHY: u32 = 1 << 14;
+        const UCR_U16M: u32 = 1 << 13;
+        const UCR_UREN: u32 = 1 << 0;
+        const PDMA_RXC0: u32 = 0x02bc_0180;
+        const PDMA_TCR: u32 = 0xc;
+        const PLLM: u32 = 0x029a_0110;
+        const TIMER0: u32 = 0x025e_0000;
+        const DSP_BOOT_ADDR1: u32 = DSP_BOOT_ADDR0 + 0x20;
+        /// MVK .L1 k,A4 with k in bits 22-18, and ADD .L1 1,A4,A4.
+        const MVK_A4: u32 = 0x0200_a358;
+        const ADD_A4: u32 = 0x0210_2058;
+        const MAGIC: [u8; 4] = [0x54, 0x49, 0x21, 0x64];
+        /// Mode, 16-bit port, PLL multiplier (SPRUEC6G Table 22).
+        const MODES: [(u8, bool, u32); 4] =
+            [(5, false, 10), (6, false, 20), (7, true, 10), (8, true, 20)];
+        const CODE: u32 = 0x0080_1000;
+        const DATA: u32 = 0x0081_0000;
+        const CORE1_CODE: u32 = 0x0080_2400;
+
+        fn label(endian: Endian, mode: u8) -> String {
+            let order = if endian == Endian::Big {
+                "big"
+            } else {
+                "little"
+            };
+            format!("{order}-endian mode {mode}")
+        }
+
+        fn boot_device(endian: Endian, mode: u8) -> Device {
+            let mut device = Device::with_boot_mode(&C6472, 0x0080_0000, endian, mode);
+            device.begin_utopia_boot(mode, PHY);
+            device
+        }
+
+        /// Table words as the hex conversion utility's `-order M` writes them, most significant
+        /// byte first: with the ROM's big-endian cell assembly that is how a table reaches L1D
+        /// in the device's own byte order, whichever that is.
+        fn wire(words: &[u32]) -> Vec<u8> {
+            words.iter().flat_map(|word| word.to_be_bytes()).collect()
+        }
+
+        /// A boot table that loads core 0's three-instruction program, a 40-byte data section,
+        /// core 1's two-instruction program through its global alias, and then names core 1's
+        /// start address and sets its boot-complete bit, which is what starts it. Core 0 ends
+        /// with 7 in A4 and core 1 with 8.
+        fn full_table() -> Vec<u8> {
+            let data: Vec<u32> = (0..10).map(|index| 0x0101_0101u32 * (index + 1)).collect();
+            let mut words = vec![CODE, 12, CODE, MVK_A4 | (5 << 18), ADD_A4, ADD_A4];
+            words.extend([40, DATA]);
+            words.extend(&data);
+            words.extend([8, 0x1000_0000 + (1 << 24) + CORE1_CODE]);
+            words.extend([MVK_A4 | (7 << 18), ADD_A4]);
+            words.extend([4, DSP_BOOT_ADDR1, CORE1_CODE >> 10]);
+            words.extend([4, BOOT_COMPLETE_STAT, 0b11]);
+            words.push(0);
+            wire(&words)
+        }
+
+        /// A table that only loads core 0's program, which fits in one cell.
+        fn short_table() -> Vec<u8> {
+            wire(&[CODE, 12, CODE, MVK_A4 | (5 << 18), ADD_A4, ADD_A4, 0])
+        }
+
+        /// What an ATM master puts on the wire: the header, 32 bytes of table, the magic and
+        /// the 12 bytes of payload after it that complete the 48 (SPRUEG2E section 2).
+        fn cell(wide: bool, table: &[u8], magic: [u8; 4]) -> Vec<u8> {
+            let header = if wide { 6 } else { 5 };
+            let mut cell: Vec<u8> = (1..=header).collect();
+            let mut chunk = table.to_vec();
+            chunk.resize(32, 0);
+            cell.extend(chunk);
+            cell.extend(magic);
+            cell.extend([0x5a; 12]);
+            assert_eq!(cell.len(), if wide { 54 } else { 53 });
+            cell
+        }
+
+        fn table_cells(wide: bool, table: &[u8]) -> Vec<Vec<u8>> {
+            table
+                .chunks(32)
+                .map(|chunk| cell(wide, chunk, MAGIC))
+                .collect()
+        }
+
+        /// Cells that are not boot cells: no magic, a different magic, and the magic the wrong
+        /// way round.
+        fn junk_cell(wide: bool, kind: usize) -> Vec<u8> {
+            let magic = [[0; 4], [0x54, 0x49, 0x21, 0x65], [0x64, 0x21, 0x49, 0x54]][kind % 3];
+            cell(wide, &[0xee; 32], magic)
+        }
+
+        fn send(device: &mut Device, cell: &[u8]) {
+            for _ in 0..200_000 {
+                if device.fabric().utopia_master_poll_receive(PHY) == Some(true) {
+                    assert!(device.fabric().utopia_master_send_cell(PHY, cell));
+                    return;
+                }
+                device.step_cycle();
+            }
+            panic!("the receive queue never had room for a cell");
+        }
+
+        fn boot_until_done(device: &mut Device) -> UtopiaProgress {
+            for _ in 0..600_000 {
+                if let Some(progress) = device
+                    .utopia_boot()
+                    .filter(|progress| progress.entry.is_some() || progress.error.is_some())
+                {
+                    return progress;
+                }
+                device.step_cycle();
+            }
+            panic!("the boot never ended: {:?}", device.utopia_boot());
+        }
+
+        fn read(device: &mut Device, address: u32) -> u32 {
+            device.with_core(0, |cpu| cpu.bus_mut().read32(address))
+        }
+
+        /// Whether a receive channel of the PDMA is enabled, read back through its proxy block:
+        /// a read of the switch address register loads the proxies from the live context.
+        fn channel_enabled(device: &mut Device, channel: u32) -> bool {
+            let proxy = PDMA_RXC0 + 0x10 * channel;
+            device.with_core(0, |cpu| {
+                let mut bus = cpu.bus_mut();
+                bus.read32(proxy);
+                bus.read32(proxy + PDMA_TCR) >> 31 != 0
+            })
+        }
+
+        #[test]
+        fn a_table_spanning_cells_boots_and_runs_in_every_mode_and_byte_order() {
+            for endian in [Endian::Little, Endian::Big] {
+                for (mode, wide, multiplier) in MODES {
+                    let label = label(endian, mode);
+                    let mut device = boot_device(endian, mode);
+                    run(&mut device, 200);
+
+                    // The ROM holds core 0 while it runs in its place, and the other cores
+                    // wait for the table to release them. The pins say which boot this is.
+                    for core in 0..6 {
+                        assert!(device.held_in_reset(core), "{label}: core {core}");
+                    }
+                    let devstat = read(&mut device, DEVSTAT);
+                    assert_eq!(devstat & 0xf, u32::from(mode), "{label}: BOOTMODE");
+                    assert_eq!((devstat >> 17) & 0x1f, u32::from(PHY), "{label}: CFGGP");
+
+                    // What the ROM programmed, read back through the registers it used: Table
+                    // 21's cache settings, the mode's PLL multiplier, a big-endian multi-PHY
+                    // receiver at the PHY ID and the width the mode names, the PDMA channel
+                    // and the timer.
+                    assert_eq!(read(&mut device, L1PCFG) & 7, 4, "{label}: L1P");
+                    assert_eq!(read(&mut device, L1DCFG) & 7, 3, "{label}: L1D");
+                    assert_eq!(read(&mut device, L2CFG) & 7, 0, "{label}: L2 cache is off");
+                    assert_eq!(read(&mut device, PLLM) & 0x3f, multiplier - 1, "{label}");
+                    let mask = UCR_BEND | UCR_SLID | UCR_MPHY | UCR_U16M | UCR_UREN;
+                    let expected = UCR_BEND
+                        | (u32::from(PHY) << 24)
+                        | UCR_MPHY
+                        | UCR_UREN
+                        | if wide { UCR_U16M } else { 0 };
+                    assert_eq!(read(&mut device, UCR) & mask, expected, "{label}: UCR");
+                    assert!(channel_enabled(&mut device, 0), "{label}: PDMA channel 8");
+                    let period = if wide { 4166 } else { 8333 };
+                    assert_eq!(read(&mut device, TIMER0 + 0x18) + 1, period, "{label}");
+
+                    // Only the PHY the pins name answers, and a cell sent to another is lost.
+                    assert_eq!(
+                        device.fabric().utopia_master_poll_receive(PHY),
+                        Some(true),
+                        "{label}"
+                    );
+                    for other in [PHY ^ 1, 0x1f] {
+                        assert_eq!(
+                            device.fabric().utopia_master_poll_receive(other),
+                            None,
+                            "{label}: PHY {other}"
+                        );
+                        let stray = cell(wide, &[0; 32], MAGIC);
+                        assert!(!device.fabric().utopia_master_send_cell(other, &stray));
+                    }
+
+                    // The table is 116 bytes: four cells, with sections that straddle them.
+                    let table = full_table();
+                    assert_eq!(table.len(), 116);
+                    for cell in table_cells(wide, &table) {
+                        send(&mut device, &cell);
+                    }
+                    // The ROM is asleep until something wakes it: four cells reach neither half
+                    // of the buffer, so it is the timer at its documented cadence.
+                    let sent = device.cycle();
+                    assert!(device.held_in_reset(0), "{label}: core 0 runs the ROM");
+                    let progress = boot_until_done(&mut device);
+                    assert_eq!(progress.error, None, "{label}");
+                    assert_eq!(progress.entry, Some(CODE), "{label}");
+                    assert_eq!(progress.accepted, 4, "{label}");
+                    assert_eq!(progress.discarded, 0, "{label}");
+                    assert_eq!(progress.table_bytes, 128, "{label}");
+                    let ended = device.cycle();
+                    // The counter starts from zero and the first match comes PRD timer clocks
+                    // later; after that it restarts from zero the clock after each match, so the
+                    // steady period is PRD + 1 clocks, the 100 us (50 us) the manual asks for
+                    // (SPRU968 Table 12). Each timer clock is six device cycles.
+                    let first_match = 6 * u64::from(period - 1);
+                    assert!(sent < first_match, "{label}: the cells arrived in time");
+                    assert!(ended >= first_match, "{label}: woke after {ended}");
+                    assert!(ended < first_match + 600, "{label}: woke after {ended}");
+
+                    // The ROM ended the way the manual says: every receive channel and the
+                    // timer disabled, and core 0 released at the entry point.
+                    for channel in 0..6 {
+                        assert!(
+                            !channel_enabled(&mut device, channel),
+                            "{label}: PDMA channel {}",
+                            8 + channel
+                        );
+                    }
+                    assert_eq!(read(&mut device, TIMER0 + 0x20), 0, "{label}: TCR");
+                    assert_eq!(read(&mut device, TIMER0 + 0x24), 0, "{label}: TGCR");
+                    assert!(!device.held_in_reset(0), "{label}");
+                    assert_eq!(device.core(0).pc(), CODE, "{label}");
+
+                    // The table's sections landed, and its release started core 1 alone.
+                    for index in 0..10u32 {
+                        assert_eq!(
+                            read(&mut device, DATA + 4 * index),
+                            0x0101_0101 * (index + 1),
+                            "{label}: data word {index}"
+                        );
+                    }
+                    run(&mut device, 400);
+                    assert_eq!(device.core(0).register('A', 4), 7, "{label}: core 0");
+                    assert!(device.core(0).pc() >= CODE + 12, "{label}");
+                    assert!(!device.held_in_reset(1), "{label}: core 1");
+                    assert_eq!(device.core(1).register('A', 4), 8, "{label}: core 1");
+                    for core in 2..6 {
+                        assert!(device.held_in_reset(core), "{label}: core {core}");
+                        assert_eq!(device.core(core).cycles(), 0, "{label}: core {core}");
+                    }
+                    // Nothing is left latched for the application to find as an interrupt.
+                    assert_eq!(read(&mut device, 0x0180_0000) & ((1 << 16) | (1 << 30)), 0);
+                }
+            }
+        }
+
+        #[test]
+        fn cells_without_the_magic_are_discarded_and_counted_wherever_they_fall() {
+            for endian in [Endian::Little, Endian::Big] {
+                for (mode, wide) in [(5, false), (8, true)] {
+                    let label = label(endian, mode);
+                    let mut device = boot_device(endian, mode);
+                    let cells = table_cells(wide, &full_table());
+                    assert_eq!(cells.len(), 4);
+                    // Junk before the first table cell, between the others and at the head of
+                    // the last, in every flavour of wrong.
+                    let mut junk = 0;
+                    for (index, table_cell) in cells.iter().enumerate() {
+                        if index != 2 {
+                            send(&mut device, &junk_cell(wide, junk));
+                            junk += 1;
+                        }
+                        send(&mut device, table_cell);
+                    }
+                    assert_eq!(junk, 3);
+                    let progress = boot_until_done(&mut device);
+                    assert_eq!(progress.error, None, "{label}");
+                    assert_eq!(progress.accepted, 4, "{label}");
+                    assert_eq!(progress.discarded, 3, "{label}");
+                    assert_eq!(progress.table_bytes, 128, "{label}");
+                    assert_eq!(progress.entry, Some(CODE), "{label}");
+                    // Junk contributed nothing to the table, so the program is the one sent.
+                    run(&mut device, 400);
+                    assert_eq!(device.core(0).register('A', 4), 7, "{label}");
+                    assert_eq!(device.core(1).register('A', 4), 8, "{label}");
+                }
+            }
+        }
+
+        #[test]
+        fn the_half_buffer_interrupt_wakes_the_rom_and_the_buffer_wraps() {
+            for endian in [Endian::Little, Endian::Big] {
+                let label = label(endian, 7);
+                let mut device = boot_device(endian, 7);
+                // 292 cells fit in the 16 KB buffer, and the PDMA interrupts at 146 and 292.
+                // 300 cells that are not boot cells push the write position through both marks
+                // and past the wrap, and the boot cell after them lands near the buffer's start.
+                for index in 0..300 {
+                    send(&mut device, &junk_cell(true, index));
+                }
+                for cell in table_cells(true, &short_table()) {
+                    send(&mut device, &cell);
+                }
+                let progress = boot_until_done(&mut device);
+                assert_eq!(progress.error, None, "{label}");
+                assert_eq!(progress.discarded, 300, "{label}");
+                assert_eq!(progress.accepted, 1, "{label}");
+                assert_eq!(progress.entry, Some(CODE), "{label}");
+                run(&mut device, 400);
+                assert_eq!(device.core(0).register('A', 4), 7, "{label}");
+                assert!(device.held_in_reset(1), "{label}: no table released core 1");
+            }
+        }
+
+        #[test]
+        fn the_full_buffer_interrupt_wakes_the_rom_before_the_timer() {
+            // The boot cell is the 292nd packet, the one that fills the buffer: the PDMA's
+            // end-of-buffer interrupt has to wake the ROM, because it is sent just after a
+            // timer match and the next one is almost 50 us away.
+            let mut device = boot_device(Endian::Little, 7);
+            for index in 0..291 {
+                send(&mut device, &junk_cell(true, index));
+            }
+            let period = read(&mut device, TIMER0 + 0x18) + 1;
+            for _ in 0..200_000 {
+                if read(&mut device, TIMER0 + 0x10) < 8 {
+                    break;
+                }
+                device.step_cycle();
+            }
+            assert!(
+                read(&mut device, TIMER0 + 0x10) < 8,
+                "the timer never restarted"
+            );
+            let cells = table_cells(true, &short_table());
+            assert_eq!(cells.len(), 1);
+            send(&mut device, &cells[0]);
+            let sent = device.cycle();
+            let progress = boot_until_done(&mut device);
+            assert_eq!(progress.entry, Some(CODE));
+            assert_eq!(progress.discarded, 291);
+            let woke = device.cycle() - sent;
+            assert!(
+                woke < 6 * u64::from(period) / 4,
+                "woke {woke} cycles after the last cell, the timer's turn"
+            );
+        }
+
+        #[test]
+        fn the_boot_stops_without_an_entry_point_when_the_table_never_ends() {
+            let mut device = boot_device(Endian::Little, 5);
+            // An entry point and then sections that never end: the stream refuses the table
+            // once it has more sections than any real image, and the core stays held.
+            let mut table = wire(&[CODE]);
+            for _ in 0..4097 {
+                table.extend(wire(&[4, DATA, 0xa5a5_a5a5]));
+            }
+            for cell in table_cells(false, &table) {
+                send(&mut device, &cell);
+            }
+            let progress = boot_until_done(&mut device);
+            assert_eq!(progress.entry, None);
+            assert!(progress.error.is_some());
+            assert!(
+                device.held_in_reset(0),
+                "the core is not given a bogus entry"
+            );
+        }
     }
 }

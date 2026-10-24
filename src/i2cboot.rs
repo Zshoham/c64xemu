@@ -100,10 +100,6 @@ const OPTION_TABLE_TYPE: u16 = 0x3;
 const TABLE_TYPE_PARAMETERS: u16 = 0;
 const TABLE_TYPE_BOOT_TABLE: u16 = 1;
 
-/// Where core 0 starts when the boot table names no entry point (SPRUEC6G section 2.3.4.2 for
-/// the table's own entry point; this is the fall-back the Ethernet boot uses too).
-const DEFAULT_ENTRY: u32 = 0x0080_0000;
-
 /// How many boot parameter blocks the boot will chase before giving up. The format lets one
 /// parameter table name another, so a malformed EEPROM could point at itself.
 const MAX_PARAMETER_BLOCKS: usize = 8;
@@ -296,8 +292,7 @@ impl I2cBoot {
                         None
                     }
                     Ok(true) => {
-                        let entry = self.stream.entry().unwrap_or(0);
-                        let entry = if entry == 0 { DEFAULT_ENTRY } else { entry };
+                        let entry = self.stream.entry().expect("an ended table has an exit");
                         // The ROM leaves the module in reset on the way out, as it found it.
                         bus.write32(ICMDR, 0);
                         self.progress.entry = Some(entry);

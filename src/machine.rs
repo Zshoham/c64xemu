@@ -14,10 +14,11 @@ use crate::cpu::Cpu;
 use crate::cpu::{CpuSnapshot, StatsCounters};
 use crate::device::{Device, DeviceProfile};
 use crate::elf::{Image, Segment};
-use crate::netio::{hex, Ethernet, EthernetFiles, HostLink, PollSchedule};
+use crate::netio::{hex, Ethernet, EthernetFiles, HostLink};
 use crate::romboot::BootParameters;
 use crate::system::{Endian, Fabric};
 use crate::trace::Trace;
+use crate::utopia::{CELL_BYTES, MAX_CELL_BYTES, NULL_PHY};
 use crate::view::{SploopDump, UnitIssue};
 use clap::{Args, ValueEnum};
 use serde_json::{json, Value};
@@ -55,8 +56,8 @@ pub struct MachineArgs {
     #[arg(long, default_value = "c6455", value_name = "NAME")]
     pub device: String,
     /// The BOOTMODE pins: mode 1 boots through --hpi-unix on either device; C6455 mode 5
-    /// reads --i2c-eeprom. C6472 modes 9 and 10 boot over MAC port 0 or 1. Mode 0 starts
-    /// every core; other C6472 ROM modes start core 0, which releases the remaining cores
+    /// reads --i2c-eeprom. C6472 modes 5-8 boot through --utopia-unix, and modes 9 and 10
+    /// over MAC port 0 or 1. Mode 0 starts every core; other C6472 modes release them by software
     #[arg(long, default_value_t = 0, value_name = "MODE")]
     pub boot_mode: u8,
     /// The serial EEPROM image on the I2C bus, which boot mode 5 reads its boot parameters and
@@ -73,6 +74,10 @@ pub struct MachineArgs {
     /// The UDP port an Ethernet boot accepts boot-table frames on
     #[arg(long, default_value_t = 9, value_name = "PORT")]
     pub boot_udp_port: u16,
+    /// The C6472 CFG[4:0] PHY address a UTOPIA boot (modes 5-8) reads, default 0 (31 is the
+    /// unreachable null PHY)
+    #[arg(long, value_parser = clap::value_parser!(u8).range(0..=31), value_name = "N")]
+    pub utopia_phy: Option<u8>,
     /// Stop when the PC reaches this address (default: C$$EXIT, then abort)
     #[arg(long, value_name = "ADDR|SYM")]
     pub stop_pc: Option<String>,
@@ -113,6 +118,13 @@ pub struct MachineArgs {
     /// How often, in cycles, the run loop looks for host accesses
     #[arg(long, default_value_t = 1_024, value_parser = non_zero_cycles, value_name = "CYCLES")]
     pub hpi_poll: u64,
+    /// Unix datagram socket for the external UTOPIA ATM master (cell-level poll, write and read
+    /// requests)
+    #[arg(long, value_name = "PATH")]
+    pub utopia_unix: Option<PathBuf>,
+    /// How often, in cycles, the run loop looks for UTOPIA master requests
+    #[arg(long, default_value_t = 1_024, value_parser = non_zero_cycles, value_name = "CYCLES")]
+    pub utopia_poll: u64,
     /// Write an execution trace to this path
     #[arg(long, value_name = "FILE")]
     pub trace: Option<PathBuf>,
@@ -212,7 +224,8 @@ pub struct Machine {
     cio_output: Vec<u8>,
     ethernet: Ethernet,
     host_link: Option<HostLink>,
-    hpi_poll: PollSchedule,
+    utopia_link: Option<HostLink>,
+    utopia_phy: u8,
     trace_exceptions: bool,
     profiling: bool,
     trace: Option<(PathBuf, bool, Option<usize>, u64)>,
@@ -305,6 +318,25 @@ impl Machine {
         let profile = DeviceProfile::named(&args.device)
             .ok_or_else(|| format!("unknown device {}", args.device))?;
         let hpi_boot = args.boot_mode == crate::hpi::BOOTMODE_HPI;
+        let utopia_boot = utopia_boot(profile, args.boot_mode);
+        if utopia_boot {
+            if args.utopia_unix.is_none() {
+                return Err("C6472 UTOPIA boot requires an ATM master on --utopia-unix".into());
+            }
+            if args.i2c_eeprom.is_some() || args.boot_config.is_some() {
+                return Err(
+                    "UTOPIA boot receives its image from the ATM master; --i2c-eeprom and \
+                     --boot-config cannot be combined with it"
+                        .into(),
+                );
+            }
+        } else if args.utopia_phy.is_some() {
+            return Err(
+                "--utopia-phy straps the PHY address a C6472 UTOPIA boot reads (--device c6472 \
+                 --boot-mode 5-8); nothing else reads it"
+                    .into(),
+            );
+        }
         if hpi_boot {
             if args.hpi_unix.is_none() {
                 return Err(format!(
@@ -328,7 +360,10 @@ impl Machine {
             }
             None => None,
         };
-        if args.boot_mode == crate::i2cboot::BOOTMODE_I2C_EEPROM && i2c_eeprom.is_none() {
+        if !profile.has_boot_controller
+            && args.boot_mode == crate::i2cboot::BOOTMODE_I2C_EEPROM
+            && i2c_eeprom.is_none()
+        {
             return Err(format!(
                 "boot mode {} is the ROM's I2C EEPROM boot; give it the EEPROM with \
                  --i2c-eeprom",
@@ -342,7 +377,7 @@ impl Machine {
             Some(Err(message)) => return Err(message),
             None => false,
         };
-        let load = if ethernet_boot || hpi_boot || i2c_eeprom.is_some() {
+        let load = if ethernet_boot || hpi_boot || utopia_boot || i2c_eeprom.is_some() {
             Load::Wire
         } else {
             Load::Segments(image.segments)
@@ -381,10 +416,18 @@ impl Machine {
                 },
             )?,
             host_link: match &args.hpi_unix {
-                Some(path) => Some(HostLink::bind(path, args.hpi_peer.as_deref())?),
+                Some(path) => Some(HostLink::bind(
+                    path,
+                    args.hpi_peer.as_deref(),
+                    args.hpi_poll,
+                )?),
                 None => None,
             },
-            hpi_poll: PollSchedule::new(args.hpi_poll),
+            utopia_link: match &args.utopia_unix {
+                Some(path) => Some(HostLink::bind(path, None, args.utopia_poll)?),
+                None => None,
+            },
+            utopia_phy: args.utopia_phy.unwrap_or(0),
             trace_exceptions: args.trace_exceptions,
             profiling: args.profile,
             trace: args.trace.as_ref().map(|path| {
@@ -484,7 +527,8 @@ impl Machine {
             cio_output: Vec::new(),
             ethernet: Ethernet::offline(),
             host_link: None,
-            hpi_poll: PollSchedule::new(1),
+            utopia_link: None,
+            utopia_phy: 0,
             trace_exceptions: false,
             profiling: false,
             trace: None,
@@ -542,7 +586,12 @@ impl Machine {
         let profiling = self.profiling;
         self.device.cpu_mut().set_profiling(profiling);
         self.ethernet.reset_poll();
-        self.hpi_poll.reset();
+        for link in [&mut self.host_link, &mut self.utopia_link]
+            .into_iter()
+            .flatten()
+        {
+            link.reset_poll();
+        }
         // The board's fused Ethernet address: what the ROM's Ethernet boot names itself by, and
         // what any firmware reads out of the MAC ID words (SPRS612G Table 3-2).
         self.device.fabric().fuse_mac_id(self.mac_id);
@@ -554,6 +603,10 @@ impl Machine {
                     ..BootParameters::default()
                 },
             );
+        }
+        if utopia_boot(self.profile, self.boot_mode) {
+            self.device
+                .begin_utopia_boot(self.boot_mode, self.utopia_phy);
         }
         if let Some(contents) = &self.i2c_eeprom {
             let contents = contents.clone();
@@ -609,6 +662,7 @@ impl Machine {
     fn step(&mut self) -> Result<(), String> {
         self.with_ethernet(Ethernet::service);
         self.service_host_port();
+        self.service_utopia_master();
         self.pump_cio()?;
         // Every core out of reset runs this cycle, and the shared peripherals advance once.
         self.device.step_cycle();
@@ -646,29 +700,71 @@ impl Machine {
 
     fn service_host_port(&mut self) {
         let cycle = self.run_clock();
-        if self.host_link.is_none() || !self.hpi_poll.take_due(cycle) {
-            return;
-        }
         let Some(link) = self.host_link.as_mut() else {
             return;
         };
-        let mut requests = Vec::new();
-        while let Some((direction, port, value)) = link.receive() {
-            requests.push((direction, port, value));
+        if !link.take_due(cycle) {
+            return;
         }
-        for (direction, port, value) in requests {
+        while let Some((direction, port, value)) = link.receive() {
             let Some(port) = host_port(port) else {
                 continue;
             };
+            let mut bus = self.device.cpu_mut().bus_mut();
             if direction == b'r' {
-                let reply = self.device.cpu_mut().bus_mut().hpi_host_read(port);
-                let link = self.host_link.as_mut().expect("host link");
-                match reply {
+                match bus.hpi_host_read(port) {
                     Some(value) => link.reply(&value.to_le_bytes()),
                     None => link.reply(&[]),
                 }
             } else {
-                self.device.cpu_mut().bus_mut().hpi_host_write(port, value);
+                bus.hpi_host_write(port, value);
+            }
+        }
+    }
+
+    /// The ATM master's requests, one datagram each: the opcode, the five-bit PHY address it
+    /// drives, and for a write the cell's wire bytes. The replies are the address phase's
+    /// answer - URCLAV/UXCLAV, or nothing for a high-impedance pin - and the transfer's.
+    fn service_utopia_master(&mut self) {
+        const REQUEST_HEADER: usize = 2;
+        const INVALID: u8 = 0xff;
+        let cycle = self.run_clock();
+        let Some(link) = self.utopia_link.as_mut() else {
+            return;
+        };
+        if !link.take_due(cycle) {
+            return;
+        }
+        // One byte past the longest request, so an oversized cell is seen even when recv_from
+        // truncates the datagram.
+        let mut bytes = [0; REQUEST_HEADER + MAX_CELL_BYTES + 1];
+        let shortest_write = REQUEST_HEADER + CELL_BYTES;
+        let longest_write = REQUEST_HEADER + MAX_CELL_BYTES;
+        while let Some(length) = link.receive_datagram(&mut bytes) {
+            if length < REQUEST_HEADER || bytes[1] > NULL_PHY {
+                link.reply(&[INVALID]);
+                continue;
+            }
+            let (opcode, phy) = (bytes[0], bytes[1]);
+            let fabric = self.device.fabric();
+            match (opcode, length) {
+                (b'p', REQUEST_HEADER) => match fabric.utopia_master_poll_receive(phy) {
+                    Some(room) => link.reply(&[u8::from(room)]),
+                    None => link.reply(&[]),
+                },
+                (b'w', _) if (shortest_write..=longest_write).contains(&length) => {
+                    let accepted = fabric.utopia_master_send_cell(phy, &bytes[2..length]);
+                    link.reply(&[u8::from(accepted)]);
+                }
+                (b'x', REQUEST_HEADER) => match fabric.utopia_master_poll_transmit(phy) {
+                    Some(waiting) => link.reply(&[u8::from(waiting)]),
+                    None => link.reply(&[]),
+                },
+                (b'r', REQUEST_HEADER) => match fabric.utopia_master_take_cell(phy) {
+                    Some(cell) => link.reply(cell.bytes()),
+                    None => link.reply(&[0]),
+                },
+                _ => link.reply(&[INVALID]),
             }
         }
     }
@@ -869,14 +965,15 @@ impl Machine {
 
             self.with_ethernet(Ethernet::service);
             self.service_host_port();
+            self.service_utopia_master();
             let handled_cio = self.pump_cio()?;
 
             let mut batch = 4096u64;
             if let Some(delay) = self.ethernet.poll_delay(current) {
                 batch = batch.min(delay);
             }
-            if self.host_link.is_some() {
-                batch = batch.min(self.hpi_poll.delay(current));
+            for link in [&self.host_link, &self.utopia_link].into_iter().flatten() {
+                batch = batch.min(link.poll_delay(current));
             }
             if let Some(limit) = deadline {
                 batch = batch.min(limit.saturating_sub(current).max(1));
@@ -1206,6 +1303,15 @@ impl Machine {
                 "error": boot.error,
             });
         }
+        if let Some(boot) = self.device.utopia_boot() {
+            state["utopia_boot"] = json!({
+                "cells_accepted": boot.accepted,
+                "cells_discarded": boot.discarded,
+                "table_bytes": boot.table_bytes,
+                "entry": boot.entry,
+                "error": boot.error,
+            });
+        }
         if self.boot_mode == crate::hpi::BOOTMODE_HPI {
             state["hpi_boot"] = json!({
                 "entry": self.device.hpi_boot_entry(0),
@@ -1424,6 +1530,12 @@ fn cio_handshake(image: &Image) -> Option<(u32, u32)> {
         .get("__CIOBUF_")
         .or_else(|| image.symbols.get("_CIOBUF_"))?;
     Some((*breakpoint, *buffer))
+}
+
+/// Whether the strapped boot mode is the C6472 ROM's UTOPIA boot (SPRUEC6G section 4.3.4). The
+/// C6455's modes 5-8 are other boots (section 2.3).
+fn utopia_boot(profile: &DeviceProfile, boot_mode: u8) -> bool {
+    profile.has_boot_controller && crate::utopiaboot::is_boot_mode(boot_mode)
 }
 
 /// The MAC port register base an Ethernet boot uses, when the strapped boot mode asks for one:

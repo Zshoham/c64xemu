@@ -10,16 +10,18 @@ prints each result for several inputs localises a mismatch in two runs; the manu
 examples make good unit tests; a host build of the same C source is the strongest oracle for
 anything the compiler can express.
 
-Current state: 1934 suite cases, all of them passing, plus 292 Rust unit tests and 388 component
-vectors driven from them. Beyond the cases, three differentials against TI's own tools run inside
-every suite pass: all 2195 instruction words in binutils' tic6x vectors, and 436813 instructions
+Current state: 1965 collected pytest cases and 739 native tests, including 390 component vectors.
+Three differentials against TI's own tools run inside every suite pass: all 2195 instruction
+words in binutils' tic6x vectors, and 436813 instructions
 across the firmware and program images compared with `dis6x` on seven dimensions - mnemonic,
 functional unit, cross-path marking, predicate, memory data path, every memory access's address
 operand, and every operand list the model reads, 285856 of them.
 
-EMAC descriptor memory protection remains open, and the method at the head of *Where to look next* is what the last
-two rounds have been: **two rules each modelled and each pinned, with nothing asking what they do
-together.** It has now found six defects. The cache manual's worked examples found a 4% error
+Four `[ ]` items are open: EMAC descriptor memory protection, EDMA3 transfers carrying the
+programmer's privilege, the C6472 PDMA beyond the boot's receive path, and UTOPIA boot's
+I2C-selected parameters. Beyond them, the method at the head of
+*Where to look next* remains **two rules each modelled and each pinned, with nothing asking what
+they do together.** It has found six defects. The cache manual's worked examples found a 4% error
 between a correct miss cost and a correct write buffer. Making a cache size carve its SRAM
 aperture found that a megamodule was caching its own L1 memory, which two sections of SPRU871K
 forbid. Enabling the EMAC's transmit mask found that a shared, edge-latched interrupt line makes
@@ -627,6 +629,18 @@ protection policy without changing EDMA3's access mode. The checks are a transmi
 without UR that sends nothing and records a read fault, and one with UR but without UW whose
 ownership remains unchanged and whose completion write records a write fault.
 
+**[ ] EDMA3 transfers carry the programmer's privilege.** Every EDMA3 transfer is judged as an
+external master - AIDX in supervisor mode - whoever set it up. SPRS612G Table 5-3 says the
+opposite: a CPU-programmed EDMA transfer inherits that core's PrivID (AID0-AID5) and privilege
+mode ("Also applies to EDMA transfers that are programmed by the CPU"), and SPRS276M section 5.2
+gives every C6455 master PrivID 0. SPRU966C section 2.10.2 is the mechanism: proxied memory
+protection records the submitter's PRIV and PRIVID with the transfer, and the transfer
+controller reads and writes with them (SAMPPRXY and DFMPPRXY, Tables 4-80 and 4-89). The channel
+controller already tracks the requesting privilege for its own active protection
+(`set_requestor_privilege`); the transfer path does not use it. The checks are a User-mode
+core's transfer refused by a page granting only supervisor writes to its AID, the same transfer
+accepted from Supervisor mode, and a page granting AIDX alone refusing it on a C6472.
+
 **[x] Which fault a protection block keeps.** *Fixed defect, and the method's sixth find.* Each
 unit's fault registers hold one fault, and both halves of the model latched one - the CPU path on
 every refused access, the DMA path only into empty registers - with nothing asking what the pair
@@ -1114,6 +1128,12 @@ until the held word lands. UCR.BEND decides which end of a word the first wire b
 Four `memory:utopia-*` cases pin the two directions, the stall and its release, the two-cell
 limit refusing a third cell, and the user-defined cell lengths.
 
+`--utopia-unix` connects a real master process over a Unix datagram socket: polls of either
+CLAV pin, cell writes and cell reads at a PHY address. `tests/test_utopia.py` runs
+`tests/firmware/utopia_echo/` on the C6455, which copies every received cell into the transmit
+queue; the master reads back exactly the cells it sent, past a high-impedance poll of another
+address and a read with nothing waiting.
+
 The master reaches the queues through the multi-PHY address phase (SPRUE48 sections 3.1, 3.2,
 3.4 and 3.7). With UCR.MPHY set - the reset state - the slave decodes the PHY address the master
 drives against SLID: polled there it drives UXCLAV with whether a complete cell is queued and
@@ -1127,6 +1147,47 @@ other addresses and single-PHY ignoring the bus; the unit test
 `only_the_slave_id_answers_the_address_phase` sweeps all 32 addresses and the null SLID. Pin-level
 timing - CLAV answering one UxCLK after the address, URCLAV dropping four clocks before a cell
 ends - is below the cell-level transactions this master performs and is not modelled.
+
+**[x] UTOPIA cell-packet padding.** *Fixed.* The cell path once put the word-alignment padding
+after the wire bytes. SPRUE48 section 2 and Figures 9-14 put the dummy bytes in front of the
+header, leaving the 48-byte payload word-aligned at packet byte 8, and SPRUEG2E Tables 6-15 draw
+the C6472's packets the same way. Both directions on both devices now pack that way. The five
+C6455 `memory:utopia-*` vectors were migrated with their data: the transmit words a program
+writes and the receive words it reads are now the figures' packets, computed from Figure 9 (BEND
+= 0) and Figure 10 (BEND = 1) rather than from the emulator, so the cells on the wire are the
+numbered cells they always were. The stalled-write case's cell now starts with the stalled
+word's last byte as Header 1. Clearing UREN leaves the receive queue as it is: neither manual
+says a receiver reset empties it.
+
+**[~] C6472 UTOPIA receive PDMA.** *The boot receive path is implemented.* SPRUEG2E's U16M and
+receive routing unit select the cell width and one of six receive channels. `src/pdma.rs`
+implements the global controls, channel proxies, SAR-first context readback, receive ABU
+wrapping and block completion, and half/full interrupts (PRINT, event 30 in the SINT-selected
+core). The ROM uses channel 8 and a 16352-byte circular buffer in core 0's addressable L1D.
+Wrong-PHY transfers do not enter the queue; a disabled channel lets two cells accumulate and
+backpressures the next until enabled. The PDMA's stores go through the switch as any DMA
+master's do, so a configuration-space destination reaches its register, and memory protection
+judges them as PrivID 0 in user mode, which SPRS612G section 5.2 gives every UTOPIA transfer:
+`the_pdma_writes_with_user_privilege` has a page that grants only the supervisor's write refuse
+the cell and record a user-write fault, and one that grants only the user's take it. A completed
+block clears STRT and sets BCZ, which `block_mode_counts_down_and_stops_the_channel` reads back
+through the proxies (SPRUEG2E Table 39).
+
+The PDMA supports the boot's synchronized 32-bit receive bursts with a fixed peripheral address
+and equal peripheral/switch burst lengths; the rest is the item below. **[INFERENCE]** PAR = 0
+is interpreted as URQ's peripheral-bus offset: SPRUEG2E Table 18 supplies offsets and section
+4.1 supplies the separate peripheral bus, but no available reference establishes an absolute
+data-port address. The model does not expose a C6472 CPU queue at the C6455's 3C00 0000h:
+SPRS612G Table 2-2 reserves that range.
+
+**[ ] C6472 UTOPIA PDMA beyond the boot path.** The transmit group is programmable but never
+serviced: nothing drains the transmit queue on UXEVT, PXINT (event 31) is never raised, and an
+ATM master's `x` poll on a C6472 always answers `0`. On the receive side the forms the boot does
+not use are counted as errors in SR1 rather than performed: event control other than PE = 0 and
+PE = 2, unsynchronised transfers, element sizes other than 32 bits, an incrementing peripheral
+address, and unequal peripheral and switch burst lengths. SPRUEG2E sections 4-6 and Tables 27-39
+give every one of them, so a transmit vector mirroring the receive vectors in `system.rs`
+(`utopia_pdma`) and an echo firmware like the C6455's are the checks.
 
 **[~] Device configuration.** *Done.* The chip-level block reports DEVSTAT with the straps a board
 that populates this memory map would set - EMIFA and DDR2 enabled, LENDIAN following the loaded
@@ -1401,8 +1462,41 @@ Together with the DSPINT/EDMA event coverage above, this closes the documented f
 HPI boot work for both profiles. The HPI peripheral's separate timing and privilege limitations
 are not a claim of complete pin-level or system-interconnect emulation.
 
-**[-] SRIO and UTOPIA boot.** SRIO still lacks a device model; UTOPIA's ATM master speaks the bus
-but not its boot protocol.
+**[x] C6472 UTOPIA cold boot.** *Done for BOOTMODE 5-8, SPRUEC6G section 4.3.4 and Table 26.*
+Modes 5/6 select an 8-bit port, modes 7/8 a 16-bit port; the paired PLL multipliers are x10/x20.
+`--utopia-phy` supplies CFG[4:0] and SLID, and is refused outside this boot. Core 0's ROM model
+configures the caches, PLL multiplier, receive PDMA channel 8, big-endian UTOPIA cell assembly
+and timer 0. It wakes on the PDMA half/full event or the timer, scans cells backwards for
+54492164h, discards/counts cells without the magic, and feeds the preceding 32 bytes, as L1D
+holds them, to the shared boot-table processor. After the terminator it disables every receive
+PDMA channel and timer 0 and branches to the table's entry - the base of L2 when the table names
+0, the rule `BootStream::entry` now applies to every ROM boot (SPRUEC6G section 3.3.4 and
+Figure 3). Secondary cores remain held unless the table releases them.
+
+**[INFERENCE]** The table travels as big-endian words (`hex6x -order M`) on either byte order: the
+ROM's big-endian cell assembly turns each wire word around on a little-endian device, and no
+manual says the ROM turns it back or states the little-endian wire order at all.
+
+The external master reaches the actual receive queue through `--utopia-unix`; no ELF segment is
+preloaded. `tests/tools/utopia_boot.py` sends the image as addressed, flow-controlled cells.
+`tests/test_utopiaboot.py` boots compiled code in both byte orders, in mode 5 (8-bit) and mode 8
+(16-bit), after wrong-PHY and invalid-magic traffic, and checks the received program's result.
+Native cases cover all four modes, circular-buffer wrap, the half-buffer wake, the full-buffer
+wake arriving well before the timer would, channel disable, a table that never terminates (the
+one malformation `BootStream` recognises) and secondary-core release.
+
+This is the cold-boot defaults, not execution of the ROM instructions. Pin-level clock timing,
+the CPU's temporary ROM interrupt-handler context, and complete PDMA functionality are not
+claimed; the receive path's PAR interpretation is documented above.
+
+**[ ] C6472 UTOPIA boot with I2C-selected parameters.** SPRUEC6G Table 26's UTOPIA boot
+parameter table - single- or multi-PHY, bus width, skipping port initialisation, the physical
+cell size and the core frequency the timer is counted from - reaches the ROM when an I2C EEPROM
+boot loads a parameter table that names UTOPIA. The modelled I2C boot is the C6455's, so this
+needs the C6472's I2C boot first; the table's fields and defaults are the expectation, and a
+cell size other than 53/54 changes the buffer's cell count (section 4.3.4's "256 to 292").
+
+**[-] SRIO boot.** Still requires an SRIO device model.
 
 ## Ethernet and MDIO
 

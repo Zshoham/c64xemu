@@ -145,7 +145,15 @@ drive the UXEVT and UREVT EDMA3 events on the C6455.
 The clock-detect bits say what the absence of a master means: nothing drives UXCLK or URCLK, so
 RCPP and XCPP stay clear and an enabled section with a non-zero clock count reaches the
 clock-failure condition after that many peripheral clocks (SPRUE48 Table 8). The cell path is
-modelled against an external ATM master pulling cells out of the transmit queue.
+modelled against an external ATM master that pulls cells out of the transmit queue and pushes
+cells into the receive queue; `--utopia-unix` connects one (see
+[The UTOPIA ATM master](../guide/networking-and-host-io.md#the-utopia-atm-master)).
+
+A cell packet in either queue is the wire cell with dummy bytes *in front of* the header up to
+a whole number of words (SPRUE48 section 2 and Figures 9-14): a standard cell is 14 words with
+the 48-byte payload at byte 8, and user-defined header bytes take the place of dummies. UCR.BEND
+says which end of each word the first wire byte sits at. Both queues hold two packets, each in a
+fixed 16-word slot, so moving a cell allocates nothing.
 
 That master reaches the slave through the UTOPIA Level 2 address phase (SPRUE48 sections 3.1 and
 3.7). With UCR.MPHY set, the reset state, the slave decodes the master's PHY address against
@@ -162,6 +170,24 @@ Under the SYSCLK3 schedule the port is stepped on every edge while an enabled se
 UINT is asserted - the device tick treats an asserted UINT as movement on every edge - and
 otherwise only on the edge a section's clock count runs out; its idle counters are derived in
 between.
+
+The device profile's `UtopiaProfile` says what the port has: the C6455's CPU windows onto the
+queues, or, on the C6472, the [SPRUEG2E](../reference/sprueg2e.pdf) port - U16M, receive routing
+via RRMR0-5/RRSR, UPIDR/UPWREMU, and a PDMA instead of the C6455's EDMA events. Standard cells
+are 53 or 54 wire bytes; both widths pad to the same 56-byte packet with the payload at byte 8.
+
+`src/pdma.rs` at `02BC 0000h` services synchronized, 32-bit receive bursts into switch memory.
+RXC0 is channel 8. SAR-first reads snapshot the live context into its proxy registers; TCR
+writes commit configuration, and an enabled channel can only be disabled before reconfiguration.
+ABU wraps at the programmed byte count and interrupts at half/full marks; block mode counts
+down, then clears STRT and sets BCZ. Its stores are judged by memory protection as PrivID 0 in
+user mode, which SPRS612G §5.2 gives every UTOPIA transfer. PRINT is event 30 in the core
+selected by SINT. The ROM configures this path for
+[UTOPIA boot](../guide/booting.md#utopia-boot). Transmit PDMA is not serviced.
+
+**[INFERENCE]** PAR uses the peripheral-bus offset, so URQ is 0 (SPRUEG2E Table 18 and section
+4.1). Its absolute CPU address is not established by the available manuals. In particular,
+the C6455 queue address is reserved on C6472, so no C6472 CPU data-port window is exposed.
 
 ## McBSP
 

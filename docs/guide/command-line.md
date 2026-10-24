@@ -37,7 +37,7 @@ means exactly the same thing in a batch run as in a debugging session. Only the 
 | `WORD[/HEADER]` | `parse_instruction`, `src/decode_cli.rs` | Hexadecimal always, `0x` prefix optional. `/HEADER` marks the word as a compact instruction and is refused if the word exceeds 16 bits. |
 | `[ADDR]` on `--ui`/`--gdb` | clap `num_args = 0..=1` | A `host:port` string passed to `TcpListener::bind`. Omitting the value takes the `default_missing_value`; omitting the flag leaves the option unset. |
 
-Poll intervals (`--net-poll`, `--hpi-poll`) go through `non_zero_cycles`, which rejects `0` with
+Poll intervals (`--net-poll`, `--hpi-poll`, `--utopia-poll`) go through `non_zero_cycles`, which rejects `0` with
 `poll interval must be at least one cycle` — a zero interval would poll the socket on every
 emulated cycle rather than never.
 
@@ -98,7 +98,7 @@ Shared by `run` and `debug`.
 | Option | Default | What it does |
 |---|---|---|
 | `--device NAME` | `c6455` | Selects the device profile by name; `DeviceProfile::named` refuses anything else with `unknown device NAME`. `c6455` is single-core, `c6472` has six cores. See [The six-core device](multicore.md). |
-| `--boot-mode MODE` | `0` | The BOOTMODE pins. Mode 0 is no ROM boot: the ELF's segments are installed and every core starts. Mode 1 is HPI host boot and requires `--hpi-unix`: all cores wait in reset. The C6455 host releases core 0 at `0x00800000` with DSPINT; the C6472 host programs `DSP_BOOT_ADDRn` and sets `BOOT_COMPLETE_STAT` bits to release selected cores. Mode 5 is the I2C EEPROM boot and requires `--i2c-eeprom`. Modes 9 and 10 are the C6472's Ethernet boot over MAC port 0 or 1; the C6455 has no Ethernet boot mode and refuses them (`ethernet_boot_port`, [SPRUEC6G](../reference/spruec6g.pdf) §4.3.5). Every other mode starts core 0 and leaves it to release the rest. See [Booting an image](booting.md). |
+| `--boot-mode MODE` | `0` | The BOOTMODE pins. Mode 0 installs ELF segments and starts every core. Mode 1 requires `--hpi-unix`: the C6455 host releases core 0 with DSPINT; the C6472 host sets `BOOT_COMPLETE_STAT`. C6455 mode 5 requires `--i2c-eeprom`. C6472 modes 5-8 require `--utopia-unix` (8/16-bit UTOPIA, paired PLL x10/x20), and modes 9/10 boot over MAC 0/1. Other modes run core 0 and leave it to release the rest. See [Booting an image](booting.md). |
 | `--i2c-eeprom FILE` | none | The serial EEPROM image on the I2C bus that an I2C boot reads its boot parameters and boot table from. Supplying it makes the load `Wire`: nothing comes from the ELF's segments. |
 | `--boot-param-index N` | `0` | Which of the eight boot parameter blocks the I2C boot loads. The block sits at `0x80 * N`. |
 | `--mac-id MAC` | `02:00:00:00:64:72` | The address fused into the MAC ID words, which an Ethernet boot names itself by. |
@@ -116,6 +116,9 @@ Shared by `run` and `debug`.
 | `--hpi-unix PATH` | none | Bind a Unix datagram socket for the HPI host side. |
 | `--hpi-peer PATH` | none | The Unix datagram socket HPI replies are sent to. Host requests carry an HCNTL code as [SPRU969B](../reference/spru969b.pdf) Table 4 numbers it. |
 | `--hpi-poll CYCLES` | `1024` | How often the run loop looks for host accesses. |
+| `--utopia-unix PATH` | none | Bind the external ATM master's Unix datagram socket: addressed polls, cell writes and cell reads, with replies to the sender; see [The UTOPIA ATM master](networking-and-host-io.md#the-utopia-atm-master). Required for C6472 boot modes 5-8. |
+| `--utopia-poll CYCLES` | `1024` | How often the run loop services ATM master requests; at least one cycle. |
+| `--utopia-phy N` | `0` | C6472 UTOPIA boot's CFG[4:0] and UTOPIA SLID, 0-31. Address 31 is the unreachable null PHY. Refused outside `--device c6472 --boot-mode 5`-`8`. |
 | `--trace FILE` | none | Write an execution trace. Without it every emit site is short-circuited by `enabled()` and nothing is allocated. |
 | `--trace-format text\|json` | `text` | Aligned text for humans, JSON Lines for machines. |
 | `--trace-ring N` | no ring | Keep only the last N events in memory and flush them at exit — the window before a fault or a hang, without paying to record the whole run. Without it every event is written as it happens. |
@@ -248,6 +251,7 @@ stdout or stderr according to the file descriptor the request named, and also ac
 | `stats` | The CPU's counters, which the perf report renders. |
 | `ethernet_boot` | Present only when the ROM's Ethernet boot ran: `frames_accepted`, `frames_discarded`, `table_bytes`, `entry`. The only way to tell a boot that completed from one still waiting for a frame. |
 | `i2c_boot` | Present only when the ROM's I2C boot ran: `parameter_blocks`, `table_blocks`, `table_bytes`, `checksum_failures`, `entry`, `error`. |
+| `utopia_boot` | Present for C6472 UTOPIA boot: `cells_accepted`, `cells_discarded`, `table_bytes` (32 per accepted cell, including final padding), `entry`, `error`. |
 | `hpi_boot` | Present when strapped to HPI boot: `entries` holds each core's release entry, null until released; `entry` is core 0's entry. The C6455 entry is fixed at `0x00800000`; C6472 entries come from `DSP_BOOT_ADDRn`. |
 | `profile` | Present with `--profile`: the 32 hottest execute-packet addresses as `{pc, where, packets}`, `where` being the covering symbol as `name+0x1c`. |
 | `cache_stats` | Present with `--profile`: per cache, its name, `enabled`, `frozen`, `capacity_bytes`, `line_size`, `ways`, `sets`, `resident_lines`, `dirty_lines` and its hit/miss/fill/eviction counters. |

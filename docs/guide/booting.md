@@ -1,19 +1,18 @@
 # Booting an image
 
-How memory gets filled and where execution starts: the default ELF path, boot tables and boot
-configuration tables, the HPI host boot, the I2C EEPROM boot, and the Ethernet boot with its host
-side.
+How memory gets filled and where execution starts: ELF loading, boot tables and configuration
+tables, HPI host boot, I2C EEPROM boot, and Ethernet and UTOPIA boot with external hosts.
 
 `--boot-mode` is the BOOTMODE pins. Mode 0 starts every core at once. Mode 1 is hardware HPI
-boot: all cores wait in reset for the external host, with no ROM involved. Modes 5, 9 and 10
-hand the boot to the ROM bootloader model, which runs *in place of* core 0 while core 0 is held.
-Other modes run core 0 and leave it to release the rest.
+boot: all cores wait in reset for the external host, with no ROM involved. C6455 mode 5 (I2C)
+and C6472 modes 5-8 (UTOPIA) and 9-10 (Ethernet) hand the boot to the ROM model, which runs
+*in place of* core 0 while core 0 is held. Other modes run core 0 and leave it to release the rest.
 
-A note that applies to all three ROM modes: the ROM's own instructions are not modelled. TI ships
+A note that applies to these ROM modes: the ROM's own instructions are not modelled. TI ships
 them in on-chip ROM this project has no copy of, and SPRUEC6G warns that their addresses change
-between silicon revisions. What is modelled is everything the ROM does that software or a device
-on the bus can observe — the register programming, the frames on the wire, the memory writes, the
-cores released and the entry point branched to.
+between silicon revisions. The models reproduce the boot transport, memory writes, core release
+and peripheral setup described below, not instruction-level ROM execution or its transient
+CPU register/interrupt-handler state.
 
 A core held in reset, by any of these boots or by the C6472's boot controller, receives no
 interrupts: an event raised while it waits never reaches its IFR. The interrupt controller still
@@ -181,6 +180,59 @@ each is 128 bytes, and the DSP picks one by CFGGP[2:0] in DEVSTAT — address = 
 which `--boot-param-index N` sets. Its options field says what follows: 0 another parameter
 table, 1 a boot table, 2 a boot configuration table. For a boot table the sections are streamed
 block by block into memory, and core 0 is then branched to the entry point.
+
+## UTOPIA boot
+
+`--device c6472 --boot-mode 5` through `8` selects UTOPIA cold boot
+([SPRUEC6G](../reference/spruec6g.pdf) §4.3.4, Tables 22 and 26). Modes 5/6 use an 8-bit bus;
+7/8 use a 16-bit bus. The paired modes program PLL1 x10/x20. `--utopia-phy N` sets CFG[4:0]
+and the slave address, default 0; it is refused outside this boot, where nothing reads it.
+Address 31 is the null PHY and cannot receive a boot. The C6455 has no UTOPIA boot mode; its
+mode 5 remains I2C.
+
+Run the emulator and sender in separate terminals:
+
+```console
+$ target/release/c64xemu run IMAGE.out --device c6472 --boot-mode 7 \
+    --utopia-phy 11 --utopia-unix /tmp/dsp-utopia.sock --max-cycles 100000000 \
+    --state-out /tmp/utopia-state.json
+$ python3 tests/tools/utopia_boot.py --image IMAGE.out --width 16 --phy 11 \
+    --socket /tmp/atm-master.sock --peer /tmp/dsp-utopia.sock --json
+```
+
+The ELF supplies only symbols and endianness to the emulator. The sender builds a boot table
+from its load segments and sends 32 bytes per cell, followed by the big-endian magic
+`54 49 21 64`. The remaining payload bytes are unused; the last table fragment is zero-padded.
+Standard wire cells have 5 header bytes in 8-bit mode, 6 in 16-bit mode, and 48 payload bytes.
+The sender waits for explicit acceptance and retries refused writes, not unanswered writes.
+
+The table travels as big-endian words - what `hex6x -order M` writes - whatever the device's
+byte order. The ROM assembles cells big-endian, so each wire word lands in L1D most
+significant byte first, and the boot-table processing reads the payload as it sits in memory:
+on a little-endian device that is the word the table meant. **[INFERENCE]** No manual states the
+wire order for a little-endian device; this is what the documented BEND setting gives a ROM
+that does not swap the bytes back.
+
+The ROM configures core 0 with 32 KB L1P cache, 16 KB L1D cache and no L2 cache. PDMA channel 8
+delivers 56-byte packets into the addressable half of L1D, wrapping after 292 cells. Half/full
+PDMA interrupts and timer 0 wake the boot processor: 100 µs for 8-bit, 50 µs for 16-bit, using
+the documented default 500 MHz core frequency and integer CPU/6 timer counts. It searches
+backward for the magic, discards/counts invalid cells, and feeds the preceding 32 bytes to
+`BootStream`. Completion disables all receive PDMA channels and timer 0 and branches core 0
+to the table's entry - the base of L2, `0x00800000`, when the table names 0, as for every ROM
+boot. Other cores remain held unless the table releases them.
+
+`utopia_boot` in the state report records accepted/discarded cells, table bytes, entry and error.
+The byte count includes 32 bytes for the final padded cell. A table that never terminates -
+more sections than any image, which is the one malformation the stream can recognise - leaves
+core 0 held and reports an error. `--boot-table`, `--boot-config` and `--i2c-eeprom` cannot be
+combined with this boot source.
+
+The ATM master's socket protocol is in
+[Networking and host I/O](networking-and-host-io.md#the-utopia-atm-master). Cold-boot defaults
+are implemented; I2C-selected extended boot parameters are not. The receive PDMA's
+peripheral-bus address interpretation and unmodelled transfer modes are listed in
+[Peripherals](../internals/peripherals.md#utopia).
 
 ## Ethernet boot
 

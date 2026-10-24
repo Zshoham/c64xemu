@@ -148,7 +148,7 @@ or destination depends on an index are methods, because a multicore device steer
 | EDMA3 region completion | 71-78, one per region, all cores | regions 0-5 are event 15 in *that core only*; regions 6 and 7 are 67 and 68 everywhere |
 | Timers | two timers, halves at 67-70, EDMA3 channels 1, 2, 16, 17 | timers 0-5 are local: events 16 and 17 in their own core; shared timers 6-11 are events 18-29 with EDMA3 channels 8-19 |
 | GPIO | pins 0-15 are events 51-66, EDMA3 channels 48-63 | pins 0-5 are event 73 in core *n*; pins 6-15 are events 74-83 everywhere; pins 0-7 drive EDMA3 channels 0-7 |
-| UTOPIA | 36, EDMA3 channels 32 and 40 | 56, no channel pair (the C6472 transmits through a six-channel PDMA that is not modelled) |
+| UTOPIA | 36, EDMA3 channels 32 and 40 | UINT 56; receive PDMA PRINT 30 in the SINT-selected core. No EDMA channel pair; transmit PDMA is not serviced. |
 | McBSP | RINT/XINT 40-43, EDMA3 channels 12-15 | none (the C6472 has three TSIPs instead) |
 | Memory protection, CPU / DMA | 124, 120, 122 / 125, 121, 123 (L2, L1P, L1D) | same |
 | Inter-processor interrupt | none | 84 |

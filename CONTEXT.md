@@ -83,7 +83,8 @@ _Avoid_: image, load record
 
 **machine**:
 The module every front end drives: a loaded image, the CPU, and the host connections the
-device needs — the CIO handshake, the Ethernet backend, the HPI host side, the trace sink.
+device needs — the CIO handshake, the Ethernet backend, the HPI host side, the UTOPIA's ATM
+master, the trace sink.
 It owns the halt rule and the state snapshot, so the batch runner, the console debugger,
 the browser dashboard and the GDB stub all run through the same seam.
 _Avoid_: emulator, session, driver

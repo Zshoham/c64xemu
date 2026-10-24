@@ -60,6 +60,9 @@ pub(crate) struct EventMap {
     /// single pair.
     pub(crate) utopia: usize,
     pub(crate) utopia_channels: Option<(usize, usize)>,
+    /// The UTOPIA PDMA's receive interrupt (PRINT), on a device whose UTOPIA has a PDMA. Which
+    /// megamodule it reaches is the channel's SINT field, so it carries no destination here.
+    pub(crate) utopia_pdma_receive: Option<usize>,
     /// The memory protection unit events: a CPU access fault and its DMA-master counterpart,
     /// per unit in L2, L1P, L1D order (SPRU871K chapter 8, events from `linux-c6x` traps.c).
     pub(crate) mpu_cpu: [usize; 3],
@@ -105,6 +108,7 @@ pub(crate) const C6455_EVENTS: EventMap = EventMap {
     tc_error_base: 81,
     utopia: 36,
     utopia_channels: Some((32, 40)),
+    utopia_pdma_receive: None,
     mpu_cpu: [124, 120, 122],
     mpu_dma: [125, 121, 123],
     mcbsp: Some(40),
@@ -142,9 +146,12 @@ pub(crate) const C6472_EVENTS: EventMap = EventMap {
     edma_mp: 58,
     tc_error_base: 59,
     utopia: 56,
-    // The C6472's UTOPIA transmits through a six-channel PDMA (EDMA3 channels 22-27) rather
-    // than the single receive/transmit pair the C6455 documents, and the PDMA is not modelled.
+    // The C6472's UTOPIA moves its cells through a six-channel PDMA rather than the single
+    // EDMA3 receive/transmit pair the C6455 documents. PRINT, the PDMA receive interrupt, is
+    // event 30 and PXINT, the transmit one, event 31 (SPRS612G Table 7-10); the PDMA's
+    // transmit side is not modelled.
     utopia_channels: None,
+    utopia_pdma_receive: Some(30),
     mpu_cpu: [124, 120, 122],
     mpu_dma: [125, 121, 123],
     // The C6472 has three TSIPs instead of the C6455's two McBSPs.

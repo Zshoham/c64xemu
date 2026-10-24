@@ -279,7 +279,8 @@ value to one of the two constants.
 | `emac_bases`, `emic_bases` | How many MACs there are, and whether each has an interrupt-control module |
 | `timer_bases` | The 64-bit timers, in device order |
 | `mpu_regions` | Memory protection page geometry of one megamodule: unit, base, page size, MPPA index range |
-| `has_mcbsp`, `has_utopia`, `has_emifa`, `has_device_config` | Peripherals a device either has or does not |
+| `has_mcbsp`, `has_emifa`, `has_device_config` | Peripherals a device either has or does not |
+| `utopia` | The UTOPIA port, if any, and what it has: the C6455's CPU queue windows, or the C6472's SPRUEG2E port with its PDMA (`UtopiaProfile`, `has_utopia_pdma()`) |
 | `has_boot_controller` | The C6472 block set: boot controller, chip-level registers, power/sleep controller, shared-memory controller and its per-core profilers |
 | `host_excluded` | Configuration windows an external host cannot reach: the HPI filter |
 | `reset_core` | Which core runs at reset with no boot controller involved |
@@ -294,7 +295,7 @@ value to one of the two constants.
 | Ethernet | one MAC at `0x02c8_0000`, no EMIC | two MACs at `0x02c8_0000`/`0x02cc_0000`, an EMIC each |
 | Timers | 2 | 12 (six per-megamodule, six shared) |
 | MPU geometry | L2 32 x 64 KB, each L1 32 x 1 KB | L2 19 x 32 KB plus 12 x 64 KB shared, each L1 16 x 2 KB |
-| McBSP / UTOPIA / EMIFA / device configuration | yes / yes / yes / yes | no / yes / no / no |
+| McBSP / UTOPIA / EMIFA / device configuration | yes / CPU queue windows, EDMA3 events / yes / yes | no / PDMA, routing unit, U16M / no / no |
 | Boot controller block set | absent | present |
 | Host-excluded windows | chip-level and device-state registers, PLL1, PLL2 | PLL3 |
 | `jtag_id` | `0x0009_202f` | `0x0009_102f` |
@@ -453,8 +454,9 @@ Every file in `src/`.
 | `mcbsp.rs` | The two multichannel buffered serial ports |
 | `mdio.rs` | The MDIO module and the PHY on the other end of it |
 | `memory.rs` | The memory hierarchy - L1P, L1D, L2, MAR bits, cache configuration - the backing store, and access timing |
-| `netio.rs` | The Ethernet backend: receive admission, TX capture and handoff, live history and polling, with a private Unix-datagram `Bridge`; the separate HPI `HostLink` adapter |
+| `netio.rs` | The Ethernet backend: receive admission, TX capture and handoff, live history and polling, with a private Unix-datagram `Bridge`; `HostLink`, the polled datagram channel the HPI host and the UTOPIA's ATM master use |
 | `pcap.rs` | pcap file reading and writing |
+| `pdma.rs` | The C6472 UTOPIA receive PDMA: channel proxies, ABU/block delivery and interrupts |
 | `pll.rs` | The PLL1 controller with its reset controller register, and PLL2 |
 | `port.rs` | The slave-port seam: `SlavePort`, `PortContext`, `PortWrite` |
 | `psc.rs` | The C6472 power/sleep controller |
@@ -470,5 +472,6 @@ Every file in `src/`.
 | `ui.rs` | The browser dashboard: the HTTP server and the JSON it serves |
 | `ui.html` | The dashboard page itself, embedded in the binary at build time |
 | `utopia.rs` | The UTOPIA 2 ATM slave interface |
+| `utopiaboot.rs` | The C6472 ROM's UTOPIA cold boot through receive PDMA and timer wakeups |
 | `view.rs` | The instruction view: unit, data path, cross path, predicate, operands as TI's tools print them, resource accounting, and the JSON serialization |
 | `writeback.rs` | The write-back queue: register writes, stores, control-register writes and saturation flags between the cycle they are scheduled and the cycle they land, and the order they land in |

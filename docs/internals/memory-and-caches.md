@@ -316,6 +316,9 @@ requester id, and the CPU is the local requester. `check_dma_access` checks the 
 requester id (IDs 0–5 have their own bit, 6 and above share AIDX) and the permission bit for the
 requester's privilege mode: IDMA and the HPI's DMA are ID 0 supervisor, the EMACs and the UTOPIA
 PDMA ID 0 user (SPRS612G section 5.2 and Table 5-3), and the EDMA3's transfers AIDX supervisor.
+Two gaps are open in the ROADMAP: the EDMA3 should carry the PrivID and mode of the core that
+programmed it (SPRU966C section 2.10.2), and the EMAC's descriptor words skip the check entirely;
+only its packet buffers are protected.
 A refused access is discarded, and `record_mpu_fault` latches the address in MPFAR and the
 attempted permission in MPFSR and raises the unit's system event: 124, 120, 122 for a CPU fault
 on L2, L1P, L1D, and 125, 121, 123 for a requester's. That event reaches the CPU as `EXCEP`

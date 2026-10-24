@@ -7,7 +7,7 @@
 //!
 //! `Bridge` carries one raw Ethernet frame per datagram, retaining its socket retry/drop
 //! policy. `tests/tools/tap_bridge.py` can relay these frames to a TAP without emulator
-//! privileges. `HostLink` is the separate HPI host-access adapter.
+//! privileges. `HostLink` is the separate datagram adapter for the HPI host and the ATM master.
 
 use std::io::ErrorKind;
 use std::os::unix::net::{SocketAddr, UnixDatagram};
@@ -403,20 +403,19 @@ impl Drop for Bridge {
     }
 }
 
-/// A datagram channel for a host process that is not a network: the HPI's host side. One
-/// datagram is one host access - `[direction, port, 0, 0, value]`, where direction is `r` or `w`
-/// and port is the HCNTL encoding - and a read is answered with its four value bytes, or with an
-/// empty datagram when the software reset is holding the host off (SPRU969B section 8.3).
+/// A datagram channel for an external peripheral master - the HPI host, the UTOPIA's ATM
+/// master - polled on its own schedule. The caller interprets requests; replies go to the
+/// configured peer or the sender of the most recently received datagram.
 pub struct HostLink {
     socket: UnixDatagram,
     bound: PathBuf,
     peer: Option<PathBuf>,
     learned: Option<SocketAddr>,
-    scratch: [u8; 16],
+    poll: PollSchedule,
 }
 
 impl HostLink {
-    pub fn bind(path: &Path, peer: Option<&Path>) -> Result<Self, String> {
+    pub fn bind(path: &Path, peer: Option<&Path>, poll_interval: u64) -> Result<Self, String> {
         if path.exists() {
             std::fs::remove_file(path).map_err(|error| format!("{}: {error}", path.display()))?;
         }
@@ -430,23 +429,49 @@ impl HostLink {
             bound: path.to_path_buf(),
             peer: peer.map(Path::to_path_buf),
             learned: None,
-            scratch: [0; 16],
+            poll: PollSchedule::new(poll_interval),
         })
     }
 
-    /// The next host access waiting, if any: direction, port and value.
+    /// A reinstalled device is polled on its first cycle.
+    pub(crate) fn reset_poll(&mut self) {
+        self.poll.reset();
+    }
+
+    /// Whether the link is due a look at `cycle`; taking a due poll schedules the next one.
+    pub(crate) fn take_due(&mut self, cycle: u64) -> bool {
+        self.poll.take_due(cycle)
+    }
+
+    /// How many cycles a batch may run before the next poll is due; never zero.
+    pub(crate) fn poll_delay(&self, cycle: u64) -> u64 {
+        self.poll.delay(cycle)
+    }
+
+    /// The next HPI access: direction, port and little-endian value.
     pub fn receive(&mut self) -> Option<(u8, u8, u32)> {
+        let mut bytes = [0; 16];
+        while let Some(length) = self.receive_datagram(&mut bytes) {
+            if length >= 8 {
+                return Some((
+                    bytes[0],
+                    bytes[1],
+                    u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+                ));
+            }
+        }
+        None
+    }
+
+    /// Receive into the caller's bounded buffer without allocating.
+    pub fn receive_datagram(&mut self, bytes: &mut [u8]) -> Option<usize> {
         loop {
-            match self.socket.recv_from(&mut self.scratch) {
+            match self.socket.recv_from(bytes) {
                 Ok((length, from)) => {
                     if self.peer.is_none() && from.as_pathname().is_some() {
                         self.learned = Some(from);
                     }
-                    if length < 8 {
-                        continue;
-                    }
-                    let value = u32::from_le_bytes(self.scratch[4..8].try_into().unwrap());
-                    return Some((self.scratch[0], self.scratch[1], value));
+                    return Some(length);
                 }
                 Err(error) if error.kind() == ErrorKind::Interrupted => continue,
                 Err(_) => return None,

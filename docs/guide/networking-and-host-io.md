@@ -1,7 +1,8 @@
 # Networking and host I/O
 
 Every way the emulated device exchanges data with the outside: pcap injection and capture, the
-live Unix-datagram Ethernet backend, the two host tools built on it, the HPI host side, and CIO.
+live Unix-datagram Ethernet backend, the two host tools built on it, the HPI host side, the
+UTOPIA's ATM master, and CIO.
 
 The EMAC model itself — descriptor rings, filtering, interrupts — is
 [Ethernet](../internals/ethernet.md). This document is the seam between it and your host.
@@ -100,6 +101,32 @@ cores' global aliases, programs their boot addresses and releases them through
 `BOOT_COMPLETE_STAT`; `--cores 0,3` selects a subset (default: all six).
 In either mode the tool fails when the emulator faults, writes no machine state, or, after
 a released boot, never reaches the application's exit.
+
+## The UTOPIA ATM master
+
+The UTOPIA slave's master is a process on a third Unix datagram socket: `--utopia-unix PATH`
+and `--utopia-poll CYCLES` (default 1024). It works on either device; replies go to each
+request's sender. One datagram is one cell-level transaction of the UTOPIA Level 2 address
+phase ([SPRUE48](../reference/sprue48.pdf) sections 3.1-3.7): an ASCII opcode, the five-bit PHY
+address the master drives, and for a write the cell's wire bytes.
+
+| Request | Reply |
+|---|---|
+| `p`, PHY | URCLAV: one byte `1` if the receive queue has room for a cell, `0` if not; an empty datagram when the pin is high-impedance (another PHY, the null PHY 31, or a receiver in reset) |
+| `w`, PHY, 53-64 wire bytes | `1` if the slave took the cell, `0` if it refused it (not addressed, or no room) |
+| `x`, PHY | UXCLAV: `1` if a complete cell waits in the transmit queue, `0` if not; empty when high-impedance |
+| `r`, PHY | The waiting cell's wire bytes, without the packet's dummy bytes; one byte `0` when nothing was taken |
+| anything else, or a PHY above 31 | One byte `FF` |
+
+There is no host-side queue: a full receive queue refuses a write, and the master retries the
+refused write rather than an unanswered one, which could duplicate a cell. The transport moves
+whole cells, not UTOPIA clock edges. On the C6472 nothing services the transmit queue - its PDMA
+transmit channels are not modelled - so `x` answers `0` there.
+
+`tests/tools/utopia_boot.py` is the master for the C6472's
+[UTOPIA boot](booting.md#utopia-boot); its `send` and `receive` helpers are what
+`tests/test_utopia.py` drives `tests/firmware/utopia_echo/` with, a C6455 program that copies
+each received cell into the transmit queue so the master reads back the cell it sent.
 
 ## CIO
 

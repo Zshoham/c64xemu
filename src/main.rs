@@ -34,6 +34,7 @@ mod mdio;
 mod memory;
 mod netio;
 mod pcap;
+mod pdma;
 mod pll;
 mod port;
 mod psc;
@@ -48,6 +49,7 @@ mod timer;
 mod trace;
 mod ui;
 mod utopia;
+mod utopiaboot;
 mod view;
 mod writeback;
 

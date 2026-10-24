@@ -117,10 +117,6 @@ const RX_BUFFERS: usize = 10;
 const RX_BUFFER_SIZE: u32 = 1600;
 const DESCRIPTOR_BYTES: u32 = 16;
 
-/// Where core 0 starts when the boot table names no entry point: the base of its L2, which is
-/// the boot exit address the ROM defaults to (SPRUEC6G section 4.3.2).
-const DEFAULT_ENTRY: u32 = 0x0080_0000;
-
 /// The boot-table frame header (SPRUEC6G Table 28): a magic halfword, then an opcode byte and a
 /// sequence byte, big-endian on the wire like every other header in the frame.
 const FRAME_MAGIC: u16 = 0x544b;
@@ -250,7 +246,6 @@ impl EmacBoot {
                     // Clearing the head descriptor pointer stops reception, which is how the
                     // ROM leaves the MAC on the way out (SPRUEC6G section 4.3.5).
                     bus.write32(self.base + RXHDP0, 0);
-                    let entry = if entry == 0 { DEFAULT_ENTRY } else { entry };
                     self.progress.entry = Some(entry);
                     self.phase = Phase::Done;
                     return Some(entry);
