@@ -19,6 +19,9 @@ in
     pkgs.bc
     pkgs.perf
     pkgs.gnumake
+    # TI's IBL romparse, built by tests/tools/ibl_tools.py, is a bison grammar and a flex lexer.
+    pkgs.bison
+    pkgs.flex
     pkgs.cargo-nextest
     pkgs.python3Packages.pytest
     tiToolsFhs

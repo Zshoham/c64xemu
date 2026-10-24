@@ -1959,23 +1959,13 @@ mod tests {
         /// UTOPIA (extended boot mode 0x104) with its own fields.
         mod from_i2c {
             use super::*;
-            use crate::i2cboot::tests::{blocks, c6472_i2c_parameters, c6472_parameters};
+            use crate::i2cboot::tests::{blocks, c6472_i2c_parameters, c6472_parameters, words};
 
             const UCR_RUDC: u32 = 0xf << 2;
             const PDMA_BSR: u32 = 0x8;
             const OPTION_SINGLE_PHY: u16 = 1;
             const OPTION_WIDE: u16 = 2;
             const OPTION_SKIP_PORT_INIT: u16 = 4;
-
-            fn device_words(words: &[u32], endian: Endian) -> Vec<u8> {
-                words
-                    .iter()
-                    .flat_map(|word| match endian {
-                        Endian::Little => word.to_le_bytes(),
-                        Endian::Big => word.to_be_bytes(),
-                    })
-                    .collect()
-            }
 
             /// Table 26: options, cell size, bus width, slave ID, core frequency.
             fn utopia_block(options: u16, cell: u16, width: u16, slave: u16, mhz: u16) -> Vec<u8> {
@@ -2109,7 +2099,7 @@ mod tests {
                 for endian in [Endian::Little, Endian::Big] {
                     let label = format!("big-endian {}", endian == Endian::Big);
                     let set = UCR_BEND | (u32::from(PHY) << 24) | RUDC_57 | UCR_UREN;
-                    let config = blocks(&device_words(&[UCR, set, UCR_U16M, 0, 0, 0], endian));
+                    let config = blocks(&words(&[UCR, set, UCR_U16M, 0, 0, 0]));
                     let next = 0x80 + config.len() as u16;
                     let mut image = c6472_i2c_parameters(2, 0x80, 0x50, (next, 0x50));
                     image.extend(config);

@@ -10,15 +10,18 @@ prints each result for several inputs localises a mismatch in two runs; the manu
 examples make good unit tests; a host build of the same C source is the strongest oracle for
 anything the compiler can express.
 
-Current state: 1980 collected pytest cases and 776 native tests, including 390 component vectors.
+Current state: 1988 collected pytest cases and 777 native tests, including 390 component vectors.
 Three differentials against TI's own tools run inside every suite pass: all 2195 instruction
 words in binutils' tic6x vectors, and 436813 instructions
 across the firmware and program images compared with `dis6x` on seven dimensions - mnemonic,
 functional unit, cross-path marking, predicate, memory data path, every memory access's address
 operand, and every operand list the model reads, 285856 of them.
 
-No `[ ]` item is open: the last, UTOPIA boot's I2C-selected parameters, closed with the C6472's
-I2C boot it needed. The method at the head of *Where to look next* remains **two rules each
+One `[ ]` item is open: booting TI's IBL itself on the C6472, beside the boot items. The three
+before it put TI's own IBL tools into the suite as the oracle for the C6472 I2C boot, and the
+first EEPROM those tools made found that the ROM model read boot-table words in the wrong byte
+order on a little-endian device - a model and a set of fixtures that agreed with each other and
+with nothing TI made. The method at the head of *Where to look next* remains **two rules each
 modelled and each pinned, with nothing asking what they do together.** It has found six defects.
 The cache manual's worked examples found a 4% error between a correct miss cost and a correct
 write buffer. Making a cache size carve its SRAM
@@ -1484,6 +1487,53 @@ an EEPROM with nothing preloaded from the ELF, and run to A4 = 55 in mode 2 at i
 mode 3 at index 5 with PLL1 at x19, cores 1-5 never leaving reset. `a_c6472_boots_a_program_off_
 the_eeprom_its_pins_name` checks the same at device level, including DEVSTAT's CFGGP, PLLM, the
 cache configuration and that blocks before the selected index are never read.
+
+**[x] Provision TI's IBL boot tools.** *Done.* `tests/tools/fetch_deps.sh` fetches TI's
+Intermediate Boot Loader (git.ti.com/keystone-rtos/ibl) at the pinned commit `ed3f098` into
+`tests/build/ibl`; git.ti.com serves no snapshot archive, so it is a depth-1 fetch of that commit
+into a staging directory, published only once checked out at that commit, and a tree counts as
+present only when it is that commit - a review found that a failed fetch had left a bare
+repository every later run accepted. `tests/tools/ibl_tools.py` builds the host tools TI's EVM build runs -
+`bconvert64x`, `b2i2c`, `b2ccs`, and `romparse` for the C6472 against the ROM's own
+`tiboot_c6472.h` - into `tests/build/ibl-tools`, with `bison` and `flex` now in `devenv.nix`.
+The tools are 2000s C, built as `-std=gnu89`. One needed more than flags: `romparse.c` defines
+`yywrap` as `void`, so a lexer that calls it reads garbage at end of file and waits for input
+forever; the lexer is generated with `--noyywrap`.
+
+**[x] Boot an EEPROM laid out entirely by TI's tools.** *Done, and it found a defect.*
+`test_an_eeprom_made_by_tis_tools_boots` runs a compiled `sum_loop` and `big_endian` through the
+IBL's own chain - `hex6x -a -boot` with the IBL's `ibl_init.rmd`, `bconvert64x`, `b2i2c`,
+`b2ccs`, `romparse -compact` - in mode 2 at index 0 and in mode 3 at index 5 with an EEPROM type
+in the options' bits 4:2, and boots each to A4 = 55. The big-endian image booted first time; the
+little-endian one did not. TI's chain writes every boot-table word most significant byte first
+whatever the build - `hex6x -a` prints a 32-bit word that way for `-order L`, SPRUEC6G section
+6.2.2.3.1 is that command, and `bconvert64x` says "The C6x boot loader expects all 32 bit values
+to be in big endian" - but the ROM model read the words in the device's byte order, and every
+EEPROM this suite built wrote them that way, so model and fixtures agreed with each other and
+with nothing TI made. `i2cboot::device_order` now turns each table and configuration word round
+on a little-endian device, on the C6455 as on the C6472 (the IBL builds its C6455 image the same
+way), which is also what the UTOPIA boot's [INFERENCE] about big-endian table words had assumed.
+The C6455 `program:i2c_eeprom_boot` harness and the native fixtures write the words that way now.
+A review then found the first fix converted each block on its own, which is right only for
+`b2i2c`'s 124-byte payloads: section 2.3.4.1 sets a 128-byte maximum and nothing else, so a word
+can end in the next block. `i2cboot::WordOrder` carries a part-word across blocks of the same
+table; `a_word_split_across_blocks_reaches_memory_whole` cuts a configuration table every 10
+bytes and a boot table every 122.
+
+**[x] Pin `tests/tools/i2c_eeprom.py` to TI's output.** *Done.*
+`test_the_eeprom_builder_writes_what_tis_tools_write` gives the builder and TI's chain the same
+choices and requires byte-identical images. Matching took three changes to the builder: table
+words most significant byte first; only initialized contents, as `hex6x -boot` carries them, the
+program clearing its own .bss; and parameter tables as `romparse` writes them - the structure's
+length (30 bytes for Table 25, 20 for Table 26) and a zero checksum, which disables the check,
+in a zero-filled 128-byte slot. The UTOPIA handover cases rest on this builder, since `romparse`
+writes no Table 26 block.
+
+**[ ] Boot TI's IBL on the C6472.** Build the IBL for the C6472 EVM with the suite's 8.5 code
+generation tools and boot the real EVM EEPROM image through the ROM model: the ROM loads the
+IBL's first stage, and that stage then drives the I2C module from firmware to read the rest. A
+feasibility check comes first. The IBL's PLL and DDR2 set-up and the EMAC or NAND it boots from
+next are where the device model is expected to fall short, and how far it gets decides the scope.
 
 **[x] C6455 HPI boot.** *Done, as the hardware boot it is.* SPRS276M section 2.4: "the HPI host
 boot is a hardware boot mode", and "the CPU is actually held in reset until a DSP interrupt is

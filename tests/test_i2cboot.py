@@ -11,6 +11,8 @@ import pytest
 
 from common import ROOT
 from target_programs import build_target_program, load_programs
+from tools import i2c_eeprom, ibl_tools
+from tools.emac_boot import parse_elf
 
 pytestmark = [pytest.mark.slow]
 
@@ -59,6 +61,60 @@ def test_a_c6472_boots_a_program_from_its_eeprom(
     assert state["fault"] is None
     assert state["cores"][0]["held_in_reset"] is False
     assert all(core["held_in_reset"] and core["cycles"] == 0 for core in state["cores"][1:])
+
+
+# The EEPROMs TI's own tools make: the IBL's hex6x/bconvert64x/b2i2c/romparse chain
+# (tests/tools/ibl_tools.py), the same index, EEPROM address and EEPROM type (options bits 4:2,
+# tiboot_c6472.h) as above.
+TI_EEPROMS = [(2, 0x50, 0, 0), (3, 0x51, 5, 1)]
+
+
+def ti_eeprom(image: Path, work: Path, slave: int, index: int, eeprom_type: int) -> bytes:
+    elf = parse_elf(str(image))
+    try:
+        return ibl_tools.eeprom(
+            image, elf.entry, elf.endian == ">",
+            ibl_tools.Section(param_index=index, options=1 | (eeprom_type << 2),
+                              dev_addr_ext=slave),
+            work,
+        )
+    except ibl_tools.IblToolError as error:
+        pytest.fail(str(error))
+
+
+@pytest.mark.parametrize("mode,slave,index,eeprom_type", TI_EEPROMS)
+def test_an_eeprom_made_by_tis_tools_boots(
+    candidate_binary: Path, image: Path, tmp_path: Path,
+    mode: int, slave: int, index: int, eeprom_type: int,
+) -> None:
+    eeprom = tmp_path / "ti.bin"
+    eeprom.write_bytes(ti_eeprom(image, tmp_path, slave, index, eeprom_type))
+    state_path = tmp_path / "state.json"
+    run = subprocess.run([
+        str(candidate_binary), "run", str(image), "--device", "c6472", "--boot-mode", str(mode),
+        "--i2c-eeprom", str(eeprom), "--boot-param-index", str(index),
+        "--max-cycles", "50000000", "--state-out", str(state_path),
+    ], cwd=ROOT, capture_output=True, text=True, timeout=300)
+    assert state_path.is_file(), run.stderr + run.stdout
+    state = json.loads(state_path.read_text())
+    assert state["i2c_boot"]["error"] is None
+    assert state["i2c_boot"]["entry"] == parse_elf(str(image)).entry
+    assert state["exit_code"] == 55
+    assert state["fault"] is None
+
+
+# The suite's own builder, given the same choices, writes TI's image byte for byte: romparse's
+# 30-byte parameter tables with the check disabled, b2i2c's blocks, and table words most
+# significant byte first in either byte order. The UTOPIA cases rest on this builder because
+# romparse writes no Table 26 block.
+@pytest.mark.parametrize("mode,slave,index,eeprom_type", TI_EEPROMS)
+def test_the_eeprom_builder_writes_what_tis_tools_write(
+    image: Path, tmp_path: Path, mode: int, slave: int, index: int, eeprom_type: int,
+) -> None:
+    table, _ = i2c_eeprom.boot_table(str(image))
+    ours = i2c_eeprom.build(index=index, slave=slave, table=table, utopia=None, config=[],
+                            eeprom_type=eeprom_type)
+    assert ours == ti_eeprom(image, tmp_path, slave, index, eeprom_type)
 
 
 L1D_PROGRAM = """

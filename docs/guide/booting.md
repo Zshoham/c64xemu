@@ -49,8 +49,9 @@ repeat:
 u32   0                 terminator
 ```
 
-Words are read in the device's byte order, which is what the hex conversion utility's `-order`
-option matches to the build.
+A table already in memory is read word by word in the device's byte order, which is what the
+hex conversion utility's `-order` option matches to the build. A table that arrives over I2C
+or UTOPIA carries its words most significant byte first instead (see below).
 
 `--boot-table FILE:ADDR` places the file at `ADDR` and loads memory from it instead of from the
 ELF segments; the ELF then supplies only symbols. The destination of a section is any address a
@@ -186,6 +187,16 @@ are applied as their blocks arrive; the boot then re-enters at the parameter blo
 device address and reads another parameter block there. An entry that asks the ROM to call a
 function stops the boot.
 
+Boot-table and configuration-table words travel most significant byte first on both byte
+orders: §6.2.2.3.1 builds the table with `hex6x -a`, which writes each 32-bit word that way for
+`-order L` as for `-order M`, and TI's IBL `bconvert64x` says "The C6x boot loader expects all
+32 bit values to be in big endian". The ROM model reads each word that way and stores it as the
+device does, so a little-endian device turns every word's bytes round. Until TI's own tools
+were run against it, the model read the words in the device's byte order and the suite's
+builders wrote them that way, which agreed with itself and with nothing TI made.
+A block need not end on a word: §2.3.4.1 sets only a 128-byte maximum, so the first bytes of a
+word a block ends inside are held until the next block of the same table completes it.
+
 ### The C6472's differences
 
 | | C6455 | C6472 |
@@ -210,8 +221,12 @@ options' table type to bits 1:0 and gives bits 4:2 to the EEPROM type, which the
 on the C6472.
 
 `tests/tools/i2c_eeprom.py` lays out a C6472 EEPROM from an ELF: the selected parameter block,
-then the boot table in the device's byte order, or with `--utopia` a UTOPIA parameter block,
-and with `--config ADDR,SET,CLEAR` a configuration table in front of the next parameter block.
+then the boot table, or with `--utopia` a UTOPIA parameter block, and with
+`--config ADDR,SET,CLEAR` a configuration table in front of the next parameter block. Its layout
+is `romparse -compact`'s, and `tests/test_i2cboot.py` holds it to TI's: the IBL's own tools,
+fetched by `tests/tools/fetch_deps.sh` and built by `tests/tools/ibl_tools.py` (which needs
+`bison` and `flex`), make an EEPROM the emulator must boot and the builder must match byte for
+byte.
 
 ```console
 $ python3 tests/tools/i2c_eeprom.py --image IMAGE.out --out eeprom.bin --index 5 --slave 0x51

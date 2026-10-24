@@ -8,8 +8,8 @@ ten-byte common header and Table 25's I2C or Table 26's UTOPIA fields, all 16-bi
 significant byte first; boot-table and configuration-table blocks are ``b2i2c``'s, four header
 bytes and up to 124 bytes of data. The parameter block the pins select sits at 0x80 * index.
 
-Without ``--utopia`` the block names a boot table (options 1) built from the ELF's load segments,
-in the device's byte order, at the next 128-byte boundary. With ``--utopia`` the block names
+Without ``--utopia`` the block names a boot table (options 1) built from the ELF's initialized
+load segments, every word most significant byte first, at the next 128-byte boundary. With ``--utopia`` the block names
 another parameter block there (options 0), and that one is extended boot mode 0x104: the device
 goes on to a UTOPIA boot configured by its fields, and the program arrives as cells instead
 (``utopia_boot.py``). ``--config ADDR,SET,CLEAR`` puts a boot configuration table (options 2,
@@ -68,18 +68,20 @@ def blocks(data: bytes) -> bytes:
     return b"".join(block(data[at:at + step]) for at in range(0, len(data), step))
 
 
-def parameter_block(boot_mode: int, fields: dict[int, int]) -> bytes:
-    """A whole 128-byte parameter block: Table 23's header, then `fields` at their offsets."""
-    payload = bytearray(BLOCK_BYTES - BLOCK_HEADER)
-    for offset, value in {4: boot_mode, **fields}.items():
-        payload[offset - BLOCK_HEADER:offset - BLOCK_HEADER + 2] = value.to_bytes(2, "big")
-    return block(bytes(payload))
+def parameter_block(boot_mode: int, length: int, fields: dict[int, int]) -> bytes:
+    """A boot parameter table in its 128-byte slot, as TI's ``romparse`` writes one: Table 23's
+    header with the size of the structure (30 bytes for Table 25, 20 for Table 26), a zero
+    checksum - which disables the check - and `fields` at their offsets, zeros after."""
+    table = bytearray(BLOCK_BYTES)
+    for offset, value in {0: length, 4: boot_mode, **fields}.items():
+        table[offset:offset + 2] = value.to_bytes(2, "big")
+    return bytes(table)
 
 
 def i2c_parameters(options: int, address: int, slave: int, following: int = 0) -> bytes:
     """Table 25: options, device address low and high, Table 25's default core and bus
     frequencies, and the next device address a configuration table re-enters at."""
-    return parameter_block(EXTENDED_I2C_MASTER, {
+    return parameter_block(EXTENDED_I2C_MASTER, 30, {
         10: options, 12: address, 14: slave, 20: 50, 22: 10,
         24: following, 26: slave if following else 0,
     })
@@ -87,14 +89,25 @@ def i2c_parameters(options: int, address: int, slave: int, following: int = 0) -
 
 def utopia_parameters(options: int, cell: int, width: int, slave: int, mhz: int) -> bytes:
     """Table 26: options, physical cell size, bus width, slave ID and core frequency."""
-    return parameter_block(EXTENDED_UTOPIA, {10: options, 12: cell, 14: width, 16: slave, 18: mhz})
+    return parameter_block(EXTENDED_UTOPIA, 20,
+                           {10: options, 12: cell, 14: width, 16: slave, 18: mhz})
+
+
+def wire_order(table: bytes, big_endian: bool) -> bytes:
+    """A table in the device's byte order as the EEPROM carries it: every 32-bit word most
+    significant byte first, which is what TI's flow - ``hex6x -a`` then ``bconvert64x`` -
+    writes for either build."""
+    if big_endian:
+        return table
+    return b"".join(table[at:at + 4][::-1] for at in range(0, len(table), 4))
 
 
 def boot_table(path: str) -> tuple[bytes, int]:
-    """The ELF's load segments as a boot table in the device's byte order (section 6.2.2).
-    An I2C-only boot leaves L1D alone, so only the ROM's L2 scratch is refused."""
+    """The ELF's initialized load segments as a boot table, words most significant byte first
+    (section 6.2.2). Like ``hex6x -boot`` it carries only what has contents: the program clears
+    its own .bss. An I2C-only boot leaves L1D alone, so only the ROM's L2 scratch is refused."""
     elf = parse_elf(path)
-    image = elf.image(0, zero_fill=True)
+    image = elf.image(0)
     sections = []
     for segment in image.segments:
         start, end = segment.address, segment.address + len(segment.data)
@@ -104,7 +117,8 @@ def boot_table(path: str) -> tuple[bytes, int]:
         if C6472_L2_END < end <= 0x00A00000:
             raise BootError(f"segment at 0x{start:08x} runs past the C6472's local L2")
         sections.append(Section(segment.address, segment.data))
-    return assemble_table(image.entry, sections, elf.endian == ">"), image.entry
+    big_endian = elf.endian == ">"
+    return wire_order(assemble_table(image.entry, sections, big_endian), big_endian), image.entry
 
 
 def build(
@@ -114,30 +128,32 @@ def build(
     table: bytes | None,
     utopia: tuple[int, int, int, int, int] | None,
     config: list[tuple[int, int, int]],
-    big_endian: bool,
+    eeprom_type: int = 0,
 ) -> bytes:
     """The EEPROM contents: zeros up to the selected parameter block, that block, then what it
     names. `table` is the boot table for an I2C-only boot; `utopia` is Table 26's fields for a
-    boot that hands over to UTOPIA."""
+    boot that hands over to UTOPIA. `eeprom_type` goes in every I2C block's options bits 4:2.
+    The layout is ``romparse -compact``'s: the data follows the selected block's 128-byte slot."""
     assert (table is None) != (utopia is None)
+    kind = eeprom_type << 2
     base = index * BLOCK_BYTES
     after = base + BLOCK_BYTES
     tail = b""
     if config:
-        word = ">I" if big_endian else "<I"
         words = [value for entry in config for value in entry] + [0, 0, 0]
-        tail = blocks(b"".join(struct.pack(word, value) for value in words))
-        head = i2c_parameters(OPTION_CONFIGURATION, after, slave, after + len(tail))
+        tail = blocks(b"".join(struct.pack(">I", value) for value in words))
+        head = i2c_parameters(kind | OPTION_CONFIGURATION, after, slave, after + len(tail))
     elif utopia is not None:
-        head = i2c_parameters(OPTION_PARAMETERS, after, slave)
+        head = i2c_parameters(kind | OPTION_PARAMETERS, after, slave)
     else:
-        head = i2c_parameters(OPTION_BOOT_TABLE, after, slave)
+        head = i2c_parameters(kind | OPTION_BOOT_TABLE, after, slave)
     if utopia is not None:
         tail += utopia_parameters(*utopia)
     else:
         if config:
             # The parameter block the configuration table re-enters at names the table.
-            tail += i2c_parameters(OPTION_BOOT_TABLE, after + len(tail) + BLOCK_BYTES, slave)
+            tail += i2c_parameters(kind | OPTION_BOOT_TABLE, after + len(tail) + BLOCK_BYTES,
+                                   slave)
         tail += blocks(table)
     image = bytes(base) + head + tail
     if len(image) > 0x10000:
@@ -173,11 +189,11 @@ def main() -> int:
     parser.add_argument("--cell-size", type=int)
     parser.add_argument("--slave-id", type=int, choices=range(32), default=0)
     parser.add_argument("--core-mhz", type=int, default=500)
+    parser.add_argument("--eeprom-type", type=int, choices=range(8), default=0,
+                        help="the I2C options' EEPROM type, bits 4:2 (tiboot_c6472.h)")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
     try:
-        elf = parse_elf(args.image)
-        big_endian = elf.endian == ">"
         if args.utopia:
             options = ((UTOPIA_SINGLE_PHY if args.single_phy else 0)
                        | (UTOPIA_WIDE if args.width == 16 else 0)
@@ -189,7 +205,7 @@ def main() -> int:
             utopia = None
             table, entry = boot_table(args.image)
         image = build(index=args.index, slave=args.slave, table=table, utopia=utopia,
-                      config=args.config, big_endian=big_endian)
+                      config=args.config, eeprom_type=args.eeprom_type)
         args.out.write_bytes(image)
         report = {"bytes": len(image), "table_bytes": len(table) if table else 0, "entry": entry}
         print(json.dumps(report) if args.json else

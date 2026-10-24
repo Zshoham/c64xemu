@@ -19,15 +19,19 @@ def test_dependencies() -> None:
 
     None of it is checked in: build/ is provisioned with tests/tools/fetch_deps.sh when any
     tree is absent - the TI toolchains the firmware and target programs are built with,
-    DSPLIB, whose kernels the dsplib_* program specs compile, and the binutils tic6x vectors
-    the decoder differential sweeps - and the firmware images and the EABI C64x+ NDK
+    DSPLIB, whose kernels the dsplib_* program specs compile, the binutils tic6x vectors
+    the decoder differential sweeps, and TI's IBL, whose host tools build boot EEPROMs - and
+    the firmware images and the EABI C64x+ NDK
     libraries they link are then built, bios_kernel first, then ndk_tcp (which builds the NDK
     libraries via tools/build_ndk_libs.sh).
     """
+    # The IBL is checked for a file inside it, not just the directory: an interrupted fetch by
+    # an earlier fetch_deps.sh could leave a bare repository there.
     trees = [ROOT / "tests/build" / name for name in
              ("xdctools_3_32_01_22_core", "bios_6_42_03_35", "ndk_2_22_02_16",
-              "ti-cgt-c6000_8.5.0.LTS", "dsplib-c64plus", "binutils-tic6x-vectors")]
-    if not all(tree.is_dir() for tree in trees):
+              "ti-cgt-c6000_8.5.0.LTS", "dsplib-c64plus", "binutils-tic6x-vectors",
+              "ibl/src/util/romparse/romparse.c")]
+    if not all(tree.exists() for tree in trees):
         print("provisioning build/ with tests/tools/fetch_deps.sh", file=sys.stderr)
         # The installers and XDCtools launchers are generic-Linux binaries; on NixOS they run
         # inside the devenv FHS environment, so invoke the script through it when present.

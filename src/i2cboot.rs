@@ -265,6 +265,9 @@ pub(crate) struct I2cBoot {
     phase: Phase,
     stream: BootStream,
     config: ConfigStream,
+    /// Table bytes on their way to the device's byte order, with a word that a block ended
+    /// part-way through.
+    words: WordOrder,
     parameter_blocks: usize,
     progress: Progress,
 }
@@ -284,6 +287,7 @@ impl I2cBoot {
             phase: Phase::Configure,
             stream: BootStream::new(endian),
             config: ConfigStream::new(endian),
+            words: WordOrder::new(endian),
             parameter_blocks: 0,
             progress: Progress::default(),
         }
@@ -406,7 +410,6 @@ impl I2cBoot {
             return None;
         }
         self.progress.checksum_failures = 0;
-        let data = &block[BLOCK_HEADER_BYTES..size];
         match self.target {
             Target::Parameters => {
                 self.take_parameters(bus, &block[..size]);
@@ -414,7 +417,8 @@ impl I2cBoot {
             }
             Target::Configuration => {
                 self.progress.config_blocks += 1;
-                match self.config.feed(data, bus) {
+                let data = self.words.convert(&block[BLOCK_HEADER_BYTES..size]);
+                match self.config.feed(&data, bus) {
                     Err(message) => self.fail(message),
                     Ok(false) => {
                         self.at = self.at.wrapping_add(size as u32);
@@ -439,8 +443,9 @@ impl I2cBoot {
             }
             Target::BootTable => {
                 self.progress.table_blocks += 1;
-                self.progress.table_bytes += data.len();
-                match self.stream.feed(data, bus) {
+                self.progress.table_bytes += size - BLOCK_HEADER_BYTES;
+                let data = self.words.convert(&block[BLOCK_HEADER_BYTES..size]);
+                match self.stream.feed(&data, bus) {
                     Err(_) => self.fail("boot table has no termination record"),
                     Ok(false) => {
                         self.at = self.at.wrapping_add(size as u32);
@@ -540,7 +545,9 @@ impl I2cBoot {
     /// Point the next read at a device address: the low word is the address inside the EEPROM,
     /// and the high word "is used as the I2C EEPROM slave address" (Table 6), where zero means
     /// the EEPROM the boot is already talking to.
+    /// A new table starts there, so no part of a word is carried over from the last.
     fn address(&mut self, low: u32, high: u32) {
+        self.words = WordOrder::new(self.endian);
         if high != 0 {
             self.slave = high & 0x3ff;
         }
@@ -600,6 +607,45 @@ fn checksum_valid(block: &[u8]) -> bool {
         }
     }
     sum == 0 || sum == 0xffff
+}
+
+/// Table data as the device's memory holds it. The EEPROM carries every 32-bit word of a boot or
+/// configuration table most significant byte first, whatever the device's byte order: SPRUEC6G
+/// section 6.2.2.3.1 builds the table with `hex6x -a`, whose ASCII-hex output writes each 32-bit
+/// word that way for `-order L` as for `-order M`, and TI's IBL tools say so outright -
+/// `bconvert64x`: "The C6x boot loader expects all 32 bit values to be in big endian ... Data
+/// bytes are also arranged to be 32 bit big endian represented" - before `b2i2c` blocks the
+/// table. A little-endian device therefore stores each word with its bytes turned round.
+///
+/// TI's `b2i2c` blocks carry 124 data bytes, but section 2.3.4.1 sets only a 128-byte maximum,
+/// so a block may end part-way through a word. The word's first bytes are held until the next
+/// block of the same table brings the rest, and only whole words go on to the table processor.
+struct WordOrder {
+    endian: Endian,
+    carry: Vec<u8>,
+}
+
+impl WordOrder {
+    fn new(endian: Endian) -> Self {
+        Self {
+            endian,
+            carry: Vec::new(),
+        }
+    }
+
+    /// The next block's data, as whole words in the device's order.
+    fn convert<'a>(&mut self, data: &'a [u8]) -> std::borrow::Cow<'a, [u8]> {
+        if self.endian == Endian::Big {
+            return std::borrow::Cow::Borrowed(data);
+        }
+        let mut bytes = std::mem::take(&mut self.carry);
+        bytes.extend_from_slice(data);
+        self.carry = bytes.split_off(bytes.len() & !3);
+        for word in bytes.chunks_exact_mut(4) {
+            word.reverse();
+        }
+        std::borrow::Cow::Owned(bytes)
+    }
 }
 
 #[cfg(test)]
@@ -701,14 +747,10 @@ pub(crate) mod tests {
         image
     }
 
-    fn words(words: &[u32], endian: Endian) -> Vec<u8> {
-        words
-            .iter()
-            .flat_map(|word| match endian {
-                Endian::Little => word.to_le_bytes(),
-                Endian::Big => word.to_be_bytes(),
-            })
-            .collect()
+    /// Table words as the EEPROM carries them, most significant byte first on either byte order
+    /// (`WordOrder`).
+    pub(crate) fn words(words: &[u32]) -> Vec<u8> {
+        words.iter().flat_map(|word| word.to_be_bytes()).collect()
     }
 
     fn run(device: &mut Device, cycles: usize) {
@@ -735,14 +777,17 @@ pub(crate) mod tests {
         const ENTRY: u32 = 0x0080_0400;
         const DESTINATION: u32 = 0x0080_1000;
         // A table long enough to need two blocks, so a section's data straddles a block
-        // boundary and the read has to come back for the rest.
+        // boundary and the read has to come back for the rest. The data travels as words most
+        // significant byte first, so on this little-endian device each word's bytes land
+        // turned round: the wire carries the payload that way so memory holds it as written.
         let payload: Vec<u8> = (0..200u32).map(|index| (index * 7 + 1) as u8).collect();
-        let mut table: Vec<u8> = Vec::new();
-        table.extend_from_slice(&ENTRY.to_le_bytes());
-        table.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-        table.extend_from_slice(&DESTINATION.to_le_bytes());
-        table.extend_from_slice(&payload);
-        table.extend_from_slice(&0u32.to_le_bytes());
+        let mut table = words(&[ENTRY, payload.len() as u32, DESTINATION]);
+        table.extend(
+            payload
+                .chunks(4)
+                .flat_map(|word| word.iter().rev().copied()),
+        );
+        table.extend(words(&[0]));
 
         let mut device = Device::with_boot_mode(&C6455, 0, Endian::Little, BOOTMODE_I2C_EEPROM);
         device.begin_i2c_boot(BOOTMODE_I2C_EEPROM, 0, eeprom(&table));
@@ -815,9 +860,7 @@ pub(crate) mod tests {
         );
         image[2..4].fill(0);
         // A table that is nothing but its entry point and the terminator.
-        let mut table = Vec::new();
-        table.extend_from_slice(&0x0080_0800u32.to_le_bytes());
-        table.extend_from_slice(&0u32.to_le_bytes());
+        let table = words(&[0x0080_0800, 0]);
         image.extend_from_slice(&block(&table));
         let mut device = Device::with_boot_mode(&C6455, 0, Endian::Little, BOOTMODE_I2C_EEPROM);
         device.begin_i2c_boot(BOOTMODE_I2C_EEPROM, 0, image);
@@ -841,9 +884,7 @@ pub(crate) mod tests {
             2 * BLOCK_BYTES as u16,
             EEPROM_ADDRESS as u16,
         ));
-        let mut table = Vec::new();
-        table.extend_from_slice(&0x0080_0c00u32.to_le_bytes());
-        table.extend_from_slice(&0u32.to_le_bytes());
+        let table = words(&[0x0080_0c00, 0]);
         image.extend_from_slice(&block(&table));
         let mut device = Device::with_boot_mode(&C6455, 0, Endian::Little, BOOTMODE_I2C_EEPROM);
         device.begin_i2c_boot(BOOTMODE_I2C_EEPROM, 1, image);
@@ -900,7 +941,7 @@ pub(crate) mod tests {
                 table.extend([4 * data.len() as u32, DATA]);
                 table.extend(&data);
                 table.push(0);
-                image.extend(blocks(&words(&table, endian)));
+                image.extend(blocks(&words(&table)));
 
                 let mut device = Device::with_boot_mode(&C6472, 0, endian, mode);
                 device.begin_i2c_boot(mode, cfggp, image);
@@ -967,7 +1008,7 @@ pub(crate) mod tests {
             }
             // Both masks naming the same bits toggles them.
             config.extend([TARGET + 0x40, 0xf0f0_f0f0, 0xf0f0_f0f0, 0, 0, 0]);
-            let config = blocks(&words(&config, endian));
+            let config = blocks(&words(&config));
             let next = (BLOCK_BYTES + config.len()) as u16;
             let table_at = next + BLOCK_BYTES as u16;
             let mut image = if c6472 {
@@ -986,7 +1027,7 @@ pub(crate) mod tests {
             } else {
                 parameters(TABLE_TYPE_BOOT_TABLE, table_at, 0)
             });
-            image.extend(blocks(&words(&[0x0080_0c00, 0], endian)));
+            image.extend(blocks(&words(&[0x0080_0c00, 0])));
             let (profile, mode) = if c6472 { (&C6472, 2) } else { (&C6455, 5) };
             let mut device = Device::with_boot_mode(profile, 0, endian, mode);
             device.with_core(0, |cpu| {
@@ -1024,10 +1065,7 @@ pub(crate) mod tests {
         let call = {
             let mut image =
                 c6472_i2c_parameters(TABLE_TYPE_CONFIGURATION, 0x80, 0x50, (0x100, 0x50));
-            image.extend(blocks(&words(
-                &[0x0080_3000, 0, 0, 0, 0, 0],
-                Endian::Little,
-            )));
+            image.extend(blocks(&words(&[0x0080_3000, 0, 0, 0, 0, 0])));
             image
         };
         let mac = c6472_parameters(0x105, &[]);
@@ -1047,5 +1085,64 @@ pub(crate) mod tests {
             assert!(device.held_in_reset(0), "{error}");
             assert_eq!(device.utopia_boot(), None, "{error}");
         }
+    }
+
+    /// Section 2.3.4.1 bounds a block at 128 bytes and nothing more, so a board may block its
+    /// tables at any length and a word can end in the next block. On a little-endian device the
+    /// ROM still has to turn that word round whole: a configuration table cut every 10 bytes
+    /// and a boot table cut every 122 put a word across nearly every boundary.
+    #[test]
+    fn a_word_split_across_blocks_reaches_memory_whole() {
+        const TARGET: u32 = 0x0080_2000;
+        let cut = |bytes: &[u8], payload: usize| -> Vec<u8> {
+            bytes.chunks(payload).flat_map(block).collect()
+        };
+        let data: Vec<u32> = (0..60)
+            .map(|index| 0x0102_0304u32.wrapping_mul(index + 1))
+            .collect();
+        let mut table = vec![CODE, 12, CODE, MVK_A4 | (5 << 18), ADD_A4, ADD_A4];
+        table.extend([4 * data.len() as u32, DATA]);
+        table.extend(&data);
+        table.push(0);
+        let config = cut(
+            &words(&[TARGET, 0x1234_5678, 0, TARGET + 4, 0xa5a5_0000, 0, 0, 0, 0]),
+            10,
+        );
+        let next = (BLOCK_BYTES + config.len()) as u16;
+        let mut image = c6472_i2c_parameters(
+            TABLE_TYPE_CONFIGURATION,
+            BLOCK_BYTES as u16,
+            0x50,
+            (next, 0x50),
+        );
+        image.extend(config);
+        image.extend(c6472_i2c_parameters(
+            TABLE_TYPE_BOOT_TABLE,
+            next + BLOCK_BYTES as u16,
+            0x50,
+            (0, 0),
+        ));
+        image.extend(cut(&words(&table), 122));
+
+        let mut device = Device::with_boot_mode(&C6472, 0, Endian::Little, 2);
+        device.begin_i2c_boot(2, 0, image);
+        run(&mut device, 600_000);
+        let boot = device.i2c_boot().unwrap();
+        assert_eq!(boot.error, None);
+        assert_eq!(boot.checksum_failures, 0);
+        assert_eq!(boot.entry, Some(CODE));
+        assert_eq!(read(&mut device, TARGET), 0x1234_5678);
+        assert_eq!(read(&mut device, TARGET + 4), 0xa5a5_0000);
+        for (index, &word) in data.iter().enumerate() {
+            assert_eq!(
+                read(&mut device, DATA + 4 * index as u32),
+                word,
+                "data word {index}"
+            );
+        }
+        for _ in 0..400 {
+            device.step_cycle();
+        }
+        assert_eq!(device.core(0).register('A', 4), 7);
     }
 }

@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Fetch everything the conformance suite builds with and reads that is not checked in, into
 # build/, so the tests run from a fresh checkout: TI's XDCtools, NDK, SYS/BIOS and C6000 code
-# generation tools, TI's DSPLIB for C64x+, and the tic6x test vectors out of a GNU binutils
-# source release. A component is skipped when its tree is already present, and downloaded
+# generation tools, TI's DSPLIB for C64x+, the tic6x test vectors out of a GNU binutils
+# source release, and TI's Intermediate Boot Loader source, whose host tools build boot EEPROM
+# images. A component is skipped when its tree is already present, and downloaded
 # archives are kept in build/.downloads for re-runs (delete that directory to reclaim the
 # space - roughly 600 MB).
 #
@@ -53,6 +54,13 @@ installers_into_prefix=(
 # to; its vector files are byte-identical in 2.45.
 tarball_subtrees=(
     "binutils-tic6x-vectors|https://ftp.gnu.org/gnu/binutils/binutils-2.44.tar.xz|binutils-2.44/gas/testsuite/gas/tic6x"
+)
+# `name|repository|commit`: a git tree checked out at one commit. git.ti.com serves no snapshot
+# archives, but it does serve a single commit by its hash. The IBL is TI's own C6472 boot EEPROM
+# tooling - the ROM's boot parameter header, b2i2c and romparse - which tests/test_i2cboot.py
+# builds and uses as the oracle for the ROM's I2C boot (tests/tools/ibl_tools.py).
+git_checkouts=(
+    "ibl|https://git.ti.com/git/keystone-rtos/ibl.git|ed3f0989d8cdc813b7ca1ed899c4d84b63de3a75"
 )
 
 for tool in curl tar python3; do
@@ -163,6 +171,31 @@ unpack_subtree() { # name url member
     fi
 }
 
+checkout() { # name repository commit
+    local name=$1 repository=$2 commit=$3
+    command -v git >/dev/null || { echo "git is required for $name" >&2; exit 1; }
+    # A tree counts only when it is the pinned commit: anything else - including what an
+    # interrupted fetch by an older version of this script left behind - is fetched again.
+    if [ "$(git -C "$target/$name" rev-parse HEAD 2>/dev/null)" = "$commit" ]; then
+        echo "== $name already present, skipping"
+        return
+    fi
+    echo "== fetching $name at $commit"
+    # Check out into a staging directory and publish it only once it is the commit, so a fetch
+    # that fails leaves nothing that looks like the tree.
+    local staging="$target/.$name.partial"
+    rm -rf "$staging"
+    git init -q "$staging"
+    git -C "$staging" fetch -q --depth 1 "$repository" "$commit"
+    git -C "$staging" checkout -q FETCH_HEAD
+    if [ "$(git -C "$staging" rev-parse HEAD)" != "$commit" ]; then
+        echo "error: $name is not at $commit" >&2
+        exit 1
+    fi
+    rm -rf "$target/$name"
+    mv "$staging" "$target/$name"
+}
+
 for entry in "${zip_archives[@]}"; do
     unpack_zip "${entry%%|*}" "${entry#*|}"
 done
@@ -176,11 +209,16 @@ for entry in "${tarball_subtrees[@]}"; do
     rest=${entry#*|}
     unpack_subtree "${entry%%|*}" "${rest%%|*}" "${rest#*|}"
 done
+for entry in "${git_checkouts[@]}"; do
+    rest=${entry#*|}
+    checkout "${entry%%|*}" "${rest%%|*}" "${rest#*|}"
+done
 
 echo
 echo "Test dependencies ready in $target:"
 for name in "${zip_archives[@]%%|*}" "${installers_under_prefix[@]%%|*}" \
-            "${installers_into_prefix[@]%%|*}" "${tarball_subtrees[@]%%|*}"; do
+            "${installers_into_prefix[@]%%|*}" "${tarball_subtrees[@]%%|*}" \
+            "${git_checkouts[@]%%|*}"; do
     if present "$name"; then
         echo "  - $name"
     else

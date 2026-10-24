@@ -266,13 +266,19 @@ def eeprom_block(payload: bytes) -> bytes:
         2, "big"
     ) + payload
 
-def build_eeprom_image(table: bytes) -> bytes:
+def build_eeprom_image(table: bytes, big_endian: bool) -> bytes:
     """A serial EEPROM's contents: the boot parameter block the ROM reads first, then the boot
     table split across as many blocks as it needs.
 
     The parameter block sits at address 0, which is where the ROM looks when the configuration
     pins select index 0, and it names the boot table's address as the block right after it.
+    `table` is in the build's byte order, as the TI-TXT output holds it; on the EEPROM every
+    32-bit word goes most significant byte first, as SPRUEC6G section 6.2.2.3.1's ``hex6x -a``
+    writes it and TI's IBL ``bconvert64x`` states ("The C6x boot loader expects all 32 bit
+    values to be in big endian").
     """
+    if not big_endian:
+        table = b"".join(table[at : at + 4][::-1] for at in range(0, len(table), 4))
     payload = bytearray(EEPROM_BLOCK_BYTES - EEPROM_BLOCK_HEADER)
     fields = dict(EEPROM_PARAM_FIELDS)
     fields[6] = EEPROM_OPTION_BOOT_TABLE
@@ -357,7 +363,7 @@ def run_target_program(
         # ELF is only there for its symbols; every byte of memory comes off the bus.
         table = boot_table_path(program, workdir).read_bytes()
         eeprom = eeprom_path(program, workdir)
-        eeprom.write_bytes(build_eeprom_image(table))
+        eeprom.write_bytes(build_eeprom_image(table, "--big_endian" in program.link_flags))
         command += [
             "--boot-mode",
             "5",
