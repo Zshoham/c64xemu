@@ -621,13 +621,13 @@ AID0 and only supervisor permissions withhold the transmit source and record Pri
 `memory:emac-reads-with-user-privilege-granted` has a page granting AID0 and only UR send it.
 This replaced an earlier AIDX/supervisor model of the EMAC that neither manual supports.
 
-**[ ] EMAC descriptor memory protection.** Packet-buffer transfers use the protection check,
-but descriptor word reads and writes still take the unchecked `dma_word`/`dma_store_word` path.
-Descriptors in protected L2 can therefore be read or have ownership updated without the required
-PrivID 0 user permission or a fault. Route the EMAC's descriptor accesses through the same
-protection policy without changing EDMA3's access mode. The checks are a transmit descriptor
-without UR that sends nothing and records a read fault, and one with UR but without UW whose
-ownership remains unchanged and whose completion write records a write fault.
+**[x] EMAC descriptor memory protection.** *Done.* The EMAC's descriptor word reads and writes
+take the same PrivID 0, user-mode protection check as its packet buffers; EDMA3's access mode is
+unchanged. A transmit descriptor without UR sends nothing and records a read fault
+(`memory:emac-tx-descriptor-without-user-read`); one with UR but without UW keeps its ownership
+and its completion write records a write fault (`memory:emac-tx-descriptor-without-user-write`).
+The receive side has the matching vectors, and `-with-user-access` proves normal processing.
+Descriptors in the EMAC's own descriptor RAM (peripheral aperture) are not protected.
 
 **[ ] EDMA3 transfers carry the programmer's privilege.** Every EDMA3 transfer is judged as an
 external master - AIDX in supervisor mode - whoever set it up. SPRS612G Table 5-3 says the

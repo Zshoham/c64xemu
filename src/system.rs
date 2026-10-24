@@ -2378,6 +2378,12 @@ impl Fabric {
         false
     }
 
+    /// Whether any megamodule restricts DMA masters at all; until one does, no DMA access is
+    /// checked.
+    fn dma_protection_active(&self) -> bool {
+        (0..self.cores).any(|core| self.mm[core].mpu_dma_restrictive)
+    }
+
     /// DMA accesses carry a requestor PrivID rather than LOCAL, and the privilege mode the
     /// master transfers in. IDMA, the HPI's DMA, the UTOPIA PDMA and the EMACs use ID 0; the
     /// EDMA3's transfers are judged as an external master (AIDX, IDs >= 6). The unit consulted
@@ -2390,9 +2396,6 @@ impl Fabric {
         id: u8,
         user: bool,
     ) -> bool {
-        if !(0..self.cores).any(|core| self.mm[core].mpu_dma_restrictive) {
-            return true;
-        }
         let Some((core, unit, page)) = self.dma_mpu_page(address) else {
             return true;
         };
@@ -2556,10 +2559,7 @@ impl Fabric {
         if !is_memory(address) {
             return Some(self.master_register_read(address));
         }
-        if !self.check_dma_access(address, Permission::Read, 0, false) {
-            return None;
-        }
-        Some(self.dma_word(address))
+        self.checked_dma_word(address, 0, false)
     }
 
     pub(crate) fn master_write32(&mut self, address: u32, value: u32) {
@@ -2573,10 +2573,7 @@ impl Fabric {
             self.master_register_write(address, value);
             return;
         }
-        if !self.check_dma_access(address, Permission::Write, 0, user) {
-            return;
-        }
-        self.dma_store_word(address, value);
+        self.checked_dma_store_word(address, value, 0, user);
     }
 
     /// A system master's word in the configuration space. A chip-level peripheral answers
@@ -2721,6 +2718,42 @@ impl Fabric {
         }
     }
 
+    /// Whether protection lets a master with PrivID `id` in `user` or supervisor mode make
+    /// `permission` accesses to all of `length` bytes at `address`; the first protected byte
+    /// latches the fault and refuses the whole access.
+    fn dma_access_allowed(
+        &mut self,
+        address: u32,
+        length: usize,
+        permission: Permission,
+        id: u8,
+        user: bool,
+    ) -> bool {
+        if !self.dma_protection_active() {
+            return true;
+        }
+        (0..length).all(|offset| {
+            let byte_address = address.wrapping_add(offset as u32);
+            self.check_dma_access(byte_address, permission, id, user)
+        })
+    }
+
+    /// A memory word for a master that carries PrivID `id` in `user` or supervisor mode, its
+    /// four bytes judged as `dma_access_allowed` says; `None` when protection refuses it.
+    fn checked_dma_word(&mut self, address: u32, id: u8, user: bool) -> Option<u32> {
+        if !self.dma_access_allowed(address, 4, Permission::Read, id, user) {
+            return None;
+        }
+        Some(self.dma_word(address))
+    }
+
+    /// `checked_dma_word` for a store: a refused word is discarded.
+    fn checked_dma_store_word(&mut self, address: u32, value: u32, id: u8, user: bool) {
+        if self.dma_access_allowed(address, 4, Permission::Write, id, user) {
+            self.dma_store_word(address, value);
+        }
+    }
+
     /// `length` bytes for a byte-moving system master that carries PrivID `id` in `user` or
     /// supervisor mode. A DMA access inside a peripheral aperture reaches that peripheral's
     /// register through its slave port, with all the side effects a CPU read would have, rather
@@ -2729,11 +2762,8 @@ impl Fabric {
         if !is_memory(address) {
             return self.dma_register_read(address, length);
         }
-        for offset in 0..length {
-            let byte_address = address.wrapping_add(offset as u32);
-            if !self.check_dma_access(byte_address, Permission::Read, id, user) {
-                return vec![0; length];
-            }
+        if !self.dma_access_allowed(address, length, Permission::Read, id, user) {
+            return vec![0; length];
         }
         self.dma_bytes(address, length)
     }
@@ -2743,11 +2773,8 @@ impl Fabric {
             self.dma_register_write(address, bytes);
             return;
         }
-        for offset in 0..bytes.len() {
-            let byte_address = address.wrapping_add(offset as u32);
-            if !self.check_dma_access(byte_address, Permission::Write, id, user) {
-                return;
-            }
+        if !self.dma_access_allowed(address, bytes.len(), Permission::Write, id, user) {
+            return;
         }
         self.dma_store(address, bytes);
     }
@@ -2788,12 +2815,22 @@ impl EmacDmaMemory for EmacMaster<'_> {
         self.0.requestor_write_bytes(address, bytes, 0, true);
     }
 
+    /// A descriptor word in memory is judged like the packet buffers, and a refused one reads
+    /// as zero. The EMAC's own descriptor RAM sits in its peripheral aperture, outside memory
+    /// protection.
     fn dma_read_u32(&mut self, address: u32) -> u32 {
-        self.0.dma_word(address)
+        if !is_memory(address) {
+            return self.0.dma_word(address);
+        }
+        self.0.checked_dma_word(address, 0, true).unwrap_or(0)
     }
 
     fn dma_write_u32(&mut self, address: u32, value: u32) {
-        self.0.dma_store_word(address, value);
+        if !is_memory(address) {
+            self.0.dma_store_word(address, value);
+            return;
+        }
+        self.0.checked_dma_store_word(address, value, 0, true);
     }
 }
 

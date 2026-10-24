@@ -316,17 +316,32 @@ requester id, and the CPU is the local requester. `check_dma_access` checks the 
 requester id (IDs 0–5 have their own bit, 6 and above share AIDX) and the permission bit for the
 requester's privilege mode: IDMA and the HPI's DMA are ID 0 supervisor, the EMACs and the UTOPIA
 PDMA ID 0 user (SPRS612G section 5.2 and Table 5-3), and the EDMA3's transfers AIDX supervisor.
-Two gaps are open in the ROADMAP: the EDMA3 should carry the PrivID and mode of the core that
-programmed it (SPRU966C section 2.10.2), and the EMAC's descriptor words skip the check entirely;
-only its packet buffers are protected.
+One gap is open in the ROADMAP: the EDMA3 should carry the PrivID and mode of the core that
+programmed it (SPRU966C section 2.10.2).
 A refused access is discarded, and `record_mpu_fault` latches the address in MPFAR and the
 attempted permission in MPFSR and raises the unit's system event: 124, 120, 122 for a CPU fault
 on L2, L1P, L1D, and 125, 121, 123 for a requester's. That event reaches the CPU as `EXCEP`
 through the exception combiner — see [Interrupts and exceptions](interrupts.md).
 
-The EMAC's packet-buffer transfers cross this check, but its descriptor word accesses still
-bypass it through `dma_word`/`dma_store_word`. Protection of descriptors in L2 is not enforced;
-the remaining work is recorded in the roadmap's *EMAC descriptor memory protection* item.
+The EMAC's descriptor words cross the same check as its packet buffers, with PrivID 0 in user
+mode (`EmacMaster::dma_read_u32`/`dma_write_u32`). A refused descriptor read returns zero, so a
+transmit descriptor without UR reads as not handed over and raises the owner host error without
+sending anything; a refused write is discarded, so ownership stays and the fault is recorded
+with UW. Protection reports a violation "to the operating environment" (SPRU871K 8.3.3.2), not
+to the requestor, so the EMAC is not told its write went nowhere: it still sends or stores the
+frame, advances the head pointer, and posts the descriptor in the completion pointer, raising
+the channel interrupt while that descriptor still shows OWNER. Descriptors outside memory, in
+the EMAC's own descriptor RAM in the peripheral aperture, are not protected.
+`memory:emac-{tx,rx}-descriptor-without-user-read`, `-without-user-write` and
+`-with-user-access` cover both directions.
+
+Every system-master word - EMAC descriptor words and the HPI's and IDMA's
+`master_read32`/`master_write32` - is judged on all four of its bytes by `dma_access_allowed`,
+as byte transfers are. Each descriptor word is a separate access, so a descriptor that
+straddles a page boundary is judged word by word: a refused word reads as zero while its
+neighbours on the other page are read normally. SPRU871K does not say how an access spanning
+two pages is judged, nor whether the EMAC fetches a descriptor as one burst (SPRU975E is
+silent too), so this per-word rule is the model's choice rather than a quoted one.
 
 A unit holds its first fault and raises nothing further until software clears it (SPRU871K
 8.4.2.1.3). The one exception is per-unit and quoted rather than generalised: L1P (2.9.2.3.3) and

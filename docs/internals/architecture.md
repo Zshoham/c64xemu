@@ -241,7 +241,7 @@ Given an address and a requester, this is which module answers:
 | CPU access inside that band | port walk → `Megamodule::cfg_*` → memory, as above |
 | CPU access to a restricted page | `Fabric::check_access` first; a violation latches MPFAR/MPFSR and raises the unit's event |
 | Word-wide master (HPI, IDMA) to memory (`is_memory`) | `Fabric::master_read32`/`master_write32` → privilege-ID-0 protection check → `dma_word`/`dma_store_word`, with the L2 snoop |
-| `DmaMemory` master (EDMA3, EMAC) to memory | `dma_read_bytes`/`dma_write_bytes` → protection check → `dma_bytes`/`dma_store`; `dma_read_u32`/`dma_write_u32` (EMAC descriptors) → `dma_word`/`dma_store_word` directly; both with the L2 snoop |
+| `DmaMemory` master (EDMA3, EMAC) to memory | `dma_read_bytes`/`dma_write_bytes` → protection check → `dma_bytes`/`dma_store`; `dma_read_u32`/`dma_write_u32` → the EMAC checks as PrivID 0 in user mode then `dma_word`/`dma_store_word`, the EDMA3 goes to them directly; all with the L2 snoop |
 | `master_*32` or `dma_*_bytes` to the configuration space | `Fabric::master_register_read`/`master_register_write`: the port walk; the megamodule registers (`0x0180_0000..0x01c0_0000`) read zero and ignore writes (SPRU871K section 5.3.1); anything else is device memory |
 | HPI host side | `Fabric::hpi_host_read`/`hpi_host_write` through `lend_hpi` → `hpi_read32`/`hpi_write32`, which drop accesses inside `DeviceProfile::host_excluded` (denied reads complete with zero) → `master_read32`/`master_write32` |
 | Debugger or front-end read | `Fabric::host_read_bytes` - backing plus `host_snoop_read`, disturbing no cache state |

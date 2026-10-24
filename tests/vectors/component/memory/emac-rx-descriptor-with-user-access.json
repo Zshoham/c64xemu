@@ -1,0 +1,87 @@
+{
+  "domain": "memory",
+  "expected": {
+    "observations": [
+      "ffffffffffff0200000000010800000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d",
+      3489660988,
+      60,
+      0,
+      0
+    ]
+  },
+  "request": {
+    "action": "system",
+    "id": "memory:emac-rx-descriptor-with-user-access",
+    "operations": [
+      {
+        "address": 8454144,
+        "hex": "00000000001180008000000000000020",
+        "op": "write_bytes"
+      },
+      {
+        "address": 46661888,
+        "op": "write32",
+        "value": 8192
+      },
+      {
+        "address": 46661952,
+        "op": "write32",
+        "value": 1
+      },
+      {
+        "address": 46661652,
+        "op": "write32",
+        "value": 1
+      },
+      {
+        "address": 25469440,
+        "op": "write32",
+        "value": 1026
+      },
+      {
+        "address": 25469444,
+        "op": "write32",
+        "value": 1342
+      },
+      {
+        "address": 46663200,
+        "op": "write32",
+        "value": 8454144
+      },
+      {
+        "address": 46661984,
+        "op": "write32",
+        "value": 32
+      },
+      {
+        "hex": "ffffffffffff0200000000010800000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d",
+        "op": "inject_frame"
+      },
+      {
+        "cycles": 64,
+        "op": "tick"
+      },
+      {
+        "address": 8392960,
+        "length": 60,
+        "op": "read_bytes"
+      },
+      {
+        "address": 8454156,
+        "op": "read32"
+      },
+      {
+        "address": 8454152,
+        "op": "read32"
+      },
+      {
+        "address": 25468928,
+        "op": "read32"
+      },
+      {
+        "address": 25468932,
+        "op": "read32"
+      }
+    ]
+  }
+}

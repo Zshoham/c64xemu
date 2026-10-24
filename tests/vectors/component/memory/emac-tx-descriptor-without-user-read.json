@@ -1,0 +1,71 @@
+{
+  "domain": "memory",
+  "expected": {
+    "observations": [
+      [],
+      3758096444,
+      8454156,
+      4
+    ]
+  },
+  "request": {
+    "action": "system",
+    "id": "memory:emac-tx-descriptor-without-user-read",
+    "operations": [
+      {
+        "address": 8392704,
+        "hex": "ffffffffffff0200000000010800000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d",
+        "op": "write_bytes"
+      },
+      {
+        "address": 8454144,
+        "hex": "00000000001080003c0000003c0000e0",
+        "op": "write_bytes"
+      },
+      {
+        "address": 46661636,
+        "op": "write32",
+        "value": 1
+      },
+      {
+        "address": 25469440,
+        "op": "write32",
+        "value": 1028
+      },
+      {
+        "address": 25469444,
+        "op": "write32",
+        "value": 1336
+      },
+      {
+        "address": 46663168,
+        "op": "write32",
+        "value": 8454144
+      },
+      {
+        "address": 46661984,
+        "op": "write32",
+        "value": 32
+      },
+      {
+        "cycles": 1,
+        "op": "tick"
+      },
+      {
+        "op": "take_tx_frames"
+      },
+      {
+        "address": 8454156,
+        "op": "read32"
+      },
+      {
+        "address": 25468928,
+        "op": "read32"
+      },
+      {
+        "address": 25468932,
+        "op": "read32"
+      }
+    ]
+  }
+}
