@@ -2060,8 +2060,8 @@ impl Fabric {
     /// One SYSCLK3 edge of the UTOPIA port if it is due, reporting whether it moved: a
     /// clock-detect section that failed latches an error the interrupt is a level on, and a
     /// cell either way arms an EDMA channel - or, on a device whose UTOPIA has a PDMA, is
-    /// delivered by it. A port with both directions disabled cannot do either, and a port that
-    /// is not due does neither and has no interrupt asserted.
+    /// moved by it. A port with both directions disabled cannot do either, and a port that is
+    /// not due does neither and has no interrupt asserted.
     fn tick_utopia(&mut self) -> bool {
         let edge = self.shared.sysclk3_edge;
         let Some(utopia) = self.shared.utopia.as_mut() else {
@@ -2072,9 +2072,12 @@ impl Fabric {
         }
         let events = utopia.step(edge, true, Utopia::tick_sysclk3);
         let moved = events.receive || events.transmit || utopia.at(edge, true).interrupt_pending();
-        if let Some(interrupt) = self.profile.events.utopia_pdma_receive {
+        if let Some((receive, transmit)) = self.profile.events.utopia_pdma {
             if events.receive {
-                self.service_utopia_receive(interrupt);
+                self.service_utopia_receive(receive);
+            }
+            if events.transmit {
+                self.service_utopia_transmit(transmit);
             }
             return moved;
         }
@@ -2117,15 +2120,47 @@ impl Fabric {
             *word = utopia_block.read_receive_queue();
         }
         utopia.plan(true);
-        let delivery = pdma.deliver_receive(burst, &words[..burst.words]);
+        let switch = pdma.advance(burst);
         // The PDMA is a switch master like any other: memory under protection and the snoop
         // protocol, a register through its port. UTOPIA transfers are always user mode, with
         // PrivID 0 (SPRS612G section 5.2: "For most peripheral masters (EMAC0, EMAC1, UTOPIA,
         // TSIP0, TSIP1, and TSIP2), the privilege mode is always user mode").
-        for &(address, word) in delivery.stores() {
+        for (&address, &word) in switch.addresses().iter().zip(&words) {
             self.master_write32_as(address, word, true);
         }
-        if let Some(core) = delivery.interrupt {
+        if let Some(core) = switch.interrupt {
+            self.raise(Destination::Core(core), interrupt);
+        }
+    }
+
+    /// UXEVT is asserted: the PDMA takes the event if a transmit channel is set up for it and
+    /// the queue can take the whole burst, reads the burst through the switch out of memory -
+    /// as PrivID 0 in user mode, like the receive side, so a word protection refuses reads as
+    /// zero and records the fault - writes it into the transmit queue, and raises `interrupt` in
+    /// the core the channel's SINT names when the transfer control asks for one (SPRUEG2E
+    /// sections 3.3, 4.4 and 6.2). The UTOPIA is planned again, because the first write of a
+    /// cell cleared the event.
+    fn service_utopia_transmit(&mut self, interrupt: usize) {
+        let edge = self.shared.sysclk3_edge;
+        let (Some(utopia), Some(pdma)) = (self.shared.utopia.as_mut(), self.shared.pdma.as_mut())
+        else {
+            return;
+        };
+        let Some(burst) = pdma.transmit_event(utopia.at(edge, true).transmit_event()) else {
+            return;
+        };
+        let switch = pdma.advance(burst);
+        let mut words = [0u32; MAX_BURST_WORDS];
+        for (word, &address) in words.iter_mut().zip(switch.addresses()) {
+            *word = self.master_read32_as(address, true).unwrap_or(0);
+        }
+        let utopia = self.shared.utopia.as_mut().unwrap();
+        let utopia_block = utopia.at(edge, true);
+        for &word in &words[..burst.words] {
+            utopia_block.write_transmit_queue(word);
+        }
+        utopia.plan(true);
+        if let Some(core) = switch.interrupt {
             self.raise(Destination::Core(core), interrupt);
         }
     }
@@ -2593,10 +2628,17 @@ impl Fabric {
     /// the hierarchy owns, and the configuration space answers as `master_register_read` says.
     /// `None` when protection refuses the read.
     pub(crate) fn master_read32(&mut self, address: u32) -> Option<u32> {
+        self.master_read32_as(address, false)
+    }
+
+    /// `master_read32` for a master whose transfers carry `user` privilege rather than the
+    /// supervisor's, with PrivID 0.
+    fn master_read32_as(&mut self, address: u32, user: bool) -> Option<u32> {
+        let privilege = Privilege { id: 0, user };
         if !is_memory(address) {
-            return Some(self.master_register_read(address, Privilege::ID0_SUPERVISOR));
+            return Some(self.master_register_read(address, privilege));
         }
-        self.checked_dma_word(address, Privilege::ID0_SUPERVISOR)
+        self.checked_dma_word(address, privilege)
     }
 
     pub(crate) fn master_write32(&mut self, address: u32, value: u32) {
@@ -4623,6 +4665,150 @@ mod tests {
             assert!(!print_flagged(&fabric));
             assert!(fabric.utopia_master_send_cell(SLAVE, &cell(2)));
             assert_eq!(fabric.utopia_master_poll_receive(SLAVE), Some(false));
+        }
+
+        const TXC0: u32 = PDMA + 0x100;
+        const PXINT: usize = 31;
+        /// Where the transmit cells wait: core 0's L1D, past the receive buffer.
+        const SOURCE: u32 = L1D + 0x400;
+
+        /// A C6472 with its transmitter enabled as slave 3 in 8-bit, multi-PHY mode, its transmit
+        /// group set up as SPRUEG2E Example 1 does - PE = 1, block mode, 14-word bursts from an
+        /// incrementing switch address into the constant UXQ port - and `cells` cells waiting at
+        /// `SOURCE`, each laid out as the cell packet the queue holds.
+        fn transmitter(cells: u8) -> Fabric {
+            let mut fabric = Fabric::new(&crate::device::C6472);
+            fabric.master_write32(UTOPIA, (u32::from(SLAVE) << 24) | (1 << 16) | (1 << 14));
+            let group = (1 << 22) | (1 << 20) | (13 << 12) | (1 << 11) | (13 << 4);
+            fabric.master_write32(PDMA + 0x60, group);
+            fabric.master_write32(PDMA + 4, 1 << 31);
+            for number in 0..cells {
+                let at = SOURCE + u32::from(number) * PACKET_BYTES;
+                for (index, word) in packet(&cell(number)).into_iter().enumerate() {
+                    fabric.master_write32(at + 4 * index as u32, word);
+                }
+            }
+            fabric
+        }
+
+        /// The cell packet for an 8-bit standard cell on a little-endian device: three dummy
+        /// bytes, then the wire bytes (SPRUEG2E Table 6).
+        fn packet(cell: &[u8]) -> Vec<u32> {
+            let mut bytes = vec![0; 3];
+            bytes.extend_from_slice(cell);
+            bytes
+                .chunks_exact(4)
+                .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+                .collect()
+        }
+
+        fn enable_transmit(fabric: &mut Fabric, cells: u32) {
+            fabric.master_write32(TXC0, SOURCE);
+            fabric.master_write32(TXC0 + 4, crate::pdma::TRANSMIT_QUEUE_PORT);
+            fabric.master_write32(TXC0 + 8, cells * PACKET_BYTES);
+            let control = (1 << 31) | (1 << 27) | (2 << 22) | (2 << 20);
+            fabric.master_write32(TXC0 + 12, control);
+        }
+
+        fn pxint_flagged(fabric: &Fabric) -> bool {
+            fabric.megamodule(0).event_flag_registers()[PXINT / 32] & (1 << (PXINT % 32)) != 0
+        }
+
+        #[test]
+        fn cells_leave_l1d_through_channel_zero_and_reach_the_master_exactly() {
+            let mut fabric = transmitter(2);
+            run(&mut fabric, 60);
+            assert_eq!(fabric.utopia_master_poll_transmit(SLAVE), Some(false));
+            assert_eq!(fabric.utopia_master_poll_transmit(SLAVE + 1), None);
+            enable_transmit(&mut fabric, 2);
+            run(&mut fabric, 60);
+            // UXCLAV says a cell is ready, and the wire carries the cell without its dummies.
+            assert_eq!(fabric.utopia_master_poll_transmit(SLAVE), Some(true));
+            let first = fabric.utopia_master_take_cell(SLAVE).unwrap();
+            assert_eq!(first.bytes(), cell(0).as_slice());
+            let second = fabric.utopia_master_take_cell(SLAVE).unwrap();
+            assert_eq!(second.bytes(), cell(1).as_slice());
+            assert_eq!(fabric.utopia_master_poll_transmit(SLAVE), Some(false));
+            // The block is done: PXINT in the core SINT names (Table 5), STRT clear and BCZ set,
+            // and the switch address past both cells (Table 39).
+            assert!(pxint_flagged(&fabric));
+            assert!(!print_flagged(&fabric));
+            assert_eq!(word(&mut fabric, TXC0), SOURCE + 2 * PACKET_BYTES);
+            assert_eq!(word(&mut fabric, TXC0 + 8), 0);
+            assert_eq!(
+                word(&mut fabric, TXC0 + 12) & ((1 << 31) | (1 << 16)),
+                1 << 16
+            );
+            // Nothing more leaves once the block has completed.
+            run(&mut fabric, 60);
+            assert_eq!(fabric.utopia_master_poll_transmit(SLAVE), Some(false));
+        }
+
+        #[test]
+        fn a_full_transmit_queue_holds_the_block_back_until_the_master_drains_it() {
+            let mut fabric = transmitter(3);
+            // Before the channel exists, UXEVT is an error, counted once however long it waits.
+            run(&mut fabric, 120);
+            assert_eq!(word(&mut fabric, PDMA + 0x20), 1);
+            enable_transmit(&mut fabric, 3);
+            run(&mut fabric, 120);
+            // The queue holds two cells (SPRUEG2E section 2), so the third stays in memory and
+            // the block is not done.
+            assert_eq!(word(&mut fabric, TXC0), SOURCE + 2 * PACKET_BYTES);
+            assert_eq!(word(&mut fabric, TXC0 + 8), PACKET_BYTES);
+            assert!(!pxint_flagged(&fabric));
+            assert_eq!(
+                fabric.utopia_master_take_cell(SLAVE).unwrap().bytes(),
+                cell(0).as_slice()
+            );
+            run(&mut fabric, 60);
+            assert!(pxint_flagged(&fabric));
+            for number in 1..3 {
+                assert_eq!(
+                    fabric.utopia_master_take_cell(SLAVE).unwrap().bytes(),
+                    cell(number).as_slice()
+                );
+            }
+            // Waiting for the master was never a stall: UXEVT only asks when there is room.
+            assert_eq!(word(&mut fabric, PDMA + 0x20), 1);
+        }
+
+        #[test]
+        fn the_pdma_reads_its_source_with_user_privilege() {
+            // SPRS612G section 5.2 again, on the read side: L1DMPPA16 guards the first 2 KB of
+            // core 0's L1D, where the cells wait. A page without UR refuses the PDMA's reads -
+            // the words go out as zeros and the fault is a user read - and one with UR passes.
+            const L1DMPPA16: u32 = 0x0184_ae40;
+            const L1DMPFAR: u32 = 0x0184_ac00;
+            const L1DMPFSR: u32 = 0x0184_ac04;
+            const AID0: u32 = 1 << 10;
+            const LOCAL: u32 = 1 << 8;
+            const SR: u32 = 1 << 5;
+            const SW: u32 = 1 << 4;
+            const UR: u32 = 1 << 2;
+            for (attributes, granted) in [
+                (AID0 | LOCAL | SR | SW, false),
+                (AID0 | LOCAL | SR | UR, true),
+            ] {
+                let mut fabric = transmitter(1);
+                fabric.write32(0, L1DMPPA16, attributes);
+                enable_transmit(&mut fabric, 1);
+                run(&mut fabric, 60);
+                let sent = fabric.utopia_master_take_cell(SLAVE).unwrap();
+                let status = fabric.read32(0, L1DMPFSR);
+                if granted {
+                    assert_eq!(sent.bytes(), cell(0).as_slice(), "user read granted");
+                    assert_eq!(status, 0, "no fault");
+                } else {
+                    assert_eq!(
+                        sent.bytes(),
+                        [0; 53],
+                        "user read refused although supervisor may read"
+                    );
+                    assert_eq!(fabric.read32(0, L1DMPFAR), SOURCE);
+                    assert_eq!(status, UR, "PrivID 0, user read");
+                }
+            }
         }
     }
 

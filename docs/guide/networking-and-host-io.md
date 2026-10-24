@@ -120,13 +120,15 @@ address the master drives, and for a write the cell's wire bytes.
 
 There is no host-side queue: a full receive queue refuses a write, and the master retries the
 refused write rather than an unanswered one, which could duplicate a cell. The transport moves
-whole cells, not UTOPIA clock edges. On the C6472 nothing services the transmit queue - its PDMA
-transmit channels are not modelled - so `x` answers `0` there.
+whole cells, not UTOPIA clock edges. On the C6472 the transmit queue fills only through the
+PDMA, so `x` answers `1` once a programmed transmit channel has written a cell there.
 
 `tests/tools/utopia_boot.py` is the master for the C6472's
 [UTOPIA boot](booting.md#utopia-boot); its `send` and `receive` helpers are what
-`tests/test_utopia.py` drives `tests/firmware/utopia_echo/` with, a C6455 program that copies
-each received cell into the transmit queue so the master reads back the cell it sent.
+`tests/test_utopia.py` drives the echo firmware with on both devices, so the master reads back
+the cell it sent. `tests/firmware/utopia_echo/` is a C6455 program that copies each received
+cell into the transmit queue with the CPU; `tests/firmware/c6472_utopia_echo/` has the PDMA
+move each cell from the receive queue into core 0's L2 and from there into the transmit queue.
 
 ## CIO
 

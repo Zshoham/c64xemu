@@ -17,8 +17,7 @@ across the firmware and program images compared with `dis6x` on seven dimensions
 functional unit, cross-path marking, predicate, memory data path, every memory access's address
 operand, and every operand list the model reads, 285856 of them.
 
-Four `[ ]` items are open: EMAC descriptor memory protection, EDMA3 transfers carrying the
-programmer's privilege, the C6472 PDMA beyond the boot's receive path, and UTOPIA boot's
+Two `[ ]` items are open: the C6472 UTOPIA PDMA's remaining transfer forms, and UTOPIA boot's
 I2C-selected parameters. Beyond them, the method at the head of
 *Where to look next* remains **two rules each modelled and each pinned, with nothing asking what
 they do together.** It has found six defects. The cache manual's worked examples found a 4% error
@@ -1170,35 +1169,53 @@ numbered cells they always were. The stalled-write case's cell now starts with t
 word's last byte as Header 1. Clearing UREN leaves the receive queue as it is: neither manual
 says a receiver reset empties it.
 
-**[~] C6472 UTOPIA receive PDMA.** *The boot receive path is implemented.* SPRUEG2E's U16M and
-receive routing unit select the cell width and one of six receive channels. `src/pdma.rs`
-implements the global controls, channel proxies, SAR-first context readback, receive ABU
-wrapping and block completion, and half/full interrupts (PRINT, event 30 in the SINT-selected
-core). The ROM uses channel 8 and a 16352-byte circular buffer in core 0's addressable L1D.
-Wrong-PHY transfers do not enter the queue; a disabled channel lets two cells accumulate and
-backpressures the next until enabled. The PDMA's stores go through the switch as any DMA
-master's do, so a configuration-space destination reaches its register, and memory protection
-judges them as PrivID 0 in user mode, which SPRS612G section 5.2 gives every UTOPIA transfer:
+**[~] C6472 UTOPIA PDMA.** *The boot receive path and the transmit path are implemented.*
+SPRUEG2E's U16M and receive routing unit select the cell width and one of six receive channels.
+`src/pdma.rs` implements the global controls, channel proxies, SAR-first context readback, ABU
+wrapping and block completion, and half/full interrupts in both directions. The ROM uses channel 8
+and a 16352-byte circular buffer in core 0's addressable L1D. Wrong-PHY transfers do not enter
+the queue; a disabled channel lets two cells accumulate and backpressures the next until
+enabled. The PDMA's stores go through the switch as any DMA master's do, so a
+configuration-space destination reaches its register, and memory protection judges them as
+PrivID 0 in user mode, which SPRS612G section 5.2 gives every UTOPIA transfer:
 `the_pdma_writes_with_user_privilege` has a page that grants only the supervisor's write refuse
 the cell and record a user-write fault, and one that grants only the user's take it. A completed
 block clears STRT and sets BCZ, which `block_mode_counts_down_and_stops_the_channel` reads back
 through the proxies (SPRUEG2E Table 39).
 
-The PDMA supports the boot's synchronized 32-bit receive bursts with a fixed peripheral address
-and equal peripheral/switch burst lengths; the rest is the item below. **[INFERENCE]** PAR = 0
-is interpreted as URQ's peripheral-bus offset: SPRUEG2E Table 18 supplies offsets and section
-4.1 supplies the separate peripheral bus, but no available reference establishes an absolute
-data-port address. The model does not expose a C6472 CPU queue at the C6455's 3C00 0000h:
-SPRS612G Table 2-2 reserves that range.
+Transmit follows section 3.3 and 4.4: each UXEVT - asserted while the queue has room for a cell,
+cleared by a cell's first write - starts one burst that reads switch memory and writes UXQ, and
+the block's end raises PXINT, event 31, in the SINT-selected core (SPRS612G Table 7-10). The
+transmit group takes PE = 0 and Example 1's PE = 1, which keeps a current channel and moves on
+when it stops; **[INFERENCE]** the order it moves in is not documented, and the model goes round
+robin. A burst starts only when the queue can take it whole and otherwise counts one stall in
+SR0's WAIT (Table 31). The reads are PrivID 0 in user mode too, and a refused one reads zero and
+records the fault, as the EMAC's descriptor reads do. `system::tests::utopia_pdma` mirrors the
+receive vectors: `cells_leave_l1d_through_channel_zero_and_reach_the_master_exactly` takes the
+exact cells off the wire with the master's `x`/`r` exchange after a block of two and reads PXINT,
+BCZ and the advanced SAR back; `a_full_transmit_queue_holds_the_block_back_until_the_master_drains_it`
+has a three-cell block stop at the queue's two cells with no interrupt, finish once the master
+takes one, and count the disabled-channel UXEVT once in SR0;
+`the_pdma_reads_its_source_with_user_privilege` has a page without UR send zeros and record a
+user-read fault, and one with UR send the cell. `pdma::tests` pins PE = 1's current channel, the
+stall count, and the transmit setups that are errors. End to end, `tests/test_utopia.py` runs
+`tests/firmware/c6472_utopia_echo/` on the C6472: block-mode receive into core 0's L2 on PRINT,
+block-mode transmit from the same buffer on PXINT, and the master reads back every cell it sent.
 
-**[ ] C6472 UTOPIA PDMA beyond the boot path.** The transmit group is programmable but never
-serviced: nothing drains the transmit queue on UXEVT, PXINT (event 31) is never raised, and an
-ATM master's `x` poll on a C6472 always answers `0`. On the receive side the forms the boot does
-not use are counted as errors in SR1 rather than performed: event control other than PE = 0 and
-PE = 2, unsynchronised transfers, element sizes other than 32 bits, an incrementing peripheral
-address, and unequal peripheral and switch burst lengths. SPRUEG2E sections 4-6 and Tables 27-39
-give every one of them, so a transmit vector mirroring the receive vectors in `system.rs`
-(`utopia_pdma`) and an echo firmware like the C6455's are the checks.
+The PDMA supports synchronized 32-bit bursts with a fixed peripheral address and equal
+peripheral/switch burst lengths; the rest is the item below. **[INFERENCE]** PAR = 0 and PAR = 4
+are interpreted as URQ's and UXQ's peripheral-bus offsets: SPRUEG2E Table 18 supplies offsets and
+section 4.1 supplies the separate peripheral bus, but no available reference establishes an
+absolute data-port address. The model does not expose a C6472 CPU queue at the C6455's
+3C00 0000h: SPRS612G Table 2-2 reserves that range.
+
+**[ ] C6472 UTOPIA PDMA transfer forms beyond the echo.** Both groups count the forms the boot and
+the echo do not use as errors in their SR rather than performing them: receive event control
+PE = 1 and PE = 3, transmit event control PE = 2 and PE = 3, unsynchronised transfers, element
+sizes other than 32 bits, an incrementing peripheral address, and unequal peripheral and switch
+burst lengths. SPRUEG2E sections 4-6 and Tables 27-39 give every one of them. Transmit PE = 2
+and 3 also need the event ID UXEVT carries, which the manual does not give. Not raised either:
+the six PXINT0-5 EDMA3 synchronisation events SPRS612G Table 7-4 lists on channels 22-27.
 
 **[~] Device configuration.** *Done.* The chip-level block reports DEVSTAT with the straps a board
 that populates this memory map would set - EMIFA and DDR2 enabled, LENDIAN following the loaded

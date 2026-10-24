@@ -36,11 +36,12 @@
 //! 16-bit field of the cell and the six mask-and-match registers RMMR0-5 decide which of six
 //! PDMA events a cell raises, the lowest match winning and a cell that matches none belonging
 //! to some other device and being dropped. And its queues are serviced by the UTOPIA PDMA
-//! (`pdma.rs`) rather than EDMA3, so the cell packets are read out by that controller over its
-//! own peripheral bus. SPRUEG2E Table 18 gives the data ports as offsets (URQ 0, UXQ 4) and the
-//! C6472 data manual maps no window for them - 0x2000_0000-0x77FF_FFFF, where the C6455's
-//! 0x3C00_0000 ports sit, is reserved (SPRS612G Table 2-2) - so its profile names no CPU
-//! windows and the queues are reachable only through the PDMA.
+//! (`pdma.rs`) rather than EDMA3: the PDMA reads receive cell packets out and writes transmit
+//! ones in over its own peripheral bus, on the same UREVT and UXEVT. SPRUEG2E Table 18 gives the
+//! data ports as offsets (URQ 0, UXQ 4) and the C6472 data manual maps no window for them -
+//! 0x2000_0000-0x77FF_FFFF, where the C6455's 0x3C00_0000 ports sit, is reserved (SPRS612G
+//! Table 2-2) - so its profile names no CPU windows and the queues are reachable only through
+//! the PDMA.
 //!
 //! On both devices a cell packet is laid out as SPRUE48 Figures 9-14 and SPRUEG2E Tables 6-15
 //! draw it: dummy bytes *before* the header pad the wire cell to whole words, so both standard
@@ -239,9 +240,10 @@ pub struct Utopia {
     /// back when the queue is ready again (SPRUE48 sections 3.3 and 3.5).
     transmit_event: bool,
     receive_event: bool,
-    /// How many times UREVT has been asserted, so the PDMA can tell a new event from the same
-    /// one still waiting for a channel.
+    /// How many times UREVT and UXEVT have been asserted, so the PDMA can tell a new event from
+    /// the same one still waiting for a channel.
     receive_generation: u64,
+    transmit_generation: u64,
 }
 
 impl Default for Utopia {
@@ -343,6 +345,7 @@ impl Utopia {
             transmit_event: true,
             receive_event: false,
             receive_generation: 0,
+            transmit_generation: 0,
         }
     }
 
@@ -404,7 +407,7 @@ impl Utopia {
     /// One 32-bit write into the transmit queue. A word that completes a packet moves it to the
     /// queue; a word that would need a slot the queue does not have is held, which is what the
     /// stall in SPRUE48 section 12.4 does, and XQSP says so until room appears.
-    fn write_transmit_queue(&mut self, value: u32) {
+    pub(crate) fn write_transmit_queue(&mut self, value: u32) {
         if self.transmit_partial.is_empty() && self.transmit_slots() >= QUEUE_CELLS {
             self.stalled_write = Some(value);
             self.pending |= XQSP;
@@ -456,6 +459,9 @@ impl Utopia {
     /// current one is fully written (SPRUE48 section 3.3, step 3).
     fn update_transmit_event(&mut self) {
         if self.transmit_slots() < QUEUE_CELLS {
+            if !self.transmit_event {
+                self.transmit_generation += 1;
+            }
             self.transmit_event = true;
         }
     }
@@ -502,6 +508,23 @@ impl Utopia {
     /// clear to asserted.
     pub(crate) fn receive_generation(&self) -> u64 {
         self.receive_generation
+    }
+
+    /// UXEVT as the PDMA sees it: which assertion is current, and how many words the queue can
+    /// take before a write would stall - the free slots' packets, less what the packet being
+    /// written already holds. `None` while the event is not asserted or the transmitter is in
+    /// reset.
+    pub(crate) fn transmit_event(&self) -> Option<crate::pdma::TransmitEvent> {
+        if !self.transmit_event || self.control & UCR_UXEN == 0 || self.stalled_write.is_some() {
+            return None;
+        }
+        let packet = packet_words(self.transmit_cell_bytes());
+        let room_words = ((QUEUE_CELLS - self.transmit_cells.len()) * packet)
+            .saturating_sub(self.transmit_partial.len);
+        Some(crate::pdma::TransmitEvent {
+            generation: self.transmit_generation,
+            room_words,
+        })
     }
 
     /// The routing unit's channel for the cell UREVT is announcing, which is the PDMA event ID

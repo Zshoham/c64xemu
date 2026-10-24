@@ -176,18 +176,25 @@ queues, or, on the C6472, the [SPRUEG2E](../reference/sprueg2e.pdf) port - U16M,
 via RRMR0-5/RRSR, UPIDR/UPWREMU, and a PDMA instead of the C6455's EDMA events. Standard cells
 are 53 or 54 wire bytes; both widths pad to the same 56-byte packet with the payload at byte 8.
 
-`src/pdma.rs` at `02BC 0000h` services synchronized, 32-bit receive bursts into switch memory.
-RXC0 is channel 8. SAR-first reads snapshot the live context into its proxy registers; TCR
-writes commit configuration, and an enabled channel can only be disabled before reconfiguration.
-ABU wraps at the programmed byte count and interrupts at half/full marks; block mode counts
-down, then clears STRT and sets BCZ. Its stores are judged by memory protection as PrivID 0 in
-user mode, which SPRS612G §5.2 gives every UTOPIA transfer. PRINT is event 30 in the core
-selected by SINT. The ROM configures this path for
-[UTOPIA boot](../guide/booting.md#utopia-boot). Transmit PDMA is not serviced.
+`src/pdma.rs` at `02BC 0000h` services synchronized, 32-bit bursts in both directions. RXC0 is
+channel 8 and TXC0 channel 0. SAR-first reads snapshot the live context into its proxy
+registers; TCR writes commit configuration, and an enabled channel can only be disabled before
+reconfiguration. ABU wraps at the programmed byte count and interrupts at half/full marks;
+block mode counts down, then clears STRT and sets BCZ. A receive burst reads URQ and stores to
+switch memory; a transmit burst, one per UXEVT, reads switch memory and writes UXQ, and starts
+only when the queue can take it whole - otherwise SR0 counts one stall and the event waits.
+Both directions are judged by memory protection as PrivID 0 in user mode, which SPRS612G §5.2
+gives every UTOPIA transfer: a refused store is dropped, a refused load reads zero, and either
+records the fault. PRINT is event 30 and PXINT event 31, each in the core selected by SINT. The
+receive group takes PE = 0 or 2; the transmit group PE = 0 or 1, SPRUEG2E Example 1's
+"current channel" mode, which moves to the next enabled channel once the current one stops
+**[INFERENCE: the arbitration order is not documented; the model goes round robin]**. The ROM
+configures the receive path for [UTOPIA boot](../guide/booting.md#utopia-boot).
 
-**[INFERENCE]** PAR uses the peripheral-bus offset, so URQ is 0 (SPRUEG2E Table 18 and section
-4.1). Its absolute CPU address is not established by the available manuals. In particular,
-the C6455 queue address is reserved on C6472, so no C6472 CPU data-port window is exposed.
+**[INFERENCE]** PAR uses the peripheral-bus offset, so URQ is 0 and UXQ 4 (SPRUEG2E Table 18
+and section 4.1). Their absolute CPU addresses are not established by the available manuals. In
+particular, the C6455 queue address is reserved on C6472, so no C6472 CPU data-port window is
+exposed.
 
 ## McBSP
 

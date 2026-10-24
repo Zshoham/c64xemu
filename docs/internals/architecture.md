@@ -457,7 +457,7 @@ Every file in `src/`.
 | `memory.rs` | The memory hierarchy - L1P, L1D, L2, MAR bits, cache configuration - the backing store, and access timing |
 | `netio.rs` | The Ethernet backend: receive admission, TX capture and handoff, live history and polling, with a private Unix-datagram `Bridge`; `HostLink`, the polled datagram channel the HPI host and the UTOPIA's ATM master use |
 | `pcap.rs` | pcap file reading and writing |
-| `pdma.rs` | The C6472 UTOPIA receive PDMA: channel proxies, ABU/block delivery and interrupts |
+| `pdma.rs` | The C6472 UTOPIA PDMA: channel proxies, receive and transmit bursts, ABU/block addressing and interrupts |
 | `pll.rs` | The PLL1 controller with its reset controller register, and PLL2 |
 | `port.rs` | The slave-port seam: `SlavePort`, `PortContext`, `PortWrite` |
 | `psc.rs` | The C6472 power/sleep controller |
