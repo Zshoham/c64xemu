@@ -325,8 +325,10 @@ through the exception combiner — see [Interrupts and exceptions](interrupts.md
 
 The EMAC's descriptor words cross the same check as its packet buffers, with PrivID 0 in user
 mode (`EmacMaster::dma_read_u32`/`dma_write_u32`). A refused descriptor read returns zero, so a
-transmit descriptor without UR reads as not handed over and raises the owner host error without
-sending anything; a refused write is discarded, so ownership stays and the fault is recorded
+transmit descriptor without UR sends nothing; the zero also reads as a descriptor the host did
+not hand over, which the model reports as the owner host error. Whether silicon raises that
+error for a faulted read is unverified, and no case pins it. A refused write is discarded, so
+ownership stays and the fault is recorded
 with UW. Protection reports a violation "to the operating environment" (SPRU871K 8.3.3.2), not
 to the requestor, so the EMAC is not told its write went nowhere: it still sends or stores the
 frame, advances the head pointer, and posts the descriptor in the completion pointer, raising
