@@ -247,6 +247,18 @@ impl EventMap {
         }
     }
 
+    /// The EDMA3 channel a UTOPIA PDMA transmit interrupt output drives. The transmit group has
+    /// six interrupt outputs, one per DSP subsystem, and SINT *n* asserts PXINT*n*, which is the
+    /// synchronisation event of EDMA3 channel 22 + *n* (SPRUEG2E section 6.2, SPRS612G
+    /// Table 7-4). SINT 6 and 7 select outputs the device does not connect, and the receive
+    /// group's PRINT outputs have no channel at all. The C6455 has no PDMA.
+    pub(crate) fn pdma_transmit_channel(&self, sint: usize) -> Option<usize> {
+        match self.family {
+            Family::C6455 => None,
+            Family::C6472 => (sint < 6).then_some(22 + sint),
+        }
+    }
+
     /// XEVT and REVT are EDMA3 events 12 to 15 and RINT/XINT are system events 40 to 43 for the
     /// two serial ports (SPRS276M Tables 7-9 and 7-11). Returns `[(event, channel); 2]` for the
     /// receive and transmit directions.
@@ -335,6 +347,18 @@ mod tests {
         );
         assert_eq!(C6472_EVENTS.gpio(6), Some((Destination::All, 74, Some(6))));
         assert_eq!(C6472_EVENTS.gpio(8), Some((Destination::All, 76, None)));
+    }
+
+    /// PXINT0-5 are EDMA3 channels 22-27 on the C6472, SPRS612G Table 7-4; nothing else is
+    /// connected, and the C6455 has no PDMA to drive any.
+    #[test]
+    fn pdma_transmit_outputs_are_channels_22_to_27() {
+        for sint in 0..6 {
+            assert_eq!(C6472_EVENTS.pdma_transmit_channel(sint), Some(22 + sint));
+        }
+        assert_eq!(C6472_EVENTS.pdma_transmit_channel(6), None);
+        assert_eq!(C6472_EVENTS.pdma_transmit_channel(7), None);
+        assert_eq!(C6455_EVENTS.pdma_transmit_channel(0), None);
     }
 
     #[test]

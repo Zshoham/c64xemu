@@ -17,9 +17,8 @@ across the firmware and program images compared with `dis6x` on seven dimensions
 functional unit, cross-path marking, predicate, memory data path, every memory access's address
 operand, and every operand list the model reads, 285856 of them.
 
-Two `[ ]` items are open: the C6472 UTOPIA PDMA's remaining transfer forms, and UTOPIA boot's
-I2C-selected parameters. Beyond them, the method at the head of
-*Where to look next* remains **two rules each modelled and each pinned, with nothing asking what
+One `[ ]` item is open: UTOPIA boot's I2C-selected parameters. Beyond it, the method at the head
+of *Where to look next* remains **two rules each modelled and each pinned, with nothing asking what
 they do together.** It has found six defects. The cache manual's worked examples found a 4% error
 between a correct miss cost and a correct write buffer. Making a cache size carve its SRAM
 aperture found that a megamodule was caching its own L1 memory, which two sections of SPRU871K
@@ -1185,9 +1184,12 @@ through the proxies (SPRUEG2E Table 39).
 
 Transmit follows section 3.3 and 4.4: each UXEVT - asserted while the queue has room for a cell,
 cleared by a cell's first write - starts one burst that reads switch memory and writes UXQ, and
-the block's end raises PXINT, event 31, in the SINT-selected core (SPRS612G Table 7-10). The
-transmit group takes PE = 0 and Example 1's PE = 1, which keeps a current channel and moves on
-when it stops; **[INFERENCE]** the order it moves in is not documented, and the model goes round
+the block's end raises PXINT, event 31, in the SINT-selected core (SPRS612G Table 7-10), and the
+same output is the EDMA3 synchronisation event of channel 22 + SINT: SPRUEG2E section 6.2 gives
+each of the two groups six interrupt outputs, one per subsystem, and SPRS612G Table 7-4 lists
+PXINT0-5 on channels 22-27. SINT 6 and 7 select no connected output, and PRINT has no channel.
+The transmit group takes PE = 0 and Example 1's PE = 1, which keeps a current channel and moves
+on when it stops; **[INFERENCE]** the order it moves in is not documented, and the model goes round
 robin. A burst starts only when the queue can take it whole and otherwise counts one stall in
 SR0's WAIT (Table 31). The reads are PrivID 0 in user mode too, and a refused one reads zero and
 records the fault, as the EMAC's descriptor reads do. `system::tests::utopia_pdma` mirrors the
@@ -1202,20 +1204,56 @@ stall count, and the transmit setups that are errors. End to end, `tests/test_ut
 `tests/firmware/c6472_utopia_echo/` on the C6472: block-mode receive into core 0's L2 on PRINT,
 block-mode transmit from the same buffer on PXINT, and the master reads back every cell it sent.
 
-The PDMA supports synchronized 32-bit bursts with a fixed peripheral address and equal
+Channels reset to PaRAM set 0 on this device (SPRU727E section 4.2.1.3), so a program that wants
+PXINT to start channel 22 maps it with DCHMAP22 as any C6472 EDMA3 program does.
+`a_completed_transmit_block_drives_only_the_edma_channel_its_sint_selects` arms all six channels
+and checks that only the selected one's A-synchronised set moves a word, that the CPU event reaches
+only the SINT core, and that SINT 6 and 7 move nothing;
+`a_transmit_block_without_interrupt_enable_raises_no_edma_event` finishes a block with IE clear and
+sees no event; `each_transmit_completion_runs_the_next_array_of_the_edma_transfer` restarts a
+block three times and finds each completion running the next array of one three-array transfer
+while the CPU flag returns each time; `receive_completions_raise_no_edma_event` pins PRINT.
+
+The PDMA supports synchronized bursts with a fixed peripheral address and equal
 peripheral/switch burst lengths; the rest is the item below. **[INFERENCE]** PAR = 0 and PAR = 4
 are interpreted as URQ's and UXQ's peripheral-bus offsets: SPRUEG2E Table 18 supplies offsets and
 section 4.1 supplies the separate peripheral bus, but no available reference establishes an
 absolute data-port address. The model does not expose a C6472 CPU queue at the C6455's
 3C00 0000h: SPRS612G Table 2-2 reserves that range.
 
-**[ ] C6472 UTOPIA PDMA transfer forms beyond the echo.** Both groups count the forms the boot and
-the echo do not use as errors in their SR rather than performing them: receive event control
-PE = 1 and PE = 3, transmit event control PE = 2 and PE = 3, unsynchronised transfers, element
-sizes other than 32 bits, an incrementing peripheral address, and unequal peripheral and switch
-burst lengths. SPRUEG2E sections 4-6 and Tables 27-39 give every one of them. Transmit PE = 2
-and 3 also need the event ID UXEVT carries, which the manual does not give. Not raised either:
-the six PXINT0-5 EDMA3 synchronisation events SPRS612G Table 7-4 lists on channels 22-27.
+**[~] C6472 UTOPIA PDMA transfer forms beyond the echo.** *Receive PE = 1 and narrow switch
+elements are done; the rest is the item below.* Receive PE = 1 is the transmit group's
+current-channel rule applied to the receive group
+(`pe_one_keeps_the_current_receive_channel_until_its_block_ends`). Switch elements of 8 and 16
+bits work in block mode (`block_mode_moves_narrow_switch_elements_one_per_peripheral_word` in
+`pdma::tests`, and `a_block_receive_into_narrow_elements_keeps_the_low_bits_of_each_word` and
+`a_block_transmit_from_narrow_elements_widens_each_to_a_word` on both byte orders). The peripheral
+element stays 32 bits: sections 3.2, 3.4 and 4.4 say the PDMA's access to the UTOPIA always is.
+**[INFERENCE]** a narrow switch element is the low bits of the word; the manual says "data is
+always right justified on the bus" only where it tabulates the endian conversions. Narrow elements
+around a circular buffer stay an error, since Table 3 gives the base alignment for 32-bit elements
+only. TI's C6472 CSL 3.00.07.01 (`docs/reference/README.md`) settled three small things: GCSR
+resets to 3, which the model does; TCR's FF is the FIFO full flag, and PCR bit 24 is a
+super-frame-sync select (`SFRM`), both noted in `src/pdma.rs` and left as they were, because
+neither source says what they do.
+
+**[-] C6472 UTOPIA PDMA forms no document gives.** Each of these is still counted as an error in
+the group's SR, because what the hardware does is a fact the manual does not give. TI's C6472 CSL
+was searched for them and does not give them either: its `TX_EVENT`/`RX_EVENT` are the event-group
+indices 0 and 1 that pick PCR0 or PCR1, and it has no code for these forms. SPRS300N, the TCI6486
+data manual, was read too and repeats SPRS612G's tables with no PDMA internals. Only silicon, or a TI
+source beyond these, can close them:
+
+* Transmit PE = 2 and 3 select a channel by event ID, and nothing says what ID UXEVT carries.
+* Receive PE = 3 "always responds, even if the PDMA channel is inactive" and errors when "the
+  receive channel buffer is full" (Tables 31 and 32), so a channel buffer sits between queue and
+  switch; its depth and the rule that drains it are not given.
+* Unsynchronised transfers: "no synchronization" is all Table 32 says. What starts a burst, which
+  channel serves it with no event ID to choose by, and how it is paced against a queue the
+  UTOPIA's section 9 says stalls the access and flags RQSP/XQSP are open.
+* An incrementing peripheral address: Table 18 has two data-port words and nothing beyond them.
+* Unequal peripheral and switch burst lengths: the channel buffer again, and how many elements an
+  event moves then.
 
 **[~] Device configuration.** *Done.* The chip-level block reports DEVSTAT with the straps a board
 that populates this memory map would set - EMIFA and DDR2 enabled, LENDIAN following the loaded

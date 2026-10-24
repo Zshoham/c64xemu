@@ -2126,7 +2126,7 @@ impl Fabric {
         // PrivID 0 (SPRS612G section 5.2: "For most peripheral masters (EMAC0, EMAC1, UTOPIA,
         // TSIP0, TSIP1, and TSIP2), the privilege mode is always user mode").
         for (&address, &word) in switch.addresses().iter().zip(&words) {
-            self.master_write32_as(address, word, true);
+            self.pdma_write_element(address, word, switch.element);
         }
         if let Some(core) = switch.interrupt {
             self.raise(Destination::Core(core), interrupt);
@@ -2138,8 +2138,9 @@ impl Fabric {
     /// as PrivID 0 in user mode, like the receive side, so a word protection refuses reads as
     /// zero and records the fault - writes it into the transmit queue, and raises `interrupt` in
     /// the core the channel's SINT names when the transfer control asks for one (SPRUEG2E
-    /// sections 3.3, 4.4 and 6.2). The UTOPIA is planned again, because the first write of a
-    /// cell cleared the event.
+    /// sections 3.3, 4.4 and 6.2). That interrupt output is also the EDMA3 synchronisation
+    /// event of its channel (SPRS612G Table 7-4). The UTOPIA is planned again, because the
+    /// first write of a cell cleared the event.
     fn service_utopia_transmit(&mut self, interrupt: usize) {
         let edge = self.shared.sysclk3_edge;
         let (Some(utopia), Some(pdma)) = (self.shared.utopia.as_mut(), self.shared.pdma.as_mut())
@@ -2152,7 +2153,7 @@ impl Fabric {
         let switch = pdma.advance(burst);
         let mut words = [0u32; MAX_BURST_WORDS];
         for (word, &address) in words.iter_mut().zip(switch.addresses()) {
-            *word = self.master_read32_as(address, true).unwrap_or(0);
+            *word = self.pdma_read_element(address, switch.element);
         }
         let utopia = self.shared.utopia.as_mut().unwrap();
         let utopia_block = utopia.at(edge, true);
@@ -2162,6 +2163,45 @@ impl Fabric {
         utopia.plan(true);
         if let Some(core) = switch.interrupt {
             self.raise(Destination::Core(core), interrupt);
+            if let Some(channel) = self.profile.events.pdma_transmit_channel(core) {
+                self.shared.edma.as_mut().unwrap().trigger_event(channel);
+            }
+        }
+    }
+
+    /// One switch element of a PDMA burst, a transfer of PrivID 0 in user mode. A 32-bit element
+    /// is the word access every other master makes; a narrower one is the low bytes of the
+    /// word - right justified, as Table 32 puts it - stored or fetched in the device's byte
+    /// order, with a register reached the way a byte-moving master reaches it.
+    fn pdma_write_element(&mut self, address: u32, word: u32, element: u32) {
+        if element == 4 {
+            self.master_write32_as(address, word, true);
+            return;
+        }
+        let element = element as usize;
+        let (big, little) = (word.to_be_bytes(), word.to_le_bytes());
+        let bytes = if self.shared.backing.endian_big() {
+            &big[4 - element..]
+        } else {
+            &little[..element]
+        };
+        self.requestor_write_bytes(address, bytes, Privilege::ID0_USER);
+    }
+
+    /// The element `pdma_write_element` stores, zero-extended into a word; a refused read is
+    /// zero.
+    fn pdma_read_element(&mut self, address: u32, element: u32) -> u32 {
+        if element == 4 {
+            return self.master_read32_as(address, true).unwrap_or(0);
+        }
+        let bytes = self.requestor_read_bytes(address, element as usize, Privilege::ID0_USER);
+        let mut word = [0; 4];
+        if self.shared.backing.endian_big() {
+            word[4 - bytes.len()..].copy_from_slice(&bytes);
+            u32::from_be_bytes(word)
+        } else {
+            word[..bytes.len()].copy_from_slice(&bytes);
+            u32::from_le_bytes(word)
         }
     }
 
@@ -4703,15 +4743,31 @@ mod tests {
         }
 
         fn enable_transmit(fabric: &mut Fabric, cells: u32) {
+            start_transmit(fabric, cells, 1 << 27);
+        }
+
+        /// Program transmit channel 0 for `cells` cells from `SOURCE` with 32-bit elements, and
+        /// `interrupt` as its IE and SINT fields.
+        fn start_transmit(fabric: &mut Fabric, cells: u32, interrupt: u32) {
+            start_transmit_block(fabric, cells * PACKET_BYTES, 2, interrupt);
+        }
+
+        /// Program transmit channel 0 for a block of `bytes` bytes from `SOURCE` in switch
+        /// elements of `ssiz` (SSIZ, Table 39) and 32-bit peripheral elements.
+        fn start_transmit_block(fabric: &mut Fabric, bytes: u32, ssiz: u32, interrupt: u32) {
             fabric.master_write32(TXC0, SOURCE);
             fabric.master_write32(TXC0 + 4, crate::pdma::TRANSMIT_QUEUE_PORT);
-            fabric.master_write32(TXC0 + 8, cells * PACKET_BYTES);
-            let control = (1 << 31) | (1 << 27) | (2 << 22) | (2 << 20);
+            fabric.master_write32(TXC0 + 8, bytes);
+            let control = (1 << 31) | interrupt | (2 << 22) | (ssiz << 20);
             fabric.master_write32(TXC0 + 12, control);
         }
 
         fn pxint_flagged(fabric: &Fabric) -> bool {
-            fabric.megamodule(0).event_flag_registers()[PXINT / 32] & (1 << (PXINT % 32)) != 0
+            pxint_flagged_in(fabric, 0)
+        }
+
+        fn pxint_flagged_in(fabric: &Fabric, core: usize) -> bool {
+            fabric.megamodule(core).event_flag_registers()[PXINT / 32] & (1 << (PXINT % 32)) != 0
         }
 
         #[test]
@@ -4808,6 +4864,265 @@ mod tests {
                     assert_eq!(fabric.read32(0, L1DMPFAR), SOURCE);
                     assert_eq!(status, UR, "PrivID 0, user read");
                 }
+            }
+        }
+
+        const EDMA: u32 = 0x02a0_0000;
+        const EDMA_ER: u32 = EDMA + 0x1000;
+        const EDMA_ERH: u32 = EDMA + 0x1004;
+        const EDMA_EESR: u32 = EDMA + 0x1030;
+        const EDMA_PARAM: u32 = EDMA + 0x4000;
+        /// The words each armed channel copies, in core 0's L1D past the transmit cells.
+        const EDMA_SOURCE: u32 = L1D + 0x800;
+        const EDMA_DATA: [u32; 3] = [0xd0d0_0001, 0xd0d0_0002, 0xd0d0_0003];
+
+        /// Where channel `channel` of PXINT0-5 (EDMA3 channels 22-27) writes.
+        fn edma_destination(channel: u32) -> u32 {
+            L1D + 0x900 + 0x10 * (channel - 22)
+        }
+
+        fn load_edma_source(fabric: &mut Fabric) {
+            for (index, word) in EDMA_DATA.into_iter().enumerate() {
+                fabric.master_write32(EDMA_SOURCE + 4 * index as u32, word);
+            }
+        }
+
+        /// Map `channel` to the PaRAM set of the same number - a C6472 resets every DMA channel
+        /// to set 0 (SPRU727E section 4.2.1.3) - and enable it for its synchronisation event
+        /// with an A-synchronised set that moves one word of `EDMA_DATA` per event: `arrays`
+        /// events complete it.
+        fn arm_edma(fabric: &mut Fabric, channel: u32, arrays: u32) {
+            fabric.master_write32(EDMA + 0x100 + 4 * channel, channel << 5);
+            let set = [
+                0,
+                EDMA_SOURCE,
+                (arrays << 16) | 4,
+                edma_destination(channel),
+                (4 << 16) | 4,
+                0xffff,
+                0,
+                1,
+            ];
+            for (index, word) in set.into_iter().enumerate() {
+                fabric.master_write32(EDMA_PARAM + 32 * channel + 4 * index as u32, word);
+            }
+            fabric.master_write32(EDMA_EESR, 1 << channel);
+        }
+
+        /// What the six PXINT destinations hold, in channel order.
+        fn edma_results(fabric: &mut Fabric) -> Vec<u32> {
+            (22..28)
+                .map(|channel| word(fabric, edma_destination(channel)))
+                .collect()
+        }
+
+        #[test]
+        fn a_completed_transmit_block_drives_only_the_edma_channel_its_sint_selects() {
+            // SINT n asserts PXINTn, EDMA3 channel 22 + n, and is event 31 in core n; SINT 6 and
+            // 7 select no connected output. Every one of the six channels is armed, so a
+            // transfer on the wrong channel shows up as a word where there should be none.
+            for sint in 0..8u32 {
+                let mut fabric = transmitter(1);
+                load_edma_source(&mut fabric);
+                for channel in 22..28 {
+                    arm_edma(&mut fabric, channel, 1);
+                }
+                start_transmit(&mut fabric, 1, (1 << 27) | (sint << 24));
+                run(&mut fabric, 400);
+                let mut expected = [0; 6];
+                if let Some(slot) = expected.get_mut(sint as usize) {
+                    *slot = EDMA_DATA[0];
+                }
+                assert_eq!(edma_results(&mut fabric), expected, "SINT {sint}");
+                // The CPU interrupt is delivered exactly as before, to the core SINT names.
+                for core in 0..6 {
+                    assert_eq!(
+                        pxint_flagged_in(&fabric, core),
+                        core == sint as usize,
+                        "SINT {sint}, core {core}"
+                    );
+                }
+                // The serviced event is not left latched.
+                assert_eq!(word(&mut fabric, EDMA_ER), 0, "SINT {sint}");
+            }
+        }
+
+        #[test]
+        fn a_transmit_block_without_interrupt_enable_raises_no_edma_event() {
+            let mut fabric = transmitter(1);
+            load_edma_source(&mut fabric);
+            arm_edma(&mut fabric, 22, 1);
+            start_transmit(&mut fabric, 1, 0);
+            run(&mut fabric, 400);
+            // The block completed - the cell is on the wire and BCZ is set - so nothing but IE
+            // kept the output quiet.
+            assert_eq!(
+                fabric.utopia_master_take_cell(SLAVE).unwrap().bytes(),
+                cell(0).as_slice()
+            );
+            // Reading SAR snapshots the channel's context into the proxies (section 5); the
+            // proxy TCR read after it then shows what the state machine set.
+            assert_eq!(word(&mut fabric, TXC0), SOURCE + PACKET_BYTES);
+            assert_eq!(word(&mut fabric, TXC0 + 12) & (1 << 16), 1 << 16);
+            assert!(!pxint_flagged(&fabric));
+            assert_eq!(word(&mut fabric, EDMA_ER), 0);
+            assert_eq!(edma_results(&mut fabric), [0; 6]);
+        }
+
+        #[test]
+        fn each_transmit_completion_runs_the_next_array_of_the_edma_transfer() {
+            let mut fabric = transmitter(1);
+            load_edma_source(&mut fabric);
+            arm_edma(&mut fabric, 22, 3);
+            for completed in 0..3 {
+                start_transmit(&mut fabric, 1, 1 << 27);
+                run(&mut fabric, 400);
+                assert_eq!(
+                    fabric.utopia_master_take_cell(SLAVE).unwrap().bytes(),
+                    cell(0).as_slice()
+                );
+                // The CPU saw this completion too: clear the flag so the next one is visible.
+                assert!(pxint_flagged(&fabric), "completion {completed}");
+                fabric.write32(0, EVTCLR0, 1 << PXINT);
+                // One array per event, so the words arrive one completion at a time.
+                for (index, expected) in EDMA_DATA.into_iter().enumerate() {
+                    let expected = if index <= completed { expected } else { 0 };
+                    assert_eq!(
+                        word(&mut fabric, edma_destination(22) + 4 * index as u32),
+                        expected,
+                        "completion {completed}, word {index}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn receive_completions_raise_no_edma_event() {
+            // PRINT has no synchronisation channel in Table 7-4.
+            let mut fabric = receiver(true);
+            for number in 0..4u8 {
+                assert!(fabric.utopia_master_send_cell(SLAVE, &cell(number)));
+                run(&mut fabric, 60);
+            }
+            assert!(print_flagged(&fabric));
+            assert_eq!(word(&mut fabric, EDMA_ER), 0);
+            assert_eq!(word(&mut fabric, EDMA_ERH), 0);
+        }
+
+        /// Channel 8 in block mode for `bytes` bytes at `L1D` in switch elements of `ssiz`, with
+        /// the interrupt enabled.
+        fn block_receiver(ssiz: u32, bytes: u32) -> Fabric {
+            let mut fabric = Fabric::new(&crate::device::C6472);
+            fabric.master_write32(UTOPIA, (u32::from(SLAVE) << 24) | (1 << 14) | 1);
+            let group = (2 << 22) | (1 << 20) | (1 << 16) | (13 << 12) | (1 << 11) | (13 << 4);
+            fabric.master_write32(PDMA + 0x64, group);
+            fabric.master_write32(RXC0, L1D);
+            fabric.master_write32(RXC0 + 4, crate::pdma::RECEIVE_QUEUE_PORT);
+            fabric.master_write32(RXC0 + 8, bytes);
+            fabric.master_write32(PDMA + 4, 1 << 31);
+            fabric.master_write32(RXC0 + 12, (1 << 31) | (1 << 27) | (2 << 22) | (ssiz << 20));
+            fabric
+        }
+
+        /// `count` bytes of memory at `address` in storage order, whatever the device's byte
+        /// order: a word read gives the bytes in that order, so this undoes it.
+        fn memory_bytes(fabric: &mut Fabric, address: u32, count: usize, big: bool) -> Vec<u8> {
+            (0..count.div_ceil(4) as u32)
+                .flat_map(|index| {
+                    let value = word(fabric, address + 4 * index);
+                    if big {
+                        value.to_be_bytes()
+                    } else {
+                        value.to_le_bytes()
+                    }
+                })
+                .take(count)
+                .collect()
+        }
+
+        /// Put `bytes` in memory at `address` in storage order.
+        fn store_bytes(fabric: &mut Fabric, address: u32, bytes: &[u8], big: bool) {
+            for (index, chunk) in bytes.chunks(4).enumerate() {
+                let mut padded = [0; 4];
+                padded[..chunk.len()].copy_from_slice(chunk);
+                let value = if big {
+                    u32::from_be_bytes(padded)
+                } else {
+                    u32::from_le_bytes(padded)
+                };
+                fabric.master_write32(address + 4 * index as u32, value);
+            }
+        }
+
+        /// An element of `size` bytes holding `value`, in storage order.
+        fn element(value: u32, size: usize, big: bool) -> Vec<u8> {
+            if big {
+                value.to_be_bytes()[4 - size..].to_vec()
+            } else {
+                value.to_le_bytes()[..size].to_vec()
+            }
+        }
+
+        #[test]
+        fn a_block_receive_into_narrow_elements_keeps_the_low_bits_of_each_word() {
+            // SPRUEG2E Table 32: data is right justified, so each 32-bit word of the cell
+            // packet becomes one byte or halfword, in the device's byte order.
+            let words = packet(&cell(1));
+            for (big, ssiz, size) in [(false, 0, 1), (false, 1, 2), (true, 0, 1), (true, 1, 2)] {
+                let mut fabric = block_receiver(ssiz, 14 * size as u32);
+                if big {
+                    fabric.set_endian(Endian::Big);
+                }
+                assert!(fabric.utopia_master_send_cell(SLAVE, &cell(1)));
+                run(&mut fabric, 60);
+                let expected: Vec<u8> = words[..14]
+                    .iter()
+                    .flat_map(|&value| element(value, size, big))
+                    .collect();
+                let landed = memory_bytes(&mut fabric, L1D, expected.len() + 4, big);
+                assert_eq!(landed[..expected.len()], expected, "big {big}, size {size}");
+                assert_eq!(landed[expected.len()..], [0; 4], "nothing past the block");
+                // The block is spent: the address moved by the element size, and the
+                // completion interrupt arrived.
+                assert_eq!(word(&mut fabric, RXC0), L1D + 14 * size as u32);
+                assert_eq!(word(&mut fabric, RXC0 + 8), 0);
+                assert!(print_flagged(&fabric));
+            }
+        }
+
+        #[test]
+        fn a_block_transmit_from_narrow_elements_widens_each_to_a_word() {
+            // The same right justification on the way out: a byte or halfword of memory is the
+            // low part of the 32-bit word the queue receives, the rest zero.
+            for (big, ssiz, size) in [(false, 0, 1), (false, 1, 2), (true, 0, 1), (true, 1, 2)] {
+                let mut fabric = transmitter(0);
+                if big {
+                    fabric.set_endian(Endian::Big);
+                }
+                let values: Vec<u32> = (1..=14)
+                    .map(|k| k * if size == 1 { 0x11 } else { 0x1111 })
+                    .collect();
+                let bytes: Vec<u8> = values
+                    .iter()
+                    .flat_map(|&value| element(value, size, big))
+                    .collect();
+                store_bytes(&mut fabric, SOURCE, &bytes, big);
+                start_transmit_block(&mut fabric, 14 * size as u32, ssiz, 1 << 27);
+                run(&mut fabric, 60);
+                // Fourteen words, one per element, are the packet whose wire cell skips the
+                // three leading dummy bytes.
+                let wire: Vec<u8> = values
+                    .iter()
+                    .flat_map(|value| value.to_le_bytes())
+                    .skip(3)
+                    .take(53)
+                    .collect();
+                assert_eq!(
+                    fabric.utopia_master_take_cell(SLAVE).unwrap().bytes(),
+                    wire.as_slice(),
+                    "big {big}, size {size}"
+                );
+                assert!(pxint_flagged(&fabric));
             }
         }
     }
