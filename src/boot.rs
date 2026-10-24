@@ -67,14 +67,85 @@ pub fn apply_boot_configuration(
         if set == 0 && clear == 0 {
             calls.push(target);
         } else {
-            let both = set & clear;
-            let value = memory.boot_read_word(target);
-            let value = (value | (set & !both)) & !(clear & !both);
-            memory.boot_write_word(target, value ^ both);
+            apply_entry(memory, target, set, clear);
         }
         cursor = cursor.wrapping_add(12);
     }
     Err("boot configuration table has no termination record".into())
+}
+
+/// One read/modify/write entry: set the bits in `set`, clear the bits in `clear`, and toggle the
+/// bits that appear in both (SPRUEC6G section 6.2.3).
+fn apply_entry(memory: &mut impl BootMemory, target: u32, set: u32, clear: u32) {
+    let both = set & clear;
+    let value = memory.boot_read_word(target);
+    let value = (value | (set & !both)) & !(clear & !both);
+    memory.boot_write_word(target, value ^ both);
+}
+
+/// The boot configuration table processed as it arrives, a fragment at a time: what an I2C
+/// boot reads when a boot parameter block's options name a boot configuration table
+/// (SPRUEC6G section 2.3.4.2). The entries are the memory-resident table's, three words each,
+/// ended by an all-zero entry; a fragment boundary can fall anywhere inside one.
+pub struct ConfigStream {
+    endian: Endian,
+    partial: [u8; 12],
+    held: usize,
+    entries: usize,
+    done: bool,
+}
+
+impl ConfigStream {
+    pub fn new(endian: Endian) -> Self {
+        Self {
+            endian,
+            partial: [0; 12],
+            held: 0,
+            entries: 0,
+            done: false,
+        }
+    }
+
+    /// Apply every whole entry in `bytes` and report whether the table has ended. An entry
+    /// whose two masks are zero asks the ROM to call a function, which a streamed table has
+    /// nobody to branch for, so it is refused rather than skipped.
+    pub fn feed(&mut self, bytes: &[u8], memory: &mut impl BootMemory) -> Result<bool, String> {
+        let mut rest = bytes;
+        while !rest.is_empty() && !self.done {
+            let take = (12 - self.held).min(rest.len());
+            self.partial[self.held..self.held + take].copy_from_slice(&rest[..take]);
+            self.held += take;
+            rest = &rest[take..];
+            if self.held < 12 {
+                break;
+            }
+            self.held = 0;
+            let word = |index: usize| {
+                let bytes: [u8; 4] = self.partial[4 * index..4 * index + 4].try_into().unwrap();
+                match self.endian {
+                    Endian::Little => u32::from_le_bytes(bytes),
+                    Endian::Big => u32::from_be_bytes(bytes),
+                }
+            };
+            let (target, set, clear) = (word(0), word(1), word(2));
+            if target == 0 && set == 0 && clear == 0 {
+                self.done = true;
+                break;
+            }
+            if set == 0 && clear == 0 {
+                return Err(format!(
+                    "boot configuration entry calls the function at 0x{target:08x}; only \
+                     read/modify/write entries are applied"
+                ));
+            }
+            self.entries += 1;
+            if self.entries > MAX_ENTRIES {
+                return Err("boot configuration table has no termination record".into());
+            }
+            apply_entry(memory, target, set, clear);
+        }
+        Ok(self.done)
+    }
 }
 
 /// The boot table processed as it arrives, a fragment at a time (SPRUEC6G section 4.3.5.3: the

@@ -1,5 +1,7 @@
 //! The ROM bootloader's I2C EEPROM boot mode: the boot a C6455 performs with BOOTMODE[3:0] set
-//! to 0101b, which SPRUEC6G Table 3 names "Master I2C boot" and section 2.3.4 describes.
+//! to 0101b, which SPRUEC6G Table 3 names "Master I2C boot" and section 2.3.4 describes, and the
+//! C6472's with BOOTMODE 2 or 3, which section 4.3.3 says "is similar to the C6454/55 device's
+//! process" with the differences that section lists.
 //!
 //! Like the Ethernet boot in `romboot.rs`, the ROM's *instructions* are not modelled - TI ships
 //! them in on-chip ROM this project has no copy of - and what is modelled is everything the ROM
@@ -13,7 +15,8 @@
 //! * "The memory device uses two bytes for internal addressing."
 //! * "The memory device has the capability to auto-increment its internal address counter such
 //!   that the contents of the memory device can be read sequentially."
-//! * "The bootloader requires the I2C EEPROM slave address to be 0x50."
+//! * "The bootloader requires the I2C EEPROM slave address to be 0x50." The C6472 "supports both
+//!   I2C address 0x50 and 0x51": BOOTMODE 2 is the first and 3 the second (Table 22).
 //!
 //! Everything on the EEPROM is blocked (section 2.3.4.1): "Each block has a maximum length of
 //! 128 bytes, including the 4 byte block header", whose Table 5 is a 16-bit block size covering
@@ -30,7 +33,32 @@
 //! configuration table". Then, for a boot table, "the bootloader reads from the I2C EEPROM
 //! address specified in the boot table until the end of the table is reached (i.e., until all
 //! code and data sections are loaded), and immediately begin execution of the loaded code by
-//! branching to the entry point specified at the beginning of the boot table".
+//! branching to the entry point specified at the beginning of the boot table". For a boot
+//! configuration table it applies the table, then "The next device address previously read from
+//! the boot parameter block is copied into device address, the boot options are cleared, and the
+//! bootloader performs a boot re-entry", which reads another parameter block from there.
+//!
+//! The C6472's differences (section 4.3.3 and Tables 22 to 25):
+//!
+//! * CFG[3:0] is the parameter block index and CFG[4] selects PLL1 "x9(0), x19(1)"; the boot
+//!   programs that multiplier and Table 21's caches before it reads anything. Both Table 22 and
+//!   the text say 9 and 19 for I2C where the MAC and SRIO rows say 10 and 20, and the model takes
+//!   them as written.
+//! * A parameter block starts with Table 23's ten-byte common header: size, checksum, an
+//!   extended boot mode (Table 24), a port and a software PLL factor; the I2C fields of Table 25
+//!   follow from offset 10. "The extended boot modes applies to all boot modes", so the block's
+//!   boot mode says which boot its fields configure: 0x101 is this I2C master boot and acts on
+//!   its options as above, and 0x104 hands the device to the UTOPIA boot with the block's Table
+//!   26 fields (`utopiaboot.rs`). No other boot is modelled as a successor, so other values stop
+//!   the boot. **[INFERENCE]** The software PLL factor is not applied: the manual gives it no
+//!   effect for the C6472, and PLL1 stays as CFG[4] set it.
+//! * Boot-table and configuration-table blocks keep Table 5's four-byte header and up to 124
+//!   bytes of data. Table 23's header belongs to the parameter tables: TI's C6472 ROM header
+//!   (`tiboot_c6472.h` in the IBL, git.ti.com/keystone-rtos/ibl) declares it as the first five
+//!   fields of each BOOT_PARAMS_*_T, and the IBL's C6472 EVM EEPROM, which this ROM boots, wraps
+//!   its boot table with `b2i2c` - "2 bytes of length, 2 bytes checksum, 124 bytes of data" -
+//!   behind `romparse` parameter tables naming boot mode 257 (0x101). `b2i2c`'s output for a
+//!   compiled boot table is byte-for-byte what the tests' block builders produce.
 //!
 //! Three places where the manual stops short and this model has to choose. Each is a choice
 //! about the shape of a transaction, not about an answer:
@@ -51,14 +79,30 @@
 //!   this model is clocked from the I2C bus, so the boot programs the dividers it is given and
 //!   the transfer takes the cycles `i2c.rs` already charges it.
 
-use crate::boot::BootStream;
+use crate::boot::{BootStream, ConfigStream};
 use crate::system::{CoreBus, Endian, Fabric};
+use crate::utopiaboot::{
+    initialise_c6472_rom_boot, Parameters as UtopiaParameters, Progress as UtopiaProgress,
+    UtopiaBoot,
+};
 
 /// BOOTMODE[3:0] 0101b is the C6455's master I2C boot (SPRUEC6G Table 3).
 pub(crate) const BOOTMODE_I2C_EEPROM: u8 = 5;
 
-/// The slave address section 2.3.4 requires the first EEPROM to answer at.
+/// The slave address section 2.3.4 requires the first EEPROM to answer at, and the C6472's
+/// second one (Table 22).
 pub(crate) const EEPROM_ADDRESS: u32 = 0x50;
+const SECOND_EEPROM_ADDRESS: u32 = 0x51;
+
+/// The EEPROM address a device's BOOTMODE pins name when they select the master I2C boot: the
+/// C6455's mode 5 (Table 3), the C6472's modes 2 and 3 (Table 22). `None` for every other mode.
+pub(crate) fn eeprom_address(c6472: bool, mode: u8) -> Option<u32> {
+    match (c6472, mode) {
+        (false, BOOTMODE_I2C_EEPROM) | (true, 2) => Some(EEPROM_ADDRESS),
+        (true, 3) => Some(SECOND_EEPROM_ADDRESS),
+        _ => None,
+    }
+}
 
 /// I2C register addresses (SPRU974A Table 2).
 const BASE: u32 = 0x02b0_4000;
@@ -83,32 +127,90 @@ const MDR_IRS: u32 = 1 << 5;
 const ICRRDY: u32 = 1 << 3;
 const ICXRDY: u32 = 1 << 4;
 
-/// One block, and the header inside it (SPRUEC6G section 2.3.4.1 and Table 5).
+/// One block, and the header inside it (SPRUEC6G section 2.3.4.1 and Table 5). Boot-table and
+/// configuration-table blocks carry this header on the C6472 too.
 const BLOCK_BYTES: usize = 128;
 const BLOCK_HEADER_BYTES: usize = 4;
 
-/// Boot parameter fields, as offsets into the block (SPRUEC6G Table 6). The two words before
-/// them are the block header the format shares with every other block.
-const PARAM_OPTIONS: usize = 6;
-const PARAM_DEVICE_ADDRESS_LOW: usize = 8;
-const PARAM_DEVICE_ADDRESS_HIGH: usize = 10;
-const PARAM_CPU_FREQUENCY: usize = 16;
-const PARAM_I2C_FREQUENCY: usize = 18;
+/// Where a boot parameter block keeps each field, as offsets into the block: the C6455's Table 6
+/// behind the four-byte block header, or the C6472's Table 25 behind Table 23's ten-byte common
+/// header with its extended boot mode at offset 4.
+struct Layout {
+    boot_mode: Option<usize>,
+    options: usize,
+    device_address_low: usize,
+    device_address_high: usize,
+    cpu_frequency: usize,
+    i2c_frequency: usize,
+    next_address_low: usize,
+    next_address_high: usize,
+}
 
-/// The options field's two least significant bits (SPRUEC6G section 2.3.4.2).
+const C6455_LAYOUT: Layout = Layout {
+    boot_mode: None,
+    options: 6,
+    device_address_low: 8,
+    device_address_high: 10,
+    cpu_frequency: 16,
+    i2c_frequency: 18,
+    next_address_low: 20,
+    next_address_high: 22,
+};
+
+const C6472_LAYOUT: Layout = Layout {
+    boot_mode: Some(4),
+    options: 10,
+    device_address_low: 12,
+    device_address_high: 14,
+    cpu_frequency: 20,
+    i2c_frequency: 22,
+    next_address_low: 24,
+    next_address_high: 26,
+};
+
+/// The options field's table types (SPRUEC6G section 2.3.4.2, Table 25), in bits 1:0 on both
+/// devices. TI's C6472 ROM header (`tiboot_c6472.h` in the IBL, BOOT_PARAMS_I2C_OPTIONS_MASK)
+/// masks two bits and puts the EEPROM type in bits 4:2, where Table 25 draws a three-bit field;
+/// the ROM's own header is followed, so an EEPROM type never reads as a table type.
 const OPTION_TABLE_TYPE: u16 = 0x3;
 const TABLE_TYPE_PARAMETERS: u16 = 0;
 const TABLE_TYPE_BOOT_TABLE: u16 = 1;
+const TABLE_TYPE_CONFIGURATION: u16 = 2;
+
+/// The C6472's extended boot modes this model runs (Table 24).
+const EXTENDED_I2C_MASTER: u16 = 0x101;
+const EXTENDED_UTOPIA: u16 = 0x104;
 
 /// How many boot parameter blocks the boot will chase before giving up. The format lets one
 /// parameter table name another, so a malformed EEPROM could point at itself.
 const MAX_PARAMETER_BLOCKS: usize = 8;
 
+/// Which ROM's I2C boot this is.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Rom {
+    C6455,
+    /// The C6472's, with the PLL1 multiplier CFG[4] selects.
+    C6472 {
+        pll_multiplier: u32,
+    },
+}
+
+impl Rom {
+    fn layout(self) -> &'static Layout {
+        match self {
+            Self::C6455 => &C6455_LAYOUT,
+            Self::C6472 { .. } => &C6472_LAYOUT,
+        }
+    }
+}
+
 /// What the boot has done so far, for a front end to report.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 pub(crate) struct Progress {
     /// Boot parameter blocks read and accepted.
     pub parameter_blocks: usize,
+    /// Blocks of boot configuration table read and applied.
+    pub config_blocks: usize,
     /// Blocks of the boot table read.
     pub table_blocks: usize,
     /// Bytes of boot-table payload handed to the table processor.
@@ -117,7 +219,7 @@ pub(crate) struct Progress {
     pub checksum_failures: usize,
     pub entry: Option<u32>,
     /// Why the boot stopped, when it stopped without an entry point.
-    pub error: Option<&'static str>,
+    pub error: Option<String>,
 }
 
 /// Which stage of the read the boot is in. Every stage is one I2C transaction, and a transaction
@@ -137,6 +239,8 @@ enum Phase {
     Consume {
         block: Vec<u8>,
     },
+    /// A parameter block named another boot, which now runs in this one's place.
+    HandedOver(Box<UtopiaBoot>),
     Done,
 }
 
@@ -145,42 +249,64 @@ enum Phase {
 enum Target {
     Parameters,
     BootTable,
+    Configuration,
 }
 
 pub(crate) struct I2cBoot {
+    rom: Rom,
+    endian: Endian,
     /// The EEPROM's slave address, and the address inside it the next block starts at.
     slave: u32,
     at: u32,
+    /// Where the parameter block after a boot configuration table is: the next device address
+    /// the block that named the table gave, low word and high word.
+    next: (u32, u32),
     target: Target,
     phase: Phase,
     stream: BootStream,
+    config: ConfigStream,
     parameter_blocks: usize,
     progress: Progress,
 }
 
 impl I2cBoot {
-    /// The boot as the pins strap it: the first EEPROM at 0x50, and the boot parameter block at
-    /// `0x80 * index`, where the index comes from the configuration pins (SPRUEC6G section
+    /// The boot as the pins strap it: the first EEPROM at `slave`, and the boot parameter block
+    /// at `0x80 * index`, where the index comes from the configuration pins (SPRUEC6G section
     /// 2.3.4.2 for the C6455, Table 22 for the C6472's CFG[3:0]).
-    pub(crate) fn new(index: u32, endian: Endian) -> Self {
+    pub(crate) fn new(rom: Rom, slave: u32, index: u32, endian: Endian) -> Self {
         Self {
-            slave: EEPROM_ADDRESS,
+            rom,
+            endian,
+            slave,
             at: index * BLOCK_BYTES as u32,
+            next: (0, 0),
             target: Target::Parameters,
             phase: Phase::Configure,
             stream: BootStream::new(endian),
+            config: ConfigStream::new(endian),
             parameter_blocks: 0,
             progress: Progress::default(),
         }
     }
 
     pub(crate) fn progress(&self) -> Progress {
-        self.progress
+        self.progress.clone()
+    }
+
+    /// What the UTOPIA boot a parameter block handed over to has done, once one has.
+    pub(crate) fn utopia(&self) -> Option<UtopiaProgress> {
+        match &self.phase {
+            Phase::HandedOver(boot) => Some(boot.progress()),
+            _ => None,
+        }
     }
 
     /// One cycle of the ROM's boot loop. Returns the entry point once the boot table has ended,
     /// which is the device's signal to start core 0 there.
     pub(crate) fn tick(&mut self, fabric: &mut Fabric) -> Option<u32> {
+        if let Phase::HandedOver(boot) = &mut self.phase {
+            return boot.tick(fabric);
+        }
         // The boot code runs on core 0, so its accesses are core 0's accesses.
         let mut bus = CoreBus::new(0, fabric);
         match std::mem::replace(&mut self.phase, Phase::Done) {
@@ -198,13 +324,18 @@ impl I2cBoot {
                 None
             }
             Phase::Consume { block } => self.consume(&mut bus, block),
+            Phase::HandedOver(_) => unreachable!("handled above"),
             Phase::Done => None,
         }
     }
 
     /// Take the module out of reset and give it a bus clock. The dividers are the ones the boot
-    /// parameters will replace; nothing this model counts is clocked from them.
+    /// parameters will replace; nothing this model counts is clocked from them. The C6472 sets
+    /// its caches and PLL1 first, as every one of its ROM boots does (Tables 20 and 21).
     fn configure(&mut self, bus: &mut CoreBus<'_>) {
+        if let Rom::C6472 { pll_multiplier } = self.rom {
+            initialise_c6472_rom_boot(bus, pll_multiplier);
+        }
         bus.write32(ICMDR, 0);
         bus.write32(ICPSC, 8);
         bus.write32(ICCLKL, 10);
@@ -256,7 +387,7 @@ impl I2cBoot {
     }
 
     /// A block is in hand. Verify it, then either take its parameters or feed its data to the
-    /// boot table processor and go round again.
+    /// table processor it belongs to and go round again.
     fn consume(&mut self, bus: &mut CoreBus<'_>, block: Vec<u8>) -> Option<u32> {
         let size = usize::from(be16(&block, 0));
         if !(BLOCK_HEADER_BYTES..=BLOCK_BYTES).contains(&size) {
@@ -275,14 +406,39 @@ impl I2cBoot {
             return None;
         }
         self.progress.checksum_failures = 0;
+        let data = &block[BLOCK_HEADER_BYTES..size];
         match self.target {
             Target::Parameters => {
-                self.take_parameters(bus, &block, size);
+                self.take_parameters(bus, &block[..size]);
                 None
+            }
+            Target::Configuration => {
+                self.progress.config_blocks += 1;
+                match self.config.feed(data, bus) {
+                    Err(message) => self.fail(message),
+                    Ok(false) => {
+                        self.at = self.at.wrapping_add(size as u32);
+                        self.begin_address(bus);
+                        None
+                    }
+                    Ok(true) => {
+                        // The boot re-entry: the next device address becomes the device address,
+                        // and what is there is another parameter block.
+                        if self.parameter_blocks >= MAX_PARAMETER_BLOCKS {
+                            return self
+                                .fail("boot parameter tables chain without naming a boot table");
+                        }
+                        let (low, high) = self.next;
+                        self.address(low, high);
+                        self.config = ConfigStream::new(self.endian);
+                        self.target = Target::Parameters;
+                        self.begin_address(bus);
+                        None
+                    }
+                }
             }
             Target::BootTable => {
                 self.progress.table_blocks += 1;
-                let data = &block[BLOCK_HEADER_BYTES..size];
                 self.progress.table_bytes += data.len();
                 match self.stream.feed(data, bus) {
                     Err(_) => self.fail("boot table has no termination record"),
@@ -304,12 +460,33 @@ impl I2cBoot {
         }
     }
 
-    /// Read the parameter block and act on its options field: another parameter table, or the
-    /// boot table this boot exists to load.
-    fn take_parameters(&mut self, bus: &mut CoreBus<'_>, block: &[u8], size: usize) {
+    /// Read the parameter block - `block` is its `size` bytes - and act on it: on the C6472 its
+    /// extended boot mode first, then its options field: another parameter table, a
+    /// configuration table, or the boot table this boot exists to load.
+    fn take_parameters(&mut self, bus: &mut CoreBus<'_>, block: &[u8]) {
         self.progress.parameter_blocks += 1;
         self.parameter_blocks += 1;
-        if size < PARAM_I2C_FREQUENCY + 2 {
+        let layout = self.rom.layout();
+        if let Some(offset) = layout.boot_mode {
+            if block.len() < offset + 2 {
+                self.fail("boot parameter block is shorter than its common header");
+                return;
+            }
+            match be16(block, offset) {
+                EXTENDED_I2C_MASTER => {}
+                EXTENDED_UTOPIA => {
+                    self.hand_over(bus, block);
+                    return;
+                }
+                _ => {
+                    self.fail(
+                        "boot parameter block names an extended boot mode this boot does not run",
+                    );
+                    return;
+                }
+            }
+        }
+        if block.len() < layout.i2c_frequency + 2 {
             self.fail("boot parameter block is shorter than the parameter structure");
             return;
         }
@@ -319,22 +496,16 @@ impl I2cBoot {
         // is the one field of the three this model's transfer time depends on, so reprogramming
         // it from a number the manual does not give would change how long the boot takes for a
         // reason no document backs.
-        let cpu_mhz = u32::from(be16(block, PARAM_CPU_FREQUENCY));
-        let bus_khz = u32::from(be16(block, PARAM_I2C_FREQUENCY));
+        let cpu_mhz = u32::from(be16(block, layout.cpu_frequency));
+        let bus_khz = u32::from(be16(block, layout.i2c_frequency));
         if cpu_mhz != 0 && bus_khz != 0 {
             let half = (cpu_mhz * 1000 / bus_khz / 2).clamp(1, 0xffff);
             bus.write32(ICCLKL, half);
             bus.write32(ICCLKH, half);
         }
-        let options = be16(block, PARAM_OPTIONS) & OPTION_TABLE_TYPE;
-        let low = u32::from(be16(block, PARAM_DEVICE_ADDRESS_LOW));
-        let high = u32::from(be16(block, PARAM_DEVICE_ADDRESS_HIGH));
-        // "This is an abstraction; this value is used as the I2C EEPROM slave address"
-        // (Table 6). A zero there means the EEPROM the boot is already talking to.
-        if high != 0 {
-            self.slave = high & 0x3ff;
-        }
-        self.at = low;
+        let options = be16(block, layout.options) & OPTION_TABLE_TYPE;
+        let low = u32::from(be16(block, layout.device_address_low));
+        let high = u32::from(be16(block, layout.device_address_high));
         match options {
             TABLE_TYPE_BOOT_TABLE => self.target = Target::BootTable,
             TABLE_TYPE_PARAMETERS => {
@@ -344,19 +515,56 @@ impl I2cBoot {
                 }
                 self.target = Target::Parameters;
             }
+            TABLE_TYPE_CONFIGURATION => {
+                if block.len() < layout.next_address_high + 2 {
+                    self.fail("boot parameter block is shorter than the next device address");
+                    return;
+                }
+                self.next = (
+                    u32::from(be16(block, layout.next_address_low)),
+                    u32::from(be16(block, layout.next_address_high)),
+                );
+                self.target = Target::Configuration;
+            }
             _ => {
-                // A boot configuration table, or the reserved encoding. The table layer for a
-                // configuration table exists in `boot.rs`, but it is a memory-resident format
-                // rather than a streamed one, so this boot does not carry it.
+                // Slave receive options, the one encoding left: it reads no table off this
+                // EEPROM for this device.
                 self.fail("boot parameter options name a table type this boot does not load");
                 return;
             }
         }
+        self.address(low, high);
         self.begin_address(bus);
     }
 
-    fn fail(&mut self, reason: &'static str) -> Option<u32> {
-        self.progress.error = Some(reason);
+    /// Point the next read at a device address: the low word is the address inside the EEPROM,
+    /// and the high word "is used as the I2C EEPROM slave address" (Table 6), where zero means
+    /// the EEPROM the boot is already talking to.
+    fn address(&mut self, low: u32, high: u32) {
+        if high != 0 {
+            self.slave = high & 0x3ff;
+        }
+        self.at = low;
+    }
+
+    /// A C6472 parameter block named UTOPIA (Table 24's 0x104): its Table 26 fields configure
+    /// the UTOPIA boot, which runs from here on in this one's place. The I2C module goes back
+    /// into reset first, as it does when this boot ends.
+    fn hand_over(&mut self, bus: &mut CoreBus<'_>, block: &[u8]) {
+        match UtopiaParameters::from_block(block) {
+            Err(reason) => {
+                self.fail(reason);
+            }
+            Ok(parameters) => {
+                bus.write32(ICMDR, 0);
+                self.phase =
+                    Phase::HandedOver(Box::new(UtopiaBoot::chained(parameters, self.endian)));
+            }
+        }
+    }
+
+    fn fail(&mut self, reason: impl Into<String>) -> Option<u32> {
+        self.progress.error = Some(reason.into());
         self.phase = Phase::Done;
         None
     }
@@ -395,13 +603,13 @@ fn checksum_valid(block: &[u8]) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
-    use crate::device::{Device, C6455};
+    use crate::device::{Device, C6455, C6472};
 
     /// One block, laid out as SPRUEC6G Table 5 says: a 16-bit size that counts the header, a
     /// 16-bit checksum over the whole block, then the payload.
-    fn block(payload: &[u8]) -> Vec<u8> {
+    pub(crate) fn block(payload: &[u8]) -> Vec<u8> {
         let size = (BLOCK_HEADER_BYTES + payload.len()) as u16;
         let mut body = Vec::new();
         body.extend_from_slice(&size.to_be_bytes());
@@ -419,24 +627,67 @@ mod tests {
         body
     }
 
-    /// The Table 6 boot parameter block: 2-byte big-endian fields at their offsets, padded out
-    /// to the 128 bytes section 2.3.4.2 says the block consists of.
-    fn parameters(options: u16, device_low: u16, device_high: u16) -> Vec<u8> {
+    /// A boot parameter block padded out to the 128 bytes section 2.3.4.2 says the block
+    /// consists of, with 2-byte big-endian fields at their offsets into the block.
+    fn parameter_block(fields: &[(usize, u16)]) -> Vec<u8> {
         let mut payload = vec![0u8; BLOCK_BYTES - BLOCK_HEADER_BYTES];
-        for (offset, value) in [
-            (4usize, BOOTMODE_I2C_EEPROM as u16),
-            (PARAM_OPTIONS, options),
-            (PARAM_DEVICE_ADDRESS_LOW, device_low),
-            (PARAM_DEVICE_ADDRESS_HIGH, device_high),
-            (PARAM_CPU_FREQUENCY, 720),
-            (PARAM_I2C_FREQUENCY, 100),
-        ] {
+        for &(offset, value) in fields {
             let at = offset - BLOCK_HEADER_BYTES;
             payload[at..at + 2].copy_from_slice(&value.to_be_bytes());
         }
         let block = block(&payload);
         assert_eq!(block.len(), BLOCK_BYTES);
         block
+    }
+
+    /// The C6455's Table 6 block.
+    fn parameters(options: u16, device_low: u16, device_high: u16) -> Vec<u8> {
+        parameter_block(&[
+            (4, BOOTMODE_I2C_EEPROM as u16),
+            (C6455_LAYOUT.options, options),
+            (C6455_LAYOUT.device_address_low, device_low),
+            (C6455_LAYOUT.device_address_high, device_high),
+            (C6455_LAYOUT.cpu_frequency, 720),
+            (C6455_LAYOUT.i2c_frequency, 100),
+        ])
+    }
+
+    /// A C6472 block: Table 23's common header naming `boot_mode` (Table 24), then `fields` at
+    /// their offsets - Table 25's for an I2C block, Table 26's for a UTOPIA one.
+    pub(crate) fn c6472_parameters(boot_mode: u16, fields: &[(usize, u16)]) -> Vec<u8> {
+        let mut all = vec![(4, boot_mode)];
+        all.extend_from_slice(fields);
+        parameter_block(&all)
+    }
+
+    /// A C6472 Table 25 block that sends the boot to `options`' table at `device_low` on the
+    /// EEPROM at `slave`, with Table 25's default frequencies.
+    pub(crate) fn c6472_i2c_parameters(
+        options: u16,
+        device_low: u16,
+        slave: u16,
+        next: (u16, u16),
+    ) -> Vec<u8> {
+        c6472_parameters(
+            EXTENDED_I2C_MASTER,
+            &[
+                (C6472_LAYOUT.options, options),
+                (C6472_LAYOUT.device_address_low, device_low),
+                (C6472_LAYOUT.device_address_high, slave),
+                (C6472_LAYOUT.cpu_frequency, 50),
+                (C6472_LAYOUT.i2c_frequency, 10),
+                (C6472_LAYOUT.next_address_low, next.0),
+                (C6472_LAYOUT.next_address_high, next.1),
+            ],
+        )
+    }
+
+    /// `bytes` cut into as many blocks as they need.
+    pub(crate) fn blocks(bytes: &[u8]) -> Vec<u8> {
+        bytes
+            .chunks(BLOCK_BYTES - BLOCK_HEADER_BYTES)
+            .flat_map(block)
+            .collect()
     }
 
     /// A boot table, then an EEPROM holding the parameter block and that table behind it.
@@ -446,10 +697,18 @@ mod tests {
             BLOCK_BYTES as u16,
             EEPROM_ADDRESS as u16,
         );
-        for chunk in table.chunks(BLOCK_BYTES - BLOCK_HEADER_BYTES) {
-            image.extend_from_slice(&block(chunk));
-        }
+        image.extend(blocks(table));
         image
+    }
+
+    fn words(words: &[u32], endian: Endian) -> Vec<u8> {
+        words
+            .iter()
+            .flat_map(|word| match endian {
+                Endian::Little => word.to_le_bytes(),
+                Endian::Big => word.to_be_bytes(),
+            })
+            .collect()
     }
 
     fn run(device: &mut Device, cycles: usize) {
@@ -462,6 +721,10 @@ mod tests {
                 return;
             }
         }
+    }
+
+    fn read(device: &mut Device, address: u32) -> u32 {
+        device.with_core(0, |cpu| cpu.bus_mut().read32(address))
     }
 
     /// The whole boot, on the device and through the I2C master's own registers: the parameter
@@ -482,7 +745,7 @@ mod tests {
         table.extend_from_slice(&0u32.to_le_bytes());
 
         let mut device = Device::with_boot_mode(&C6455, 0, Endian::Little, BOOTMODE_I2C_EEPROM);
-        device.begin_i2c_boot(0, eeprom(&table));
+        device.begin_i2c_boot(BOOTMODE_I2C_EEPROM, 0, eeprom(&table));
         assert!(
             device.held_in_reset(0),
             "core 0 runs the ROM, so it is held"
@@ -524,7 +787,7 @@ mod tests {
         // Corrupt one payload byte, leaving the checksum field as it was.
         image[8] ^= 0xff;
         let mut device = Device::with_boot_mode(&C6455, 0, Endian::Little, BOOTMODE_I2C_EEPROM);
-        device.begin_i2c_boot(0, image);
+        device.begin_i2c_boot(BOOTMODE_I2C_EEPROM, 0, image);
         run(&mut device, 200_000);
 
         let boot = device.i2c_boot().expect("the device is booting over I2C");
@@ -532,7 +795,7 @@ mod tests {
         assert_eq!(boot.parameter_blocks, 0, "a bad block is never acted on");
         assert_eq!(boot.checksum_failures, 2, "read once, re-read once");
         assert_eq!(
-            boot.error,
+            boot.error.as_deref(),
             Some("boot block checksum did not verify on re-read")
         );
         assert!(
@@ -557,7 +820,7 @@ mod tests {
         table.extend_from_slice(&0u32.to_le_bytes());
         image.extend_from_slice(&block(&table));
         let mut device = Device::with_boot_mode(&C6455, 0, Endian::Little, BOOTMODE_I2C_EEPROM);
-        device.begin_i2c_boot(0, image);
+        device.begin_i2c_boot(BOOTMODE_I2C_EEPROM, 0, image);
         run(&mut device, 200_000);
 
         let boot = device.i2c_boot().expect("the device is booting over I2C");
@@ -569,9 +832,10 @@ mod tests {
     /// (SPRUEC6G section 2.3.4.2). Index 1 reads the second block, not the first.
     #[test]
     fn the_configuration_pins_select_which_parameter_block_is_read() {
-        // Block 0 names a table type this boot refuses; block 1 names a real boot table. A boot
-        // that read block 0 would fail, so reaching the entry point is what proves the index.
-        let mut image = parameters(2, 0, 0);
+        // Block 0 names the reserved table type, which this boot refuses; block 1 names a real
+        // boot table. A boot that read block 0 would fail, so reaching the entry point is what
+        // proves the index.
+        let mut image = parameters(3, 0, 0);
         image.extend_from_slice(&parameters(
             TABLE_TYPE_BOOT_TABLE,
             2 * BLOCK_BYTES as u16,
@@ -582,11 +846,206 @@ mod tests {
         table.extend_from_slice(&0u32.to_le_bytes());
         image.extend_from_slice(&block(&table));
         let mut device = Device::with_boot_mode(&C6455, 0, Endian::Little, BOOTMODE_I2C_EEPROM);
-        device.begin_i2c_boot(1, image);
+        device.begin_i2c_boot(BOOTMODE_I2C_EEPROM, 1, image);
         run(&mut device, 200_000);
 
         let boot = device.i2c_boot().expect("the device is booting over I2C");
         assert_eq!(boot.error, None);
         assert_eq!(boot.entry, Some(0x0080_0c00));
+    }
+
+    /// MVK .L1 k,A4 with k in bits 22-18, and ADD .L1 1,A4,A4: with k = 5 and two adds, a
+    /// program that leaves 7 in A4.
+    const MVK_A4: u32 = 0x0200_a358;
+    const ADD_A4: u32 = 0x0210_2058;
+    const CODE: u32 = 0x0080_1000;
+    const DATA: u32 = 0x0081_0000;
+
+    /// SPRUEC6G section 4.3.3 and Tables 22 to 25 on the six-core device: BOOTMODE 2 reads the
+    /// EEPROM at 0x50 and 3 the one at 0x51, CFG[3:0] picks the parameter block and CFG[4] PLL1's
+    /// x9 or x19, every block of parameters carries Table 23's common header, and the boot table
+    /// it names puts a program in core 0's L2 that core 0 then runs. Cores 1-5 stay held: nothing
+    /// in the table releases them.
+    #[test]
+    fn a_c6472_boots_a_program_off_the_eeprom_its_pins_name() {
+        let data: Vec<u32> = (0..60)
+            .map(|index| 0x0102_0304u32.wrapping_mul(index + 1))
+            .collect();
+        for endian in [Endian::Little, Endian::Big] {
+            for (mode, slave, cfggp, multiplier) in
+                [(2u8, 0x50u16, 0x00u8, 9u32), (3, 0x51, 0x13, 19)]
+            {
+                let label = format!(
+                    "big-endian {} mode {mode} CFG {cfggp:#x}",
+                    endian == Endian::Big
+                );
+                let index = usize::from(cfggp & 0xf);
+                // Every block before the selected one names a boot this model does not run, so
+                // reading any of them stops the boot.
+                let mut image = Vec::new();
+                for _ in 0..index {
+                    image.extend(c6472_parameters(0x105, &[]));
+                }
+                let table_at = ((index + 1) * BLOCK_BYTES) as u16;
+                // Mode 3's block also names an EEPROM type in options bits 4:2 (1, the 24C32
+                // family, in tiboot_c6472.h), which must not change the table type.
+                let eeprom_type = if mode == 3 { 1 << 2 } else { 0 };
+                image.extend(c6472_i2c_parameters(
+                    TABLE_TYPE_BOOT_TABLE | eeprom_type,
+                    table_at,
+                    slave,
+                    (0, 0),
+                ));
+                let mut table = vec![CODE, 12, CODE, MVK_A4 | (5 << 18), ADD_A4, ADD_A4];
+                table.extend([4 * data.len() as u32, DATA]);
+                table.extend(&data);
+                table.push(0);
+                image.extend(blocks(&words(&table, endian)));
+
+                let mut device = Device::with_boot_mode(&C6472, 0, endian, mode);
+                device.begin_i2c_boot(mode, cfggp, image);
+                for core in 0..6 {
+                    assert!(device.held_in_reset(core), "{label}: core {core}");
+                }
+                run(&mut device, 400_000);
+
+                let boot = device.i2c_boot().expect("the device is booting over I2C");
+                assert_eq!(boot.error, None, "{label}");
+                assert_eq!(boot.entry, Some(CODE), "{label}");
+                assert_eq!(boot.parameter_blocks, 1, "{label}");
+                assert_eq!(
+                    boot.table_blocks, 3,
+                    "{label}: 276 bytes in 124-byte blocks"
+                );
+                // The pins as software reads them, and what the ROM set from them first.
+                assert_eq!(
+                    (read(&mut device, 0x02a8_0000) >> 17) & 0x1f,
+                    u32::from(cfggp)
+                );
+                assert_eq!(
+                    read(&mut device, 0x029a_0110) & 0x3f,
+                    multiplier - 1,
+                    "{label}"
+                );
+                assert_eq!(read(&mut device, crate::memory::L1PCFG) & 7, 4, "{label}");
+                assert_eq!(read(&mut device, crate::memory::L1DCFG) & 7, 3, "{label}");
+                assert_eq!(read(&mut device, crate::memory::L2CFG) & 7, 0, "{label}");
+                for (index, &word) in data.iter().enumerate() {
+                    assert_eq!(read(&mut device, DATA + 4 * index as u32), word, "{label}");
+                }
+
+                assert!(!device.held_in_reset(0), "{label}");
+                assert_eq!(device.core(0).pc(), CODE, "{label}");
+                for _ in 0..400 {
+                    device.step_cycle();
+                }
+                assert_eq!(device.core(0).register('A', 4), 7, "{label}");
+                for core in 1..6 {
+                    assert!(device.held_in_reset(core), "{label}: core {core}");
+                }
+            }
+        }
+    }
+
+    /// Options 2: "the bootloader reads from the specified I2C EEPROM address until the end of
+    /// the boot configuration table", then "The next device address previously read from the
+    /// boot parameter block is copied into device address ... and the bootloader performs a boot
+    /// re-entry" (SPRUEC6G section 2.3.4.2). The table's entries set, clear and toggle bits
+    /// (section 6.2.3), and the parameter block the re-entry reads names the boot table.
+    #[test]
+    fn a_configuration_table_runs_and_the_boot_reenters_at_the_next_device_address() {
+        const TARGET: u32 = 0x0080_2000;
+        for (c6472, endian) in [
+            (false, Endian::Little),
+            (true, Endian::Little),
+            (true, Endian::Big),
+        ] {
+            // A configuration table longer than a block, so an entry straddles the boundary.
+            let mut config = Vec::new();
+            for index in 0..12u32 {
+                config.extend([TARGET + 4 * index, 0x00ff_00f0, 0x0f00_0000]);
+            }
+            // Both masks naming the same bits toggles them.
+            config.extend([TARGET + 0x40, 0xf0f0_f0f0, 0xf0f0_f0f0, 0, 0, 0]);
+            let config = blocks(&words(&config, endian));
+            let next = (BLOCK_BYTES + config.len()) as u16;
+            let table_at = next + BLOCK_BYTES as u16;
+            let mut image = if c6472 {
+                c6472_i2c_parameters(TABLE_TYPE_CONFIGURATION, 0x80, 0x50, (next, 0x50))
+            } else {
+                parameter_block(&[
+                    (C6455_LAYOUT.options, TABLE_TYPE_CONFIGURATION),
+                    (C6455_LAYOUT.device_address_low, 0x80),
+                    (C6455_LAYOUT.next_address_low, next),
+                    (C6455_LAYOUT.next_address_high, 0x50),
+                ])
+            };
+            image.extend(config);
+            image.extend(if c6472 {
+                c6472_i2c_parameters(TABLE_TYPE_BOOT_TABLE, table_at, 0, (0, 0))
+            } else {
+                parameters(TABLE_TYPE_BOOT_TABLE, table_at, 0)
+            });
+            image.extend(blocks(&words(&[0x0080_0c00, 0], endian)));
+            let (profile, mode) = if c6472 { (&C6472, 2) } else { (&C6455, 5) };
+            let mut device = Device::with_boot_mode(profile, 0, endian, mode);
+            device.with_core(0, |cpu| {
+                let mut bus = cpu.bus_mut();
+                for index in 0..12 {
+                    bus.write32(TARGET + 4 * index, 0x0f00_0003);
+                }
+                bus.write32(TARGET + 0x40, 0x0ff0_0ff0);
+            });
+            device.begin_i2c_boot(mode, 0, image);
+            run(&mut device, 400_000);
+
+            let label = format!("C6472 {c6472} big-endian {}", endian == Endian::Big);
+            let boot = device.i2c_boot().unwrap();
+            assert_eq!(boot.error, None, "{label}");
+            assert_eq!(boot.parameter_blocks, 2, "{label}");
+            assert_eq!(boot.config_blocks, 2, "{label}");
+            assert_eq!(boot.entry, Some(0x0080_0c00), "{label}");
+            for index in 0..12 {
+                assert_eq!(
+                    read(&mut device, TARGET + 4 * index),
+                    0x00ff_00f3,
+                    "{label}"
+                );
+            }
+            assert_eq!(read(&mut device, TARGET + 0x40), 0xff00_ff00, "{label}");
+        }
+    }
+
+    /// What a C6472 parameter block can name that stops the boot with core 0 held: an entry
+    /// asking the ROM to call a function, a boot this model does not chain to, and UTOPIA
+    /// parameters the port cannot be set up from.
+    #[test]
+    fn a_c6472_block_this_boot_cannot_follow_stops_it() {
+        let call = {
+            let mut image =
+                c6472_i2c_parameters(TABLE_TYPE_CONFIGURATION, 0x80, 0x50, (0x100, 0x50));
+            image.extend(blocks(&words(
+                &[0x0080_3000, 0, 0, 0, 0, 0],
+                Endian::Little,
+            )));
+            image
+        };
+        let mac = c6472_parameters(0x105, &[]);
+        // Options say a 16-bit bus, the bus width field 8 bits.
+        let utopia = c6472_parameters(EXTENDED_UTOPIA, &[(10, 2), (12, 54), (14, 8), (18, 500)]);
+        for (image, error) in [
+            (call, "calls the function at 0x00803000"),
+            (mac, "extended boot mode"),
+            (utopia, "bus width"),
+        ] {
+            let mut device = Device::with_boot_mode(&C6472, 0, Endian::Little, 2);
+            device.begin_i2c_boot(2, 0, image);
+            run(&mut device, 400_000);
+            let boot = device.i2c_boot().unwrap();
+            let reported = boot.error.expect(error);
+            assert!(reported.contains(error), "{reported}");
+            assert!(device.held_in_reset(0), "{error}");
+            assert_eq!(device.utopia_boot(), None, "{error}");
+        }
     }
 }

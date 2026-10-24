@@ -23,11 +23,11 @@ pytestmark = [pytest.mark.slow, pytest.mark.host]
 
 SLAVE = 9
 ECHOES = 3
-# Per device: the firmware, and the machine options that run it. On the C6472, boot mode 2 is
-# not a UTOPIA boot, and only core 0 comes out of reset to run the image.
+# Per device: the firmware, and the machine options that run it. On the C6472, boot mode 4 (I2C
+# slave, which has no modelled boot source) loads the ELF and brings only core 0 out of reset.
 DEVICES = {
     "c6455": ("utopia_echo", ()),
-    "c6472": ("c6472_utopia_echo", ("--boot-mode", "2")),
+    "c6472": ("c6472_utopia_echo", ("--boot-mode", "4")),
 }
 
 

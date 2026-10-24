@@ -11,7 +11,7 @@
 use crate::cpu::Cpu;
 use crate::events::{EventMap, C6455_EVENTS, C6472_EVENTS};
 use crate::hpi::HPI_BOOT_ENTRY;
-use crate::i2cboot::{I2cBoot, Progress as I2cProgress};
+use crate::i2cboot::{I2cBoot, Progress as I2cProgress, Rom as I2cRom};
 use crate::memory::{L1DCFG, L1PCFG, L2CFG};
 use crate::romboot::{BootParameters, EmacBoot, Progress};
 use crate::space::{AddressMap, C6455_MAP, C6472_MAP};
@@ -413,15 +413,31 @@ impl Device {
         self.rom_boot = Some(RomBoot::Emac(EmacBoot::new(base, endian, parameters)));
     }
 
-    /// Strap the device to the ROM bootloader's I2C EEPROM boot (SPRUEC6G section 2.3.4), with
-    /// the EEPROM image on the bus at the address the ROM requires and the boot parameter block
-    /// at `0x80 * index`. Core 0 is held while the boot code runs in its place.
-    pub fn begin_i2c_boot(&mut self, index: u32, contents: Vec<u8>) {
+    /// Strap the device to the ROM bootloader's I2C EEPROM boot (SPRUEC6G sections 2.3.4 and
+    /// 4.3.3) on BOOTMODE `mode`, with `cfggp` on the configuration pins and the EEPROM image on
+    /// the bus at the address the mode requires. The C6455 reads its parameter block index from
+    /// CFGGP[2:0]; the C6472 from CFG[3:0], with CFG[4] choosing PLL1's x9 or x19 (Table 22).
+    /// Core 0 is held while the boot code runs in its place.
+    pub fn begin_i2c_boot(&mut self, mode: u8, cfggp: u8, contents: Vec<u8>) {
         let endian = self.fabric().endian();
-        self.fabric()
-            .attach_i2c_eeprom(crate::i2cboot::EEPROM_ADDRESS, contents);
+        let c6472 = self.fabric().profile().has_boot_controller;
+        let slave = crate::i2cboot::eeprom_address(c6472, mode)
+            .expect("the boot mode is the device's master I2C boot");
+        let (rom, index) = if c6472 {
+            let pll_multiplier = if cfggp & 0x10 != 0 { 19 } else { 9 };
+            self.fabric().strap_cfggp(cfggp);
+            (I2cRom::C6472 { pll_multiplier }, cfggp & 0xf)
+        } else {
+            (I2cRom::C6455, cfggp & 0x7)
+        };
+        self.fabric().attach_i2c_eeprom(slave, contents);
         self.fabric().set_held_in_reset(0, true);
-        self.rom_boot = Some(RomBoot::I2c(I2cBoot::new(index, endian)));
+        self.rom_boot = Some(RomBoot::I2c(I2cBoot::new(
+            rom,
+            slave,
+            u32::from(index),
+            endian,
+        )));
     }
 
     /// Strap the device to the ROM bootloader's UTOPIA boot, BOOTMODE 5-8 (SPRUEC6G section
@@ -432,17 +448,19 @@ impl Device {
     /// boot table releases them.
     pub fn begin_utopia_boot(&mut self, mode: u8, phy: u8) {
         let endian = self.fabric().endian();
-        let boot = UtopiaBoot::new(mode, phy, endian);
+        let boot = UtopiaBoot::cold(mode, phy, endian);
         self.fabric().strap_utopia(phy, boot.is_wide());
         self.fabric().set_held_in_reset(0, true);
         self.rom_boot = Some(RomBoot::Utopia(boot));
     }
 
-    /// What the UTOPIA boot has done, when the device was strapped to one.
+    /// What the UTOPIA boot has done, when the device was strapped to one or an I2C boot's
+    /// parameter block handed over to one.
     pub fn utopia_boot(&self) -> Option<UtopiaProgress> {
         match self.rom_boot.as_ref()? {
             RomBoot::Utopia(boot) => Some(boot.progress()),
-            _ => None,
+            RomBoot::I2c(boot) => boot.utopia(),
+            RomBoot::Emac(_) => None,
         }
     }
 
@@ -1635,14 +1653,19 @@ mod tests {
         /// What an ATM master puts on the wire: the header, 32 bytes of table, the magic and
         /// the 12 bytes of payload after it that complete the 48 (SPRUEG2E section 2).
         fn cell(wide: bool, table: &[u8], magic: [u8; 4]) -> Vec<u8> {
-            let header = if wide { 6 } else { 5 };
-            let mut cell: Vec<u8> = (1..=header).collect();
+            sized_cell(if wide { 54 } else { 53 }, table, magic)
+        }
+
+        /// A cell of `bytes` on the wire: everything in front of the 48-byte payload is header,
+        /// the standard cell's and any user-defined bytes.
+        fn sized_cell(bytes: usize, table: &[u8], magic: [u8; 4]) -> Vec<u8> {
+            let mut cell: Vec<u8> = (1..=(bytes - 48) as u8).collect();
             let mut chunk = table.to_vec();
             chunk.resize(32, 0);
             cell.extend(chunk);
             cell.extend(magic);
             cell.extend([0x5a; 12]);
-            assert_eq!(cell.len(), if wide { 54 } else { 53 });
+            assert_eq!(cell.len(), bytes);
             cell
         }
 
@@ -1661,9 +1684,13 @@ mod tests {
         }
 
         fn send(device: &mut Device, cell: &[u8]) {
+            send_to(device, PHY, cell);
+        }
+
+        fn send_to(device: &mut Device, phy: u8, cell: &[u8]) {
             for _ in 0..200_000 {
-                if device.fabric().utopia_master_poll_receive(PHY) == Some(true) {
-                    assert!(device.fabric().utopia_master_send_cell(PHY, cell));
+                if device.fabric().utopia_master_poll_receive(phy) == Some(true) {
+                    assert!(device.fabric().utopia_master_send_cell(phy, cell));
                     return;
                 }
                 device.step_cycle();
@@ -1925,6 +1952,210 @@ mod tests {
                 device.held_in_reset(0),
                 "the core is not given a bogus entry"
             );
+        }
+
+        /// The handover of SPRUEC6G section 4.3.3 and Tables 23, 24 and 26: an I2C boot (mode
+        /// 2, the EEPROM at 0x50) reads a parameter block that names another, and that one names
+        /// UTOPIA (extended boot mode 0x104) with its own fields.
+        mod from_i2c {
+            use super::*;
+            use crate::i2cboot::tests::{blocks, c6472_i2c_parameters, c6472_parameters};
+
+            const UCR_RUDC: u32 = 0xf << 2;
+            const PDMA_BSR: u32 = 0x8;
+            const OPTION_SINGLE_PHY: u16 = 1;
+            const OPTION_WIDE: u16 = 2;
+            const OPTION_SKIP_PORT_INIT: u16 = 4;
+
+            fn device_words(words: &[u32], endian: Endian) -> Vec<u8> {
+                words
+                    .iter()
+                    .flat_map(|word| match endian {
+                        Endian::Little => word.to_le_bytes(),
+                        Endian::Big => word.to_be_bytes(),
+                    })
+                    .collect()
+            }
+
+            /// Table 26: options, cell size, bus width, slave ID, core frequency.
+            fn utopia_block(options: u16, cell: u16, width: u16, slave: u16, mhz: u16) -> Vec<u8> {
+                c6472_parameters(
+                    0x104,
+                    &[
+                        (10, options),
+                        (12, cell),
+                        (14, width),
+                        (16, slave),
+                        (18, mhz),
+                    ],
+                )
+            }
+
+            /// A C6472 strapped to I2C boot from 0x50 with CFG[4] high, so PLL1 is x19, booting
+            /// the EEPROM `image`.
+            fn i2c_device(endian: Endian, image: Vec<u8>) -> Device {
+                let mut device = Device::with_boot_mode(&C6472, 0x0080_0000, endian, 2);
+                device.begin_i2c_boot(2, 0x10, image);
+                device
+            }
+
+            fn until_listening(device: &mut Device, phy: u8) {
+                for _ in 0..600_000 {
+                    if device.fabric().utopia_master_poll_receive(phy) == Some(true) {
+                        return;
+                    }
+                    device.step_cycle();
+                }
+                panic!(
+                    "the port never listened at PHY {phy}: {:?}",
+                    device.utopia_boot()
+                );
+            }
+
+            /// The table's five fields each reach the hardware: the PHY mode and slave ID, the
+            /// bus width, a cell size other than the standard one - which changes the packet,
+            /// the PDMA burst and how many cells the 16 KB buffer holds - and the core frequency
+            /// the timer is counted from. PLL1 stays at the I2C boot's x19. Enough junk cells go
+            /// first to carry the PDMA's write position round the shorter buffer, so the ROM
+            /// only finds the table if it and the PDMA agree where every packet starts.
+            #[test]
+            fn the_parameter_table_configures_the_utopia_boot_it_hands_over_to() {
+                // Options, cell, width, slave, MHz, buffered cells.
+                let cases: [(u16, u16, u16, u8, u32, u32); 2] = [
+                    (0, 64, 8, 0x0b, 250, 256),
+                    (OPTION_SINGLE_PHY | OPTION_WIDE, 60, 16, 0x03, 1000, 273),
+                ];
+                for endian in [Endian::Little, Endian::Big] {
+                    for (options, cell_bytes, width, slave, mhz, cells) in cases {
+                        let wide = width == 16;
+                        let single = options & OPTION_SINGLE_PHY != 0;
+                        let label = format!(
+                            "big-endian {} {width}-bit {cell_bytes}-byte cells",
+                            endian == Endian::Big
+                        );
+                        let mut image = c6472_i2c_parameters(0, 0x80, 0x50, (0, 0));
+                        image.extend(utopia_block(
+                            options,
+                            cell_bytes,
+                            width,
+                            u16::from(slave),
+                            mhz as u16,
+                        ));
+                        let mut device = i2c_device(endian, image);
+                        until_listening(&mut device, slave);
+
+                        let i2c = device.i2c_boot().unwrap();
+                        assert_eq!(i2c.error, None, "{label}");
+                        assert_eq!(i2c.parameter_blocks, 2, "{label}");
+                        assert_eq!(i2c.entry, None, "{label}: UTOPIA's boot, not I2C's");
+                        let extra = u32::from(cell_bytes) - if wide { 54 } else { 53 };
+                        let mask = UCR_BEND | UCR_SLID | UCR_MPHY | UCR_U16M | UCR_RUDC | UCR_UREN;
+                        let expected = UCR_BEND
+                            | (u32::from(slave) << 24)
+                            | if single { 0 } else { UCR_MPHY }
+                            | if wide { UCR_U16M } else { 0 }
+                            | (extra << 2)
+                            | UCR_UREN;
+                        assert_eq!(read(&mut device, UCR) & mask, expected, "{label}: UCR");
+                        let packet = 4 * u32::from(cell_bytes).div_ceil(4);
+                        let bsr = device.with_core(0, |cpu| {
+                            let mut bus = cpu.bus_mut();
+                            bus.read32(PDMA_RXC0);
+                            bus.read32(PDMA_RXC0 + PDMA_BSR)
+                        });
+                        assert_eq!(bsr, (packet << 16) | (cells * packet), "{label}: BSR");
+                        let microseconds = if wide { 50 } else { 100 };
+                        assert_eq!(
+                            read(&mut device, TIMER0 + 0x18) + 1,
+                            mhz * microseconds / 6,
+                            "{label}: timer period"
+                        );
+                        assert_eq!(read(&mut device, PLLM) & 0x3f, 18, "{label}: PLL1 x19");
+
+                        // Multi-PHY answers its slave ID alone; single-PHY decodes no address.
+                        let other = slave ^ 1;
+                        let answer = device.fabric().utopia_master_poll_receive(other);
+                        assert_eq!(answer, single.then_some(true), "{label}: PHY {other}");
+                        let address = if single { other } else { slave };
+                        let junk = sized_cell(usize::from(cell_bytes), &[0xee; 32], [0; 4]);
+                        for _ in 0..280 {
+                            send_to(&mut device, address, &junk);
+                        }
+                        for chunk in full_table().chunks(32) {
+                            let cell = sized_cell(usize::from(cell_bytes), chunk, MAGIC);
+                            send_to(&mut device, address, &cell);
+                        }
+                        let progress = boot_until_done(&mut device);
+                        assert_eq!(progress.error, None, "{label}");
+                        assert_eq!(progress.discarded, 280, "{label}");
+                        assert_eq!(progress.accepted, 4, "{label}");
+                        assert_eq!(progress.entry, Some(CODE), "{label}");
+                        run(&mut device, 400);
+                        assert_eq!(device.core(0).register('A', 4), 7, "{label}: core 0");
+                        assert_eq!(device.core(1).register('A', 4), 8, "{label}: core 1");
+                    }
+                }
+            }
+
+            /// Options bit 2 skips port initialisation. The ROM still sets up its own receive
+            /// path - PDMA channel 8 and the timer - but UCR is whatever came before: here a boot
+            /// configuration table on the same EEPROM, run by the I2C boot first, which brings
+            /// the port up at a PHY and a cell size of its own. The parameter table's slave ID
+            /// names another PHY and is not applied. Without that table the port stays in
+            /// reset and no cell can reach the device.
+            #[test]
+            fn skipping_port_initialisation_leaves_the_port_as_the_eeprom_configured_it() {
+                const RUDC_57: u32 = 4 << 2;
+                for endian in [Endian::Little, Endian::Big] {
+                    let label = format!("big-endian {}", endian == Endian::Big);
+                    let set = UCR_BEND | (u32::from(PHY) << 24) | RUDC_57 | UCR_UREN;
+                    let config = blocks(&device_words(&[UCR, set, UCR_U16M, 0, 0, 0], endian));
+                    let next = 0x80 + config.len() as u16;
+                    let mut image = c6472_i2c_parameters(2, 0x80, 0x50, (next, 0x50));
+                    image.extend(config);
+                    image.extend(utopia_block(OPTION_SKIP_PORT_INIT, 57, 8, 0x02, 500));
+                    let mut device = i2c_device(endian, image);
+                    // The configuration table brings the port up before the I2C boot has read
+                    // the parameter block after it; cells sent now wait in the queue for the
+                    // PDMA channel the UTOPIA boot programs.
+                    until_listening(&mut device, PHY);
+                    assert_eq!(device.fabric().utopia_master_poll_receive(0x02), None);
+                    for chunk in full_table().chunks(32) {
+                        send(&mut device, &sized_cell(57, chunk, MAGIC));
+                    }
+                    let progress = boot_until_done(&mut device);
+                    assert_eq!(progress.error, None, "{label}");
+                    assert_eq!(progress.entry, Some(CODE), "{label}");
+                    let i2c = device.i2c_boot().unwrap();
+                    assert_eq!(i2c.config_blocks, 1, "{label}");
+                    assert_eq!(i2c.parameter_blocks, 2, "{label}");
+                    // UCR is still the table's: the handover wrote neither SLID nor anything else.
+                    let mask = UCR_BEND | UCR_SLID | UCR_MPHY | UCR_U16M | UCR_RUDC | UCR_UREN;
+                    assert_eq!(read(&mut device, UCR) & mask, set | UCR_MPHY, "{label}");
+                    run(&mut device, 400);
+                    assert_eq!(device.core(0).register('A', 4), 7, "{label}");
+                }
+
+                // The same skip with nothing to configure the port: the ROM's own path is up,
+                // the port is not, and the boot waits with nothing able to reach it.
+                let mut image = c6472_i2c_parameters(0, 0x80, 0x50, (0, 0));
+                image.extend(utopia_block(OPTION_SKIP_PORT_INIT, 53, 8, PHY.into(), 500));
+                let mut device = i2c_device(Endian::Little, image);
+                for _ in 0..300_000 {
+                    device.step_cycle();
+                }
+                let progress = device.utopia_boot().expect("handed over to UTOPIA");
+                assert!(channel_enabled(&mut device, 0), "PDMA channel 8");
+                assert_eq!(read(&mut device, TIMER0 + 0x18) + 1, 8333);
+                // SPRUEG2E Figure 9: the reserved one, MPHY and U16M, with UREN clear.
+                assert_eq!(read(&mut device, UCR), 0x2000_6000, "UCR as reset left it");
+                for phy in [PHY, 0x02, 0x1f] {
+                    assert_eq!(device.fabric().utopia_master_poll_receive(phy), None);
+                }
+                assert_eq!(progress.accepted + progress.discarded, 0);
+                assert_eq!(progress.entry, None);
+                assert!(device.held_in_reset(0));
+            }
         }
     }
 }

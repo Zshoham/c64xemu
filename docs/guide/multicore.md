@@ -48,9 +48,11 @@ The shared L2 RAM at `0020 0000h` needs no alias: all six cores address it ident
 
 ## Starting the cores
 
-`--boot-mode 0` starts every core at the ELF entry point at once. Any other mode runs core 0 and
+`--boot-mode 0` starts every core at the ELF entry point at once. The HPI, I2C, UTOPIA and MAC
+modes (1, 2-3, 5-8, 9-10) hold every core until their boot source has delivered the image. A
+mode with no modelled boot source - 4 (I2C slave), or 11 to 15 - loads the ELF, runs core 0 and
 leaves the rest internally held in reset until core 0 releases them — which is what real silicon
-does, and what the firmware in `tests/firmware/c6472_multicore/` demonstrates:
+does after a boot, and what the firmware in `tests/firmware/c6472_multicore/` demonstrates:
 
 ```c
 #define BOOT_COMPLETE_STAT (*(volatile unsigned *)0x02AB0004)
@@ -109,7 +111,7 @@ $ jq -c '.device, .cores[]' state.json
 
 That is boot mode 0 — all six running the same image in lockstep, which is why the cycle counts
 and program counters agree. With any other boot mode, cores 1-5 report `held_in_reset: true`
-until the running image releases them.
+until something releases them.
 
 ## One Ethernet connection, six cores
 

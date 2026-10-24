@@ -98,9 +98,10 @@ Shared by `run` and `debug`.
 | Option | Default | What it does |
 |---|---|---|
 | `--device NAME` | `c6455` | Selects the device profile by name; `DeviceProfile::named` refuses anything else with `unknown device NAME`. `c6455` is single-core, `c6472` has six cores. See [The six-core device](multicore.md). |
-| `--boot-mode MODE` | `0` | The BOOTMODE pins. Mode 0 installs ELF segments and starts every core. Mode 1 requires `--hpi-unix`: the C6455 host releases core 0 with DSPINT; the C6472 host sets `BOOT_COMPLETE_STAT`. C6455 mode 5 requires `--i2c-eeprom`. C6472 modes 5-8 require `--utopia-unix` (8/16-bit UTOPIA, paired PLL x10/x20), and modes 9/10 boot over MAC 0/1. Other modes run core 0 and leave it to release the rest. See [Booting an image](booting.md). |
-| `--i2c-eeprom FILE` | none | The serial EEPROM image on the I2C bus that an I2C boot reads its boot parameters and boot table from. Supplying it makes the load `Wire`: nothing comes from the ELF's segments. |
-| `--boot-param-index N` | `0` | Which of the eight boot parameter blocks the I2C boot loads. The block sits at `0x80 * N`. |
+| `--boot-mode MODE` | `0` | The BOOTMODE pins. Mode 0 installs ELF segments and starts every core. Mode 1 requires `--hpi-unix`: the C6455 host releases core 0 with DSPINT; the C6472 host sets `BOOT_COMPLETE_STAT`. C6455 mode 5 and C6472 modes 2 (EEPROM at 0x50) and 3 (0x51) are the master I2C boot and require `--i2c-eeprom`. C6472 modes 5-8 require `--utopia-unix` (8/16-bit UTOPIA, paired PLL x10/x20), and modes 9/10 boot over MAC 0/1. Other modes run core 0 and leave it to release the rest. See [Booting an image](booting.md). |
+| `--i2c-eeprom FILE` | none | The serial EEPROM image on the I2C bus that the master I2C boot reads its boot parameters and boot table from; refused with any other boot mode. Supplying it makes the load `Wire`: nothing comes from the ELF's segments. A C6472 EEPROM whose parameters hand over to UTOPIA also needs `--utopia-unix`. |
+| `--boot-param-index N` | `0` | Which boot parameter block the I2C boot loads: CFGGP[2:0] on the C6455 (0-7), CFG[3:0] on the C6472 (0-15). The block sits at `0x80 * N`. |
+| `--i2c-pll-x19` | off | Straps CFG[4] high for a C6472 I2C boot, so the boot sets PLL1 to x19 rather than x9 (SPRUEC6G Table 22). Refused elsewhere. |
 | `--mac-id MAC` | `02:00:00:00:64:72` | The address fused into the MAC ID words, which an Ethernet boot names itself by. |
 | `--boot-udp-port PORT` | `9` | The UDP port an Ethernet boot accepts boot-table frames on. |
 | `--stop-pc ADDR\|SYM` | `C$$EXIT`, else `abort` | The program's exit point. Resolved once at load; if neither symbol is present and the option is absent, the machine has no stop address and `run` refuses to start. |
@@ -250,8 +251,8 @@ stdout or stderr according to the file descriptor the request named, and also ac
 | `cores` | One entry per core: index, cycle counter, `pc`, `halted`, `held_in_reset`, `fault`, and `focused` for the core the front ends drive. On a C6455 there is exactly one. |
 | `stats` | The CPU's counters, which the perf report renders. |
 | `ethernet_boot` | Present only when the ROM's Ethernet boot ran: `frames_accepted`, `frames_discarded`, `table_bytes`, `entry`. The only way to tell a boot that completed from one still waiting for a frame. |
-| `i2c_boot` | Present only when the ROM's I2C boot ran: `parameter_blocks`, `table_blocks`, `table_bytes`, `checksum_failures`, `entry`, `error`. |
-| `utopia_boot` | Present for C6472 UTOPIA boot: `cells_accepted`, `cells_discarded`, `table_bytes` (32 per accepted cell, including final padding), `entry`, `error`. |
+| `i2c_boot` | Present only when the ROM's I2C boot ran: `parameter_blocks`, `config_blocks`, `table_blocks`, `table_bytes`, `checksum_failures`, `entry`, `error`. `entry` stays null when a C6472 parameter block handed the boot over to UTOPIA. |
+| `utopia_boot` | Present for C6472 UTOPIA boot, cold or handed over from an I2C boot: `cells_accepted`, `cells_discarded`, `table_bytes` (32 per accepted cell, including final padding), `entry`, `error`. |
 | `hpi_boot` | Present when strapped to HPI boot: `entries` holds each core's release entry, null until released; `entry` is core 0's entry. The C6455 entry is fixed at `0x00800000`; C6472 entries come from `DSP_BOOT_ADDRn`. |
 | `profile` | Present with `--profile`: the 32 hottest execute-packet addresses as `{pc, where, packets}`, `where` being the covering symbol as `name+0x1c`. |
 | `cache_stats` | Present with `--profile`: per cache, its name, `enabled`, `frozen`, `capacity_bytes`, `line_size`, `ways`, `sets`, `resident_lines`, `dirty_lines` and its hit/miss/fill/eviction counters. |

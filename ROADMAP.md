@@ -10,17 +10,18 @@ prints each result for several inputs localises a mismatch in two runs; the manu
 examples make good unit tests; a host build of the same C source is the strongest oracle for
 anything the compiler can express.
 
-Current state: 1965 collected pytest cases and 739 native tests, including 390 component vectors.
+Current state: 1980 collected pytest cases and 776 native tests, including 390 component vectors.
 Three differentials against TI's own tools run inside every suite pass: all 2195 instruction
 words in binutils' tic6x vectors, and 436813 instructions
 across the firmware and program images compared with `dis6x` on seven dimensions - mnemonic,
 functional unit, cross-path marking, predicate, memory data path, every memory access's address
 operand, and every operand list the model reads, 285856 of them.
 
-One `[ ]` item is open: UTOPIA boot's I2C-selected parameters. Beyond it, the method at the head
-of *Where to look next* remains **two rules each modelled and each pinned, with nothing asking what
-they do together.** It has found six defects. The cache manual's worked examples found a 4% error
-between a correct miss cost and a correct write buffer. Making a cache size carve its SRAM
+No `[ ]` item is open: the last, UTOPIA boot's I2C-selected parameters, closed with the C6472's
+I2C boot it needed. The method at the head of *Where to look next* remains **two rules each
+modelled and each pinned, with nothing asking what they do together.** It has found six defects.
+The cache manual's worked examples found a 4% error between a correct miss cost and a correct
+write buffer. Making a cache size carve its SRAM
 aperture found that a megamodule was caching its own L1 memory, which two sections of SPRU871K
 forbid. Enabling the EMAC's transmit mask found that a shared, edge-latched interrupt line makes
 acknowledging one queue unsafe. Going looking on purpose found two more in one pass: an L1D
@@ -1447,6 +1448,43 @@ device, which takes the device path. A run now takes the device path whenever th
 and the halt rule ignores a core held in reset: a held core is not stopped on a breakpoint, and
 its PC is an address the boot has not branched it to yet.
 
+A boot configuration table (options 2) is now followed too, on both devices: its read/modify/write
+entries (section 6.2.3) are applied from a streamed `ConfigStream` as their blocks arrive, then
+"The next device address previously read from the boot parameter block is copied into device
+address ... and the bootloader performs a boot re-entry". An entry asking the ROM to call a
+function stops the boot rather than being skipped. `a_configuration_table_runs_and_the_boot_
+reenters_at_the_next_device_address` straddles an entry across a block boundary and toggles bits
+with both masks, on the C6455 and on the C6472 in both byte orders.
+
+**[x] C6472 I2C EEPROM boot.** *Done, SPRUEC6G section 4.3.3 and Tables 22 to 25.* `--device
+c6472 --boot-mode 2` reads the EEPROM at 0x50 and `3` the one at 0x51; CFG[3:0], from
+`--boot-param-index`, picks the parameter block, and CFG[4], from `--i2c-pll-x19`, PLL1's
+multiplier. Both Table 22 and the text say x9 and x19 for the I2C modes where the MAC and SRIO
+rows say x10 and x20; the model takes them as written. The ROM sets Table 21's caches first and
+holds cores 1-5 until a table releases them. Parameter blocks carry Table 23's ten-byte common
+header, and its extended boot mode (Table 24) says which boot the block configures: 0x101 is this
+one, 0x104 is the UTOPIA handover below, anything else stops the boot.
+
+SPRUEC6G alone left two layout questions, and TI's own C6472 tools answer both: the IBL
+(git.ti.com/keystone-rtos/ibl) carries the ROM's `tiboot_c6472.h` and builds the C6472 EVM's boot
+EEPROM. Boot-table and configuration-table blocks keep Table 5's four-byte header: the IBL wraps
+its boot table with `b2i2c` ("2 bytes of length, 2 bytes checksum, 124 bytes of data") behind
+`romparse` parameter tables naming boot mode 257, and `b2i2c` built from that source turns a
+compiled boot table into exactly the bytes `tests/tools/i2c_eeprom.py` writes. A review read
+Table 23 as putting the ten-byte header on every block; the header file declares it as the head
+of each BOOT_PARAMS_*_T only, and its field offsets match Tables 25 and 26. The same header masks
+the options' table type to bits 1:0 and puts an EEPROM type in bits 4:2, where Table 25 draws a
+three-bit field, so the model masks two bits and an EEPROM type is ignored. **[INFERENCE]** The
+software PLL factor has no effect, since nothing gives it one on this device.
+`tests/tools/i2c_eeprom.py` builds the EEPROM from an ELF; an I2C-only image may place segments in
+the 16 KB of L1D SRAM, which only UTOPIA boot claims.
+
+`tests/test_i2cboot.py` is the acceptance case: `sum_loop` and `big_endian`, compiled, turned into
+an EEPROM with nothing preloaded from the ELF, and run to A4 = 55 in mode 2 at index 0 and in
+mode 3 at index 5 with PLL1 at x19, cores 1-5 never leaving reset. `a_c6472_boots_a_program_off_
+the_eeprom_its_pins_name` checks the same at device level, including DEVSTAT's CFGGP, PLLM, the
+cache configuration and that blocks before the selected index are never read.
+
 **[x] C6455 HPI boot.** *Done, as the hardware boot it is.* SPRS276M section 2.4: "the HPI host
 boot is a hardware boot mode", and "the CPU is actually held in reset until a DSP interrupt is
 generated by the host". `--boot-mode 1 --hpi-unix` straps that at reset:
@@ -1555,12 +1593,31 @@ This is the cold-boot defaults, not execution of the ROM instructions. Pin-level
 the CPU's temporary ROM interrupt-handler context, and complete PDMA functionality are not
 claimed; the receive path's PAR interpretation is documented above.
 
-**[ ] C6472 UTOPIA boot with I2C-selected parameters.** SPRUEC6G Table 26's UTOPIA boot
-parameter table - single- or multi-PHY, bus width, skipping port initialisation, the physical
-cell size and the core frequency the timer is counted from - reaches the ROM when an I2C EEPROM
-boot loads a parameter table that names UTOPIA. The modelled I2C boot is the C6455's, so this
-needs the C6472's I2C boot first; the table's fields and defaults are the expectation, and a
-cell size other than 53/54 changes the buffer's cell count (section 4.3.4's "256 to 292").
+**[x] C6472 UTOPIA boot with I2C-selected parameters.** *Done, SPRUEC6G Tables 24 and 26.* A C6472
+I2C parameter block naming extended boot mode 0x104 hands the device to the UTOPIA boot with that
+block's fields; the cold boot builds the same `utopiaboot::Parameters` from the pins with Table
+26's defaults, so both run the same receive path and boot-table processing:
+
+* single-PHY clears UCR.MPHY, so the port answers every address;
+* the bus width (options bit 1 and the width field, which must agree and be 8 or 16) sets U16M;
+* the physical cell size sets RUDC to the bytes beyond the standard 53 or 54, up to 64, and with
+  it the packet (14 to 16 words), the PDMA burst and the buffer: 292 standard cells in 16 KB down
+  to 256 of 64 bytes, section 4.3.4's "256 to 292";
+* the slave ID sets SLID, and the core frequency counts timer 0's 100 or 50 us period.
+
+**[INFERENCE]** Skipping port initialisation skips the UCR write alone: the PSC, PDMA channel 8 and
+timer 0 are how the ROM finds cells at all. A handed-over boot does not reprogram PLL1 or the
+caches, which the I2C boot set; a table the port cannot be set up from stops the boot.
+
+`device::tests::utopia_boot::from_i2c` reads every field back through its register in both byte
+orders, sends 280 non-boot cells to carry the PDMA round the shorter buffers of 64- and 60-byte
+cells before the table, and boots with port initialisation skipped after an EEPROM configuration
+table brought the port up at its own PHY and a 57-byte cell - and, without one, finds the port
+still in reset and the boot waiting. `tests/test_utopiaboot.py` does the same end to end on
+compiled `sum_loop` and `big_endian`: 64-byte multi-PHY cells on the 8-bit bus and 60-byte
+single-PHY cells on the 16-bit bus, each after a standard-size cell that the configured size
+makes the ROM discard, and the skipped initialisation behind an EEPROM configuration table. The
+cold-boot cases are unchanged.
 
 **[-] SRIO boot.** Still requires an SRIO device model.
 

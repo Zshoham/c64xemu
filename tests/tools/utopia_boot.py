@@ -21,10 +21,11 @@ else:
 MAGIC = bytes.fromhex("54492164")
 
 
-def cell(payload: bytes, width: int) -> bytes:
-    """A physical cell: 5/6 header bytes, 32 boot bytes, magic, and unused payload."""
-    header = 5 if width == 8 else 6
-    return bytes(header) + payload.ljust(32, b"\0") + MAGIC + bytes(12)
+def cell(payload: bytes, width: int, size: int | None = None) -> bytes:
+    """A physical cell: 5/6 header bytes plus any user-defined ones up to `size`, 32 boot bytes,
+    magic, and unused payload. The payload is always a cell's last 48 bytes."""
+    size = size or (53 if width == 8 else 54)
+    return bytes(size - 48) + payload.ljust(32, b"\0") + MAGIC + bytes(12)
 
 
 def exchange(sock: socket.socket, peer: str, request: bytes, deadline: float) -> bytes:
@@ -76,6 +77,8 @@ def main() -> int:
     parser.add_argument("--image", required=True)
     parser.add_argument("--phy", type=int, choices=range(31), default=0)
     parser.add_argument("--width", type=int, choices=(8, 16), default=8)
+    parser.add_argument("--cell-size", type=int, choices=range(53, 65),
+                        help="the physical cell size the boot parameters name (default 53/54)")
     parser.add_argument("--timeout", type=positive_float, default=60)
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
@@ -109,7 +112,8 @@ def main() -> int:
             count = refused = 0
             for offset in range(0, len(table), 32):
                 refused += send(sock, args.peer, args.phy,
-                                cell(table[offset:offset + 32], args.width), deadline)
+                                cell(table[offset:offset + 32], args.width, args.cell_size),
+                                deadline)
                 count += 1
         report = {"cells": count, "table_bytes": count * 32,
                   "entry": image.entry, "refused": refused}

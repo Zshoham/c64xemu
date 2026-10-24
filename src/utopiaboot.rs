@@ -36,8 +36,10 @@
 //!   for a little-endian device; this is what the documented BEND setting gives a ROM that does
 //!   not swap bytes back].
 //! * Section 4.3.4 gives the buffer as "256 to 292 cells" in 16 KB, which is 16384 divided by
-//!   the packet size: 292 cells of 56 bytes for the 53- and 54-byte cells a cold boot uses.
-//!   The buffer size register therefore holds 292 * 56 = 16352 bytes, and the PDMA wraps there.
+//!   the packet size: 292 cells of 56 bytes for the 53- and 54-byte cells a cold boot uses, down
+//!   to 256 cells of 64 bytes for the longest cell the port takes. The buffer size register
+//!   therefore holds the whole packets that fit - 292 * 56 = 16352 bytes for a standard cell -
+//!   and the PDMA wraps there.
 //! * The channel's peripheral-side buffer size has no stated value for a constant-address
 //!   peripheral; the ROM writes one cell packet, the unit the peripheral hands over per event.
 //! * Table 26 gives the PHY ID the boot reads from CFGGP[4:0] and the PLL multiplier the mode
@@ -48,6 +50,27 @@
 //!   gated with that megamodule's, so the ROM makes sure LPSC1 is enabled along with the UTOPIA.
 //! * The table's entry point is resolved as every ROM boot resolves it: `BootStream::entry`
 //!   makes zero the default boot exit address.
+//!
+//! Table 26's boot parameter table is what an I2C boot hands over when a parameter block names
+//! UTOPIA (extended boot mode 0x104, Table 24); a cold boot builds the same table from the pins
+//! with Table 26's defaults. How each field reaches the hardware:
+//!
+//! * The physical cell size is the standard cell (53 bytes, 54 on the 16-bit bus) plus UCR's
+//!   RUDC user-defined header bytes, which SPRUEG2E section 2 puts in front of the header; a
+//!   size the port cannot receive (below the standard cell, above 64 bytes) stops the boot.
+//!   Its packet sets the PDMA's burst, the buffer's cell count and where each payload sits.
+//! * Bit 0 of the options clears UCR.MPHY for a single-PHY port, which then answers every
+//!   address; the slave ID is SLID either way.
+//! * Bit 1 of the options and the bus width field say the same thing twice. **[INFERENCE]**
+//!   The manual does not say which wins, so a table in which they disagree, or whose width is
+//!   neither 8 nor 16, stops the boot rather than guessing.
+//! * Bit 2 skips "port initialisation": **[INFERENCE]** the UCR write and nothing else. The
+//!   ROM's own receive path - the PSC, PDMA channel 8 into L1D and timer 0 - is how it finds
+//!   cells at all, so those are programmed regardless; the port is left as an earlier boot
+//!   configuration table, or the reset state, left it.
+//! * The core frequency is what the timer's period is counted from, "after PLL
+//!   configuration". A chained boot leaves PLL1 as the I2C boot set it; only the cold boot
+//!   programs the multiplier its mode names.
 
 use crate::boot::BootStream;
 use crate::memory::{L1DCFG, L1PCFG, L2CFG};
@@ -93,6 +116,15 @@ const PLL1_PLLM: u32 = 0x029a_0110;
 const L1P_CACHE_32K: u32 = 4;
 const L1D_CACHE_16K: u32 = 3;
 const L2_CACHE_OFF: u32 = 0;
+
+/// What every C6472 ROM boot from mode 2 to 14 programs first (SPRUEC6G Tables 20 and 21): the
+/// cache settings, and PLL1's multiplier, whose register takes the multiplier minus one.
+pub(crate) fn initialise_c6472_rom_boot(bus: &mut CoreBus<'_>, pll_multiplier: u32) {
+    bus.write32(L1PCFG, L1P_CACHE_32K);
+    bus.write32(L1DCFG, L1D_CACHE_16K);
+    bus.write32(L2CFG, L2_CACHE_OFF);
+    bus.write32(PLL1_PLLM, pll_multiplier - 1);
+}
 
 /// UCR (SPRUEG2E Table 19). The ROM configures the receive side only: the master drives the
 /// transmit interface's address and clock, and nothing in this boot writes it.
@@ -141,14 +173,16 @@ const TCR_SINT_CORE0: u32 = 0 << 24;
 const TCR_PSIZ_32: u32 = 2 << 22;
 const TCR_SSIZ_32: u32 = 2 << 20;
 
-/// The cell packet a cold boot receives: the 53- or 54-byte wire cell padded in front to 56
-/// bytes, 14 words (SPRUEG2E section 2), and how many of them fit in 16 KB of core 0's L1D
-/// (section 4.3.4 says 256 to 292).
-const PACKET_WORDS: usize = 14;
-const PACKET_BYTES: u32 = 4 * PACKET_WORDS as u32;
-const CELLS: u32 = 16 * 1024 / PACKET_BYTES;
-/// The bytes the PDMA fills before it wraps.
-const BUFFER_BYTES: u32 = CELLS * PACKET_BYTES;
+/// The cells the port receives: the standard cell, 53 bytes or 54 on the 16-bit bus, and up to
+/// 64 with RUDC's user-defined header bytes in front (SPRUEG2E sections 2 and 10, SPRUE48 Table
+/// 7). Each lands as a packet padded in front to whole words, so 14 to 16 of them.
+const NARROW_CELL_BYTES: u32 = 53;
+const WIDE_CELL_BYTES: u32 = 54;
+const LONGEST_CELL_BYTES: u32 = 64;
+const UCR_RUDC_SHIFT: u32 = 2;
+const MAX_PACKET_WORDS: usize = 16;
+/// The 16 KB of core 0's L1D the PDMA fills (section 4.3.4).
+const BUFFER_SPACE: u32 = 16 * 1024;
 
 /// Core 0's L1D, as the PDMA (a switch master) addresses it and as core 0 does (SPRS612G
 /// Table 2-2).
@@ -166,10 +200,10 @@ const TIMER_TGCR: u32 = TIMER0 + 0x24;
 /// the half counts continuously.
 const TGCR_LO_UNCHAINED: u32 = (1 << 2) | 1;
 const TCR_ENAMODE_LO_CONTINUOUS: u32 = 2 << 6;
-/// The timer's input clock is the CPU clock divided by six (SPRS612G section 7.16), and the
-/// boot parameter table's default core frequency is 500 MHz (SPRUEC6G Table 26).
+/// The timer's input clock is the CPU clock divided by six (SPRS612G section 7.16).
 const TIMER_CLOCK_DIVIDER: u32 = 6;
-const CORE_MHZ: u32 = 500;
+/// Table 26's default core frequency, which a cold boot counts the timer from.
+const DEFAULT_CORE_MHZ: u32 = 500;
 
 /// EVTFLAG0 and EVTCLR0, and the two events the ROM sleeps on: TINTL, and the UTOPIA PDMA's
 /// interrupt, system event 30 in core 0's interrupt controller (SINT 0).
@@ -185,6 +219,127 @@ const TABLE_BYTES: usize = 32;
 const TABLE_WORDS: usize = TABLE_BYTES / 4;
 const PAYLOAD_WORDS: usize = 48 / 4;
 const MAGIC: u32 = 0x5449_2164;
+
+/// Table 26's fields, as offsets into a boot parameter block whose first ten bytes are Table
+/// 23's common header. Every field is 16 bits, most significant byte first.
+const PARAM_OPTIONS: usize = 10;
+const PARAM_CELL_SIZE: usize = 12;
+const PARAM_BUS_WIDTH: usize = 14;
+const PARAM_SLAVE_ID: usize = 16;
+const PARAM_CORE_MHZ: usize = 18;
+const PARAM_BYTES: usize = 20;
+const OPTION_SINGLE_PHY: u16 = 1 << 0;
+const OPTION_WIDE: u16 = 1 << 1;
+const OPTION_SKIP_PORT_INIT: u16 = 1 << 2;
+
+/// SPRUEC6G Table 26, the UTOPIA boot parameter table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Parameters {
+    /// Options bit 0: a single-PHY port rather than the default multi-PHY one.
+    pub single_phy: bool,
+    /// A 16-bit bus rather than an 8-bit one.
+    pub wide: bool,
+    /// Options bit 2: leave the port as it is instead of initialising it.
+    pub skip_port_init: bool,
+    /// The physical cell size in bytes.
+    pub cell_bytes: u32,
+    /// The PHY address the port answers in multi-PHY mode.
+    pub slave_id: u8,
+    /// The core frequency after PLL configuration, which the timer's period is counted from.
+    pub core_mhz: u32,
+}
+
+impl Parameters {
+    /// Table 26's defaults, as a cold boot takes them from the pins: BOOTMODE[3:0] names the bus
+    /// width and CFGGP[4:0] the slave ID (Table 22).
+    pub(crate) fn cold(mode: u8, phy: u8) -> Self {
+        debug_assert!(is_boot_mode(mode), "not a UTOPIA boot mode");
+        let wide = matches!(mode, 7 | 8);
+        Self {
+            single_phy: false,
+            wide,
+            skip_port_init: false,
+            cell_bytes: standard_cell_bytes(wide),
+            slave_id: phy & 0x1f,
+            core_mhz: DEFAULT_CORE_MHZ,
+        }
+    }
+
+    /// The table as a boot parameter block carries it. A field the port cannot be set up from
+    /// stops the boot with the reason.
+    pub(crate) fn from_block(block: &[u8]) -> Result<Self, &'static str> {
+        if block.len() < PARAM_BYTES {
+            return Err("UTOPIA boot parameter block is shorter than Table 26");
+        }
+        let field = |offset: usize| u16::from_be_bytes([block[offset], block[offset + 1]]);
+        let options = field(PARAM_OPTIONS);
+        let wide = options & OPTION_WIDE != 0;
+        match (field(PARAM_BUS_WIDTH), wide) {
+            (8, false) | (16, true) => {}
+            (8 | 16, _) => {
+                return Err(
+                    "UTOPIA boot parameters name one bus width in the options and another \
+                            in the bus width field",
+                )
+            }
+            _ => return Err("UTOPIA boot parameters name a bus width other than 8 or 16 bits"),
+        }
+        let cell_bytes = u32::from(field(PARAM_CELL_SIZE));
+        if !(standard_cell_bytes(wide)..=LONGEST_CELL_BYTES).contains(&cell_bytes) {
+            return Err("UTOPIA boot cell size is outside what the port receives on this bus");
+        }
+        let slave_id = field(PARAM_SLAVE_ID);
+        if slave_id > 0x1f {
+            return Err("UTOPIA boot slave ID does not fit the five-bit PHY address");
+        }
+        let core_mhz = u32::from(field(PARAM_CORE_MHZ));
+        if core_mhz == 0 {
+            return Err("UTOPIA boot core frequency is zero, so the timer has no period");
+        }
+        Ok(Self {
+            single_phy: options & OPTION_SINGLE_PHY != 0,
+            wide,
+            skip_port_init: options & OPTION_SKIP_PORT_INIT != 0,
+            cell_bytes,
+            slave_id: slave_id as u8,
+            core_mhz,
+        })
+    }
+
+    /// The words a cell occupies in the buffer: the wire cell padded in front to whole words.
+    fn packet_words(&self) -> usize {
+        self.cell_bytes.div_ceil(4) as usize
+    }
+
+    fn packet_bytes(&self) -> u32 {
+        4 * self.packet_words() as u32
+    }
+
+    /// How many packets fit in the 16 KB buffer: "256 to 292 cells" (section 4.3.4).
+    pub(crate) fn buffer_cells(&self) -> u32 {
+        BUFFER_SPACE / self.packet_bytes()
+    }
+
+    /// The user-defined header bytes in front of the standard cell, UCR.RUDC.
+    fn user_defined_bytes(&self) -> u32 {
+        self.cell_bytes - standard_cell_bytes(self.wide)
+    }
+
+    /// Timer 0's period register: the timer clocks in 100 us (50 us on the 16-bit bus) less
+    /// one, because the counter restarts from zero the clock after it matches (SPRU968 Table 12).
+    fn timer_period(&self) -> u32 {
+        let microseconds = if self.wide { 50 } else { 100 };
+        self.core_mhz * microseconds / TIMER_CLOCK_DIVIDER - 1
+    }
+}
+
+fn standard_cell_bytes(wide: bool) -> u32 {
+    if wide {
+        WIDE_CELL_BYTES
+    } else {
+        NARROW_CELL_BYTES
+    }
+}
 
 /// What the boot has done so far, for a front end to report.
 #[derive(Clone, Default, Debug, PartialEq, Eq)]
@@ -215,14 +370,12 @@ enum Phase {
 }
 
 pub(crate) struct UtopiaBoot {
-    /// Bus width 16 rather than 8, as BOOTMODE 7 and 8 strap it (Table 26's default).
-    wide: bool,
-    /// The PHY ID from CFGGP[4:0], which is the default slave ID (Table 26).
-    slave_id: u8,
+    parameters: Parameters,
     /// The byte order the ROM reads its buffer in.
     endian: Endian,
-    /// The PLL1 multiplier BOOTMODE selects: x10 for modes 5 and 7, x20 for 6 and 8.
-    pll_multiplier: u32,
+    /// The PLL1 multiplier a cold boot's BOOTMODE selects: x10 for modes 5 and 7, x20 for 6 and
+    /// 8. A boot an I2C boot handed over to leaves PLL1 as that boot set it.
+    pll_multiplier: Option<u32>,
     phase: Phase,
     stream: BootStream,
     /// The next cell packet the ROM reads out of the circular buffer.
@@ -233,12 +386,21 @@ pub(crate) struct UtopiaBoot {
 impl UtopiaBoot {
     /// The boot as the pins strap it: BOOTMODE[3:0] picks the port width and the PLL
     /// multiplier, and CFGGP[4:0] is the PHY ID the port answers to (SPRUEC6G Table 22).
-    pub(crate) fn new(mode: u8, phy: u8, endian: Endian) -> Self {
-        debug_assert!(is_boot_mode(mode), "not a UTOPIA boot mode");
+    pub(crate) fn cold(mode: u8, phy: u8, endian: Endian) -> Self {
+        let multiplier = if matches!(mode, 5 | 7) { 10 } else { 20 };
+        Self::new(Parameters::cold(mode, phy), Some(multiplier), endian)
+    }
+
+    /// The boot an I2C boot hands over to, with the parameter table it read (Table 24's
+    /// extended boot mode 0x104).
+    pub(crate) fn chained(parameters: Parameters, endian: Endian) -> Self {
+        Self::new(parameters, None, endian)
+    }
+
+    fn new(parameters: Parameters, pll_multiplier: Option<u32>, endian: Endian) -> Self {
         Self {
-            wide: matches!(mode, 7 | 8),
-            slave_id: phy & 0x1f,
-            pll_multiplier: if matches!(mode, 5 | 7) { 10 } else { 20 },
+            parameters,
+            pll_multiplier,
             phase: Phase::PowerUp { requested: false },
             stream: BootStream::new(endian),
             endian,
@@ -251,9 +413,9 @@ impl UtopiaBoot {
         self.progress.clone()
     }
 
-    /// Whether the pins strapped a 16-bit port.
+    /// Whether the boot runs a 16-bit port.
     pub(crate) fn is_wide(&self) -> bool {
-        self.wide
+        self.parameters.wide
     }
 
     /// One cycle of the ROM's boot loop. Returns the entry point once the boot table has ended,
@@ -299,14 +461,15 @@ impl UtopiaBoot {
     /// SPRUEG2E section 13 gives for a UTOPIA slave: the PDMA channel first, then the port's
     /// registers, and the receiver is taken out of reset last.
     fn configure(&mut self, bus: &mut CoreBus<'_>) {
-        // Table 21: the cache settings of every ROM boot but no-boot and HPI.
-        bus.write32(L1PCFG, L1P_CACHE_32K);
-        bus.write32(L1DCFG, L1D_CACHE_16K);
-        bus.write32(L2CFG, L2_CACHE_OFF);
-        bus.write32(PLL1_PLLM, self.pll_multiplier - 1);
+        let parameters = self.parameters;
+        if let Some(multiplier) = self.pll_multiplier {
+            // The multiplier the mode names. A chained boot's I2C boot has already done this.
+            initialise_c6472_rom_boot(bus, multiplier);
+        }
 
         // PDMA channel 8: every cell goes to a circular buffer in L1D, a cell packet per event.
-        let burst = PACKET_WORDS as u32 - 1;
+        let burst = parameters.packet_words() as u32 - 1;
+        let packet = parameters.packet_bytes();
         bus.write32(
             PDMA_PCR1,
             PCR_PE_EVENT_ID
@@ -320,33 +483,38 @@ impl UtopiaBoot {
         );
         bus.write32(PDMA_RXC0 + PROXY_SAR, L1D_GLOBAL);
         bus.write32(PDMA_RXC0 + PROXY_PAR, RECEIVE_QUEUE_PORT);
-        bus.write32(PDMA_RXC0 + PROXY_BSR, (PACKET_BYTES << 16) | BUFFER_BYTES);
+        bus.write32(
+            PDMA_RXC0 + PROXY_BSR,
+            (packet << 16) | (parameters.buffer_cells() * packet),
+        );
         bus.write32(
             PDMA_RXC0 + PROXY_TCR,
             TCR_STRT | TCR_IMOD_HALF_AND_END | TCR_IE | TCR_SINT_CORE0 | TCR_PSIZ_32 | TCR_SSIZ_32,
         );
         bus.write32(PDMA_GCSR, GCSR_STRT);
 
-        // The port: slave, multi-PHY at the PHY ID, big-endian cell assembly and the width the
-        // mode names, with the standard cell (no user-defined header bytes).
-        let mut control = UCR_BEND | (u32::from(self.slave_id) << UCR_SLID_SHIFT) | UCR_MPHY;
-        if self.wide {
-            control |= UCR_U16M;
+        // The port: slave, big-endian cell assembly at the slave ID, multi-PHY unless the
+        // options ask for single-PHY, the bus width, and the user-defined header bytes that make
+        // the physical cell size.
+        if !parameters.skip_port_init {
+            let mut control = UCR_BEND
+                | (u32::from(parameters.slave_id) << UCR_SLID_SHIFT)
+                | (parameters.user_defined_bytes() << UCR_RUDC_SHIFT);
+            if !parameters.single_phy {
+                control |= UCR_MPHY;
+            }
+            if parameters.wide {
+                control |= UCR_U16M;
+            }
+            bus.write32(UCR, control);
+            bus.write32(UCR, control | UCR_UREN);
         }
-        bus.write32(UCR, control);
-        bus.write32(UCR, control | UCR_UREN);
 
         // Local timer 0: a 32-bit periodic timer that interrupts every 100 us (50 us in 16-bit
-        // mode), so a cell that arrived without crossing a buffer mark is still found. The
-        // period register holds the CPU/6 clocks in that time less one, because the counter
-        // restarts from zero the clock after it matches (SPRU968 Table 12).
-        let microseconds = if self.wide { 50 } else { 100 };
+        // mode), so a cell that arrived without crossing a buffer mark is still found.
         bus.write32(TIMER_TGCR, 0);
         bus.write32(TIMER_CNTLO, 0);
-        bus.write32(
-            TIMER_PRDLO,
-            CORE_MHZ * microseconds / TIMER_CLOCK_DIVIDER - 1,
-        );
+        bus.write32(TIMER_PRDLO, parameters.timer_period());
         bus.write32(TIMER_TCR, TCR_ENAMODE_LO_CONTINUOUS);
         bus.write32(TIMER_TGCR, TGCR_LO_UNCHAINED);
         // Interrupts the port or the timer raised on the way up are not wake-ups.
@@ -370,16 +538,19 @@ impl UtopiaBoot {
     /// position, which the channel's switch address register reads back as (SPRUEG2E section 5:
     /// reading a channel's proxy block loads it from the live context).
     fn drain(&mut self, bus: &mut CoreBus<'_>) -> Option<u32> {
+        let packet = self.parameters.packet_bytes();
+        let cells = self.parameters.buffer_cells();
         let written = bus.read32(PDMA_RXC0 + PROXY_SAR).wrapping_sub(L1D_GLOBAL);
-        let write_cell = (written / PACKET_BYTES) % CELLS;
+        let write_cell = (written / packet) % cells;
+        let mut words = [0u32; MAX_PACKET_WORDS];
+        let words = &mut words[..self.parameters.packet_words()];
         while self.next_cell != write_cell {
-            let base = L1D_LOCAL + self.next_cell * PACKET_BYTES;
-            let mut words = [0u32; PACKET_WORDS];
+            let base = L1D_LOCAL + self.next_cell * packet;
             for (index, word) in words.iter_mut().enumerate() {
                 *word = bus.read32(base + 4 * index as u32);
             }
-            self.next_cell = (self.next_cell + 1) % CELLS;
-            if let Some(entry) = self.process(bus, &words) {
+            self.next_cell = (self.next_cell + 1) % cells;
+            if let Some(entry) = self.process(bus, words) {
                 return Some(self.finish(bus, entry));
             }
             if matches!(self.phase, Phase::Failed) {
@@ -390,7 +561,7 @@ impl UtopiaBoot {
     }
 
     /// Validate one cell and hand its table bytes to boot-table processing.
-    fn process(&mut self, bus: &mut CoreBus<'_>, words: &[u32; PACKET_WORDS]) -> Option<u32> {
+    fn process(&mut self, bus: &mut CoreBus<'_>, words: &[u32]) -> Option<u32> {
         let Some(table) = table_bytes(words, self.endian) else {
             self.progress.discarded += 1;
             return None;
@@ -433,9 +604,9 @@ impl UtopiaBoot {
 /// The payload is the last twelve words of the packet. It is searched from its end towards its
 /// start for the magic word. The eight preceding words, still inside the payload, are the table
 /// bytes, in the device's byte order as they sit in memory.
-fn table_bytes(words: &[u32; PACKET_WORDS], endian: Endian) -> Option<[u8; TABLE_BYTES]> {
-    let payload = PACKET_WORDS - PAYLOAD_WORDS;
-    let magic = (payload + TABLE_WORDS..PACKET_WORDS)
+fn table_bytes(words: &[u32], endian: Endian) -> Option<[u8; TABLE_BYTES]> {
+    let payload = words.len() - PAYLOAD_WORDS;
+    let magic = (payload + TABLE_WORDS..words.len())
         .rev()
         .find(|&index| words[index] == MAGIC)?;
     let mut table = [0u8; TABLE_BYTES];
@@ -455,8 +626,9 @@ fn table_bytes(words: &[u32; PACKET_WORDS], endian: Endian) -> Option<[u8; TABLE
 mod tests {
     use super::*;
 
-    fn packet(words: &[(usize, u32)]) -> [u32; PACKET_WORDS] {
-        let mut packet = [0u32; PACKET_WORDS];
+    /// A standard cell's packet, 14 words.
+    fn packet(words: &[(usize, u32)]) -> [u32; 14] {
+        let mut packet = [0u32; 14];
         for &(index, value) in words {
             packet[index] = value;
         }
@@ -469,9 +641,9 @@ mod tests {
             [(5, false, 10), (6, false, 20), (7, true, 10), (8, true, 20)]
         {
             assert!(is_boot_mode(mode));
-            let boot = UtopiaBoot::new(mode, 3, Endian::Little);
+            let boot = UtopiaBoot::cold(mode, 3, Endian::Little);
             assert_eq!(boot.is_wide(), wide, "mode {mode}");
-            assert_eq!(boot.pll_multiplier, multiplier, "mode {mode}");
+            assert_eq!(boot.pll_multiplier, Some(multiplier), "mode {mode}");
         }
         for mode in [0, 1, 2, 4, 9, 10, 15] {
             assert!(!is_boot_mode(mode), "mode {mode}");
@@ -484,7 +656,7 @@ mod tests {
         let mut words = vec![0x1111_1111, 0x2222_2222];
         words.extend(&table);
         words.extend([MAGIC, 0xffff_ffff, 0xeeee_eeee, 0xdddd_dddd]);
-        let words: [u32; PACKET_WORDS] = words.try_into().unwrap();
+        let words: [u32; 14] = words.try_into().unwrap();
         for (endian, bytes) in [
             (Endian::Little, u32::to_le_bytes as fn(u32) -> [u8; 4]),
             (Endian::Big, u32::to_be_bytes),
@@ -523,5 +695,86 @@ mod tests {
         assert_eq!(find(&[(9, MAGIC)]), None);
         // The earliest position that leaves a whole table inside the payload.
         assert!(find(&[(10, MAGIC)]).is_some());
+    }
+
+    /// A Table 26 block: the ten-byte common header, then the fields big-endian.
+    fn block(options: u16, cell: u16, width: u16, slave: u16, mhz: u16) -> Vec<u8> {
+        let mut block = vec![0u8; PARAM_BYTES];
+        for (offset, value) in [
+            (PARAM_OPTIONS, options),
+            (PARAM_CELL_SIZE, cell),
+            (PARAM_BUS_WIDTH, width),
+            (PARAM_SLAVE_ID, slave),
+            (PARAM_CORE_MHZ, mhz),
+        ] {
+            block[offset..offset + 2].copy_from_slice(&value.to_be_bytes());
+        }
+        block
+    }
+
+    /// "The actual number of cells which can be buffered varies by the cell size parameter in
+    /// the boot parameter table, and ranges from 256 to 292 cells" (section 4.3.4).
+    #[test]
+    fn the_cell_size_sets_how_many_cells_the_buffer_holds() {
+        for mode in 5..=8 {
+            let cold = Parameters::cold(mode, 3);
+            assert_eq!(cold.buffer_cells(), 292, "mode {mode}");
+            assert_eq!(cold.user_defined_bytes(), 0, "mode {mode}");
+            assert_eq!(cold.core_mhz, 500);
+        }
+        for (options, width, cell, cells, extra) in [
+            (0, 8, 53, 292, 0),
+            (0, 8, 57, 273, 4),
+            (0, 8, 64, 256, 11),
+            (OPTION_WIDE, 16, 54, 292, 0),
+            (OPTION_WIDE, 16, 60, 273, 6),
+            (OPTION_WIDE, 16, 64, 256, 10),
+        ] {
+            let parameters = Parameters::from_block(&block(options, cell, width, 7, 500)).unwrap();
+            assert_eq!(
+                parameters.buffer_cells(),
+                cells,
+                "{width}-bit {cell}-byte cell"
+            );
+            assert_eq!(
+                parameters.user_defined_bytes(),
+                extra,
+                "{width}-bit {cell}-byte cell"
+            );
+        }
+    }
+
+    #[test]
+    fn the_options_and_core_frequency_reach_the_parameters() {
+        let options = OPTION_SINGLE_PHY | OPTION_WIDE | OPTION_SKIP_PORT_INIT;
+        let parameters = Parameters::from_block(&block(options, 54, 16, 0x1e, 250)).unwrap();
+        assert!(parameters.single_phy && parameters.wide && parameters.skip_port_init);
+        assert_eq!(parameters.slave_id, 0x1e);
+        // 50 us of a 250 MHz core's CPU/6 timer clocks, less one.
+        assert_eq!(parameters.timer_period(), 2082);
+        assert_eq!(Parameters::cold(5, 0).timer_period(), 8332);
+    }
+
+    #[test]
+    fn a_table_the_port_cannot_be_set_up_from_stops_the_boot() {
+        for (block, why) in [
+            (block(0, 53, 16, 0, 500), "options say 8 bits, the field 16"),
+            (
+                block(OPTION_WIDE, 54, 8, 0, 500),
+                "options say 16 bits, the field 8",
+            ),
+            (block(0, 53, 32, 0, 500), "no 32-bit UTOPIA"),
+            (
+                block(OPTION_WIDE, 53, 16, 0, 500),
+                "shorter than the wide standard cell",
+            ),
+            (block(0, 52, 8, 0, 500), "shorter than the standard cell"),
+            (block(0, 65, 8, 0, 500), "longer than the port takes"),
+            (block(0, 53, 8, 0x20, 500), "slave ID beyond five bits"),
+            (block(0, 53, 8, 0, 0), "no core frequency"),
+            (vec![0; PARAM_BYTES - 1], "a block that ends early"),
+        ] {
+            assert!(Parameters::from_block(&block).is_err(), "{why}");
+        }
     }
 }

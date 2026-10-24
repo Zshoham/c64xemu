@@ -192,16 +192,21 @@ table addressed to each core, and sends it. `--mac-id` fuses the address the dev
 by, `--boot-udp-port` moves the port it listens on, and `--boot-mode 10` puts the wire on the
 second MAC, which is where the backend's frames then arrive.
 
-**Booting off an I2C EEPROM.** The ROM's master I2C boot (SPRUEC6G section 2.3.4), which is how a
-board with a boot EEPROM comes up: `c64xemu run IMAGE --boot-mode 5 --i2c-eeprom FILE` loads
-nothing from the ELF either. The file is the EEPROM's contents, put on the bus at the 0x50 the
-bootloader requires, and the boot reads it by driving the modelled I2C master's own registers -
+**Booting off an I2C EEPROM.** The ROM's master I2C boot (SPRUEC6G sections 2.3.4 and 4.3.3), which
+is how a board with a boot EEPROM comes up: `c64xemu run IMAGE --boot-mode 5 --i2c-eeprom FILE` on
+the C6455, `--device c6472 --boot-mode 2` (EEPROM at 0x50) or `3` (0x51) on the C6472, loads
+nothing from the ELF either. The file is the EEPROM's contents, put on the bus at the address
+the mode names, and the boot reads it by driving the modelled I2C master's own registers -
 two internal address bytes as a master transmit, then a repeated START and a master receive - so
 the sequence exercises ICSAR, ICCNT, ICMDR, ICDXR and ICDRR the way firmware does. Everything on
 the EEPROM is blocked: a 16-bit size counting the four-byte header and a 16-bit ones-complement
 checksum, which is verified and re-read once on failure. The boot parameter block at
-`0x80 * --boot-param-index` names what follows, and for a boot table the sections are streamed
-block by block into memory before core 0 is branched to the entry point.
+`0x80 * --boot-param-index` names what follows: a boot table, whose sections are streamed block
+by block into memory before core 0 is branched to the entry point, or a boot configuration table
+applied before the next parameter block. A C6472 parameter block can instead name UTOPIA, and
+the boot hands over to the UTOPIA boot with that block's single-/multi-PHY, bus width,
+port-initialisation, cell size and core frequency fields. `tests/tools/i2c_eeprom.py` builds a
+C6472 EEPROM from an ELF.
 
 **Six cores on one device.** `--device c6472` is a TMS320C6472: six C64x+ megamodules, each with
 its own 32 KB L1P, 32 KB L1D and 608 KB L2 SRAM, its own interrupt controller, memory protection
@@ -389,10 +394,11 @@ target/release/c64xemu run image.out \
 ```
 
 The shared machine options are `--device c6455|c6472` (default `c6455`), `--boot-mode` (the
-BOOTMODE pins: 0 starts every core, 5 is the master I2C boot, 9 and 10 boot the C6472 over MAC
-port 0 or 1, any other mode starts core 0 and leaves it to release the rest), `--mac-id` and
-`--boot-udp-port` for that Ethernet boot, `--i2c-eeprom FILE` and `--boot-param-index` for the
-I2C one, `--stop-pc` and `--break` (both take an address or a symbol),
+BOOTMODE pins: 0 starts every core, 5 is the C6455's master I2C boot and 2 or 3 the C6472's, 9
+and 10 boot the C6472 over MAC port 0 or 1, any other mode starts core 0 and leaves it to release
+the rest), `--mac-id` and `--boot-udp-port` for that Ethernet boot, `--i2c-eeprom FILE`,
+`--boot-param-index` and `--i2c-pll-x19` for the I2C one, `--stop-pc` and `--break` (both take
+an address or a symbol),
 `--boot-table FILE:ADDR` and `--boot-config FILE:ADDR`, `--pcap-in`/`--pcap-out`,
 `--net-unix`/`--net-peer`/`--net-poll`/`--net-port` for the live Ethernet backend,
 `--hpi-unix`/`--hpi-peer`/`--hpi-poll` for the host port, the `--trace*` family,
@@ -403,8 +409,9 @@ through the same configuration registers firmware writes, leaving the MAR bits a
 as a whole-run budget, `--state-out`, `--dump ADDR:LEN`, `--pc-trail N` and `--trap-oob`. A run
 that booted over Ethernet also reports an `ethernet_boot` object in `--state-out`: the frames the
 boot accepted and discarded, the boot-table bytes it processed, and the entry point it branched to.
-A run that booted off an EEPROM reports an `i2c_boot` object the same way: the parameter and table
-blocks it read, the boot-table bytes it processed, any checksum failure, and the entry point.
+A run that booted off an EEPROM reports an `i2c_boot` object the same way: the parameter,
+configuration and table blocks it read, the boot-table bytes it processed, any checksum failure,
+and the entry point; a C6472 boot handed over to UTOPIA reports `utopia_boot` as well.
 
 On a multicore device every core out of reset runs each cycle and the shared peripherals advance
 once, a breakpoint stops the device whichever core reaches it, and an image whose segments land

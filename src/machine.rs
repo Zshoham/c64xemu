@@ -55,19 +55,23 @@ pub struct MachineArgs {
     /// Which device to emulate: the single-core c6455, or the six-core c6472
     #[arg(long, default_value = "c6455", value_name = "NAME")]
     pub device: String,
-    /// The BOOTMODE pins: mode 1 boots through --hpi-unix on either device; C6455 mode 5
-    /// reads --i2c-eeprom. C6472 modes 5-8 boot through --utopia-unix, and modes 9 and 10
-    /// over MAC port 0 or 1. Mode 0 starts every core; other C6472 modes release them by software
+    /// The BOOTMODE pins: mode 1 boots through --hpi-unix on either device; C6455 mode 5 and
+    /// C6472 modes 2 and 3 read --i2c-eeprom. C6472 modes 5-8 boot through --utopia-unix, and
+    /// modes 9 and 10 over MAC port 0 or 1. Mode 0 starts every core; other C6472 modes release
+    /// them by software
     #[arg(long, default_value_t = 0, value_name = "MODE")]
     pub boot_mode: u8,
-    /// The serial EEPROM image on the I2C bus, which boot mode 5 reads its boot parameters and
-    /// its boot table out of
+    /// The serial EEPROM image on the I2C bus, which the master I2C boot (C6455 mode 5, C6472
+    /// mode 2 at 0x50 or 3 at 0x51) reads its boot parameters and its boot table out of
     #[arg(long, value_name = "FILE")]
     pub i2c_eeprom: Option<PathBuf>,
-    /// Which of the eight boot parameter blocks an I2C boot loads: the configuration pins
-    /// select it, and the block sits at 0x80 times this index
+    /// Which boot parameter block an I2C boot loads: the configuration pins select it (CFGGP[2:0]
+    /// on the C6455, CFG[3:0] on the C6472), and the block sits at 0x80 times this index
     #[arg(long, default_value_t = 0, value_name = "N")]
     pub boot_param_index: u32,
+    /// Strap CFG[4] high on a C6472 I2C boot, which sets PLL1 to x19 rather than x9
+    #[arg(long)]
+    pub i2c_pll_x19: bool,
     /// The Ethernet address fused into the MAC ID words, which an Ethernet boot names itself by
     #[arg(long, default_value = "02:00:00:00:64:72", value_parser = parse_mac, value_name = "MAC")]
     pub mac_id: [u8; 6],
@@ -241,10 +245,11 @@ pub struct Machine {
     /// The address fused into the MAC ID words, and the UDP port an Ethernet boot listens on.
     mac_id: [u8; 6],
     boot_udp_port: u16,
-    /// The serial EEPROM a board would have put on the I2C bus, and which of the eight boot
-    /// parameter blocks the configuration pins select. Held so a reload straps the same board.
+    /// The serial EEPROM a board would have put on the I2C bus, and the configuration pins the
+    /// I2C boot reads its parameter block index (and on the C6472, its PLL) from. Held so a
+    /// reload straps the same board.
     i2c_eeprom: Option<Vec<u8>>,
-    boot_param_index: u32,
+    i2c_cfggp: u8,
 }
 
 /// One member of the stop-condition set `resume` evaluates on every cycle. The machine-native
@@ -360,16 +365,42 @@ impl Machine {
             }
             None => None,
         };
-        if !profile.has_boot_controller
-            && args.boot_mode == crate::i2cboot::BOOTMODE_I2C_EEPROM
-            && i2c_eeprom.is_none()
-        {
+        let i2c_boot =
+            crate::i2cboot::eeprom_address(profile.has_boot_controller, args.boot_mode).is_some();
+        if i2c_boot && i2c_eeprom.is_none() {
             return Err(format!(
-                "boot mode {} is the ROM's I2C EEPROM boot; give it the EEPROM with \
-                 --i2c-eeprom",
-                crate::i2cboot::BOOTMODE_I2C_EEPROM
+                "boot mode {} is the {}'s master I2C boot; give it the EEPROM with --i2c-eeprom",
+                args.boot_mode, profile.name
             ));
         }
+        if !i2c_boot && i2c_eeprom.is_some() {
+            return Err(format!(
+                "--i2c-eeprom is read by the master I2C boot, which is {} on the {}",
+                if profile.has_boot_controller {
+                    "--boot-mode 2 (EEPROM at 0x50) or 3 (0x51)"
+                } else {
+                    "--boot-mode 5"
+                },
+                profile.name
+            ));
+        }
+        // The configuration pins: CFGGP[2:0] are the C6455's index, CFG[3:0] the C6472's and
+        // CFG[4] its PLL select (SPRUEC6G section 2.3.4.2 and Table 22).
+        let index_limit = if profile.has_boot_controller { 16 } else { 8 };
+        if args.boot_param_index >= index_limit {
+            return Err(format!(
+                "--boot-param-index {} is beyond the {} parameter blocks the {}'s pins select",
+                args.boot_param_index, index_limit, profile.name
+            ));
+        }
+        if args.i2c_pll_x19 && !(i2c_boot && profile.has_boot_controller) {
+            return Err(
+                "--i2c-pll-x19 straps CFG[4] for a C6472 I2C boot (--device c6472 \
+                        --boot-mode 2 or 3); nothing else reads it"
+                    .into(),
+            );
+        }
+        let i2c_cfggp = args.boot_param_index as u8 | (u8::from(args.i2c_pll_x19) << 4);
         // A boot builds the memory image from the host, wire or bus, so the ELF supplies only
         // symbols (SPRS276M section 2.4, SPRUEC6G sections 2.3.4 and 4.3.5).
         let ethernet_boot = match ethernet_boot_port(profile, args.boot_mode) {
@@ -444,7 +475,7 @@ impl Machine {
             mac_id: args.mac_id,
             boot_udp_port: args.boot_udp_port,
             i2c_eeprom,
-            boot_param_index: args.boot_param_index,
+            i2c_cfggp,
         };
         if matches!(machine.load, Load::Wire) {
             // Two boot sources are one too many.
@@ -538,7 +569,7 @@ impl Machine {
             mac_id: [0; 6],
             boot_udp_port: 9,
             i2c_eeprom: None,
-            boot_param_index: 0,
+            i2c_cfggp: 0,
         }
     }
 
@@ -610,7 +641,8 @@ impl Machine {
         }
         if let Some(contents) = &self.i2c_eeprom {
             let contents = contents.clone();
-            self.device.begin_i2c_boot(self.boot_param_index, contents);
+            self.device
+                .begin_i2c_boot(self.boot_mode, self.i2c_cfggp, contents);
         }
         if let Some((table, address)) = &self.boot_config {
             // The configuration table runs before the boot table, which is the order the ROM
@@ -1296,6 +1328,7 @@ impl Machine {
             // read its table from one that stopped on a bad block.
             state["i2c_boot"] = json!({
                 "parameter_blocks": boot.parameter_blocks,
+                "config_blocks": boot.config_blocks,
                 "table_blocks": boot.table_blocks,
                 "table_bytes": boot.table_bytes,
                 "checksum_failures": boot.checksum_failures,

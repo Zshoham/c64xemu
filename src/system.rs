@@ -1224,6 +1224,10 @@ impl Fabric {
         self.shared.backing.endian()
     }
 
+    pub(crate) fn profile(&self) -> &'static DeviceProfile {
+        self.profile
+    }
+
     /// Which cores the boot controller is holding in reset, as a bitmask. A held core does not
     /// execute, but every one of its memories still answers (SPRUEC6G section 4.3.2).
     pub(crate) fn held_in_reset(&self, core: usize) -> bool {
@@ -2357,6 +2361,14 @@ impl Fabric {
     pub(crate) fn strap_utopia(&mut self, phy: u8, wide: bool) {
         if let Some(chip) = self.shared.chipcfg.as_mut() {
             chip.strap_utopia(phy, wide);
+        }
+    }
+
+    /// Strap CFGGP[4:0], the configuration pins a C6472 boot mode reads (SPRUEC6G Table 22).
+    /// A device without a chip-level register file has no such pins.
+    pub(crate) fn strap_cfggp(&mut self, value: u8) {
+        if let Some(chip) = self.shared.chipcfg.as_mut() {
+            chip.strap_cfggp(value);
         }
     }
 

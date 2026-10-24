@@ -155,14 +155,15 @@ mailbox: the cores' caches are not coherent with one another.
 
 ## I2C EEPROM boot
 
-`--boot-mode 5 --i2c-eeprom FILE` is the master I2C boot of SPRUEC6G Table 3 and §2.3.4: the way
-a board with a boot EEPROM comes up. The ELF loads nothing.
+`--boot-mode 5 --i2c-eeprom FILE` is the C6455's master I2C boot of SPRUEC6G Table 3 and §2.3.4:
+the way a board with a boot EEPROM comes up. On the C6472 it is `--device c6472 --boot-mode 2`
+(EEPROM at 0x50) or `3` (0x51), §4.3.3 and Table 22. The ELF loads nothing.
 
 The read sequence goes through the modelled I2C master's own registers — ICSAR, ICCNT, ICMDR,
 ICDXR and ICDRR are driven exactly as firmware drives them, two internal address bytes as a
 master transmit, then a repeated START and a master receive — and the EEPROM answers as a
 board's would. `src/i2c.rs` therefore models what §2.3.4 requires of the device: two-byte
-internal addressing, an auto-incrementing address counter, and slave address 0x50.
+internal addressing, an auto-incrementing address counter, and the slave address the mode names.
 
 Everything on the EEPROM is blocked, at most 128 bytes per block including a four-byte header:
 
@@ -176,10 +177,47 @@ Valid checksums are 0 and −0, and a checksum field of 0 disables the check. A 
 re-read once.
 
 The boot is two stages. First a boot parameter block: the blocks begin at EEPROM address 0 and
-each is 128 bytes, and the DSP picks one by CFGGP[2:0] in DEVSTAT — address = `0x80 * index`,
-which `--boot-param-index N` sets. Its options field says what follows: 0 another parameter
-table, 1 a boot table, 2 a boot configuration table. For a boot table the sections are streamed
-block by block into memory, and core 0 is then branched to the entry point.
+each is 128 bytes, and the DSP picks one by its configuration pins — CFGGP[2:0] on the C6455,
+CFG[3:0] on the C6472 — at address `0x80 * index`, which `--boot-param-index N` sets. Its options
+field says what follows: 0 another parameter table, 1 a boot table, 2 a boot configuration
+table. For a boot table the sections are streamed block by block into memory, and core 0 is
+then branched to the entry point. A configuration table's read/modify/write entries (§6.2.3)
+are applied as their blocks arrive; the boot then re-enters at the parameter block's next
+device address and reads another parameter block there. An entry that asks the ROM to call a
+function stops the boot.
+
+### The C6472's differences
+
+| | C6455 | C6472 |
+|---|---|---|
+| Modes | 5 | 2 (0x50), 3 (0x51) |
+| Parameter block index | CFGGP[2:0] | CFG[3:0] |
+| PLL1 | untouched | x9, or x19 with `--i2c-pll-x19` (CFG[4]) |
+| Caches | untouched | Table 21: 32 KB L1P, 16 KB L1D, no L2 cache |
+| Parameter block | Table 6 behind the 4-byte header | Table 25 behind Table 23's 10-byte header |
+
+The C6472 header adds an extended boot mode (Table 24) to every parameter block. 0x101 is the
+I2C boot itself and acts on the options as above; 0x104 hands the device to the UTOPIA boot,
+configured by the block's Table 26 fields (see [UTOPIA boot](#utopia-boot)). Any other mode
+stops the boot. Cores 1-5 stay held until the table releases them.
+
+Boot-table and configuration-table blocks keep the four-byte header: Table 23's header belongs to
+the parameter tables. TI's own C6472 tools say so: the ROM's `tiboot_c6472.h` and the C6472 EVM
+EEPROM build in TI's IBL (git.ti.com/keystone-rtos/ibl), whose `b2i2c` cuts the boot table into
+four-byte-header, 124-byte blocks behind `romparse` parameter tables. The same header masks the
+options' table type to bits 1:0 and gives bits 4:2 to the EEPROM type, which the boot ignores.
+**[INFERENCE]** The software PLL field is not applied; nothing in the manual gives it an effect
+on the C6472.
+
+`tests/tools/i2c_eeprom.py` lays out a C6472 EEPROM from an ELF: the selected parameter block,
+then the boot table in the device's byte order, or with `--utopia` a UTOPIA parameter block,
+and with `--config ADDR,SET,CLEAR` a configuration table in front of the next parameter block.
+
+```console
+$ python3 tests/tools/i2c_eeprom.py --image IMAGE.out --out eeprom.bin --index 5 --slave 0x51
+$ target/release/c64xemu run IMAGE.out --device c6472 --boot-mode 3 --boot-param-index 5 \
+    --i2c-pll-x19 --i2c-eeprom eeprom.bin --state-out /tmp/i2c-state.json
+```
 
 ## UTOPIA boot
 
@@ -228,9 +266,41 @@ more sections than any image, which is the one malformation the stream can recog
 core 0 held and reports an error. `--boot-table`, `--boot-config` and `--i2c-eeprom` cannot be
 combined with this boot source.
 
+### Parameters from an I2C EEPROM
+
+A C6472 I2C boot whose parameter block names extended boot mode 0x104 runs the same UTOPIA boot
+with that block's Table 26 fields instead of the cold-boot defaults:
+
+| Offset | Field | Effect | Cold-boot default |
+|---|---|---|---|
+| 10 bit 0 | single-PHY | clears UCR.MPHY: every address reaches the port | multi-PHY |
+| 10 bit 1, 14 | bus width | UCR.U16M; the two must agree and be 8 or 16 | from the mode |
+| 10 bit 2 | skip port initialisation | UCR is not written | initialise |
+| 12 | physical cell size | UCR.RUDC = size − 53 (8-bit) or − 54 (16-bit), up to 64 bytes | 53 / 54 |
+| 16 | slave ID | UCR.SLID | CFG[4:0] |
+| 18 | core frequency, MHz | timer 0's period | 500 |
+
+The cell size sets the packet — the cell padded in front to whole words, 14 to 16 of them — and
+with it the PDMA burst and the buffer: 16 KB holds 292 standard cells and 256 of 64 bytes, the
+"256 to 292 cells" of §4.3.4. The 48-byte payload is always the packet's last twelve words.
+
+**[INFERENCE]** Skipping port initialisation skips the UCR write and nothing else: the PSC, PDMA
+channel 8 and timer 0 are how the ROM finds cells at all, so they are still programmed. The port
+is left as reset or an earlier configuration table left it. A chained boot does not reprogram
+PLL1 or the caches; the I2C boot set both. A table whose fields the port cannot be set up from
+stops the boot with core 0 held.
+
+```console
+$ python3 tests/tools/i2c_eeprom.py --image IMAGE.out --out eeprom.bin --utopia \
+    --width 8 --cell-size 64 --slave-id 9 --core-mhz 250
+$ target/release/c64xemu run IMAGE.out --device c6472 --boot-mode 2 --i2c-eeprom eeprom.bin \
+    --utopia-unix /tmp/dsp-utopia.sock --state-out /tmp/utopia-state.json
+$ python3 tests/tools/utopia_boot.py --image IMAGE.out --width 8 --cell-size 64 --phy 9 \
+    --socket /tmp/atm-master.sock --peer /tmp/dsp-utopia.sock --json
+```
+
 The ATM master's socket protocol is in
-[Networking and host I/O](networking-and-host-io.md#the-utopia-atm-master). Cold-boot defaults
-are implemented; I2C-selected extended boot parameters are not. The receive PDMA's
+[Networking and host I/O](networking-and-host-io.md#the-utopia-atm-master). The receive PDMA's
 peripheral-bus address interpretation and unmodelled transfer modes are listed in
 [Peripherals](../internals/peripherals.md#utopia).
 

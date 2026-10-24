@@ -189,7 +189,7 @@ them until something releases them - see [The six-core device](../guide/multicor
 
 ```
 $ ./target/release/c64xemu run tests/firmware/bios_kernel/build/bios_kernel.out \
-    --device c6472 --boot-mode 2 --max-cycles 2000 --state-out /tmp/c6472b.json
+    --device c6472 --boot-mode 4 --max-cycles 2000 --state-out /tmp/c6472b.json
 c64xemu: cycle limit 2000 reached at PC 0x00812e98
 $ jq -c '.cores[] | {core, pc, cycles, held_in_reset}' /tmp/c6472b.json
 {"core":0,"pc":8466072,"cycles":2000,"held_in_reset":false}
@@ -448,7 +448,7 @@ Every file in `src/`.
 | `gpio.rs` | The general-purpose input/output peripheral and its edge detection |
 | `hpi.rs` | The host port interface, both sides of it |
 | `i2c.rs` | The I2C module, and the EEPROM a board puts on the bus |
-| `i2cboot.rs` | The ROM bootloader's I2C EEPROM boot mode |
+| `i2cboot.rs` | The ROM bootloader's I2C EEPROM boot mode, C6455 and C6472, and the C6472's handover to UTOPIA boot |
 | `idma.rs` | The megamodule IDMA channels |
 | `machine.rs` | The machine every front end drives: `MachineArgs`, the halt rule, the stop-condition set, the snapshot |
 | `main.rs` | The module list, the clap command tree, the SIGTERM handler, address parsing |
@@ -473,6 +473,6 @@ Every file in `src/`.
 | `ui.rs` | The browser dashboard: the HTTP server and the JSON it serves |
 | `ui.html` | The dashboard page itself, embedded in the binary at build time |
 | `utopia.rs` | The UTOPIA 2 ATM slave interface |
-| `utopiaboot.rs` | The C6472 ROM's UTOPIA cold boot through receive PDMA and timer wakeups |
+| `utopiaboot.rs` | The C6472 ROM's UTOPIA boot through receive PDMA and timer wakeups, from the pins or from an I2C boot's Table 26 parameters |
 | `view.rs` | The instruction view: unit, data path, cross path, predicate, operands as TI's tools print them, resource accounting, and the JSON serialization |
 | `writeback.rs` | The write-back queue: register writes, stores, control-register writes and saturation flags between the cycle they are scheduled and the cycle they land, and the order they land in |

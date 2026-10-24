@@ -123,15 +123,21 @@ impl ChipConfig {
         }
     }
 
-    /// Strap the pins a UTOPIA boot reads: the PHY ID on CFGGP[4:0], DEVSTAT bits 21:17
-    /// (Figure 3-3, SPRUEC6G Table 22), and the UTOPIA_EN pins, which "initialize at reset from
-    /// GP01/UTOPIA_EN" into DEVCTL bits 2:1 (SPRS612G Table 3-4): 01b powers the 8-bit port's
-    /// I/O and 11b the upper byte as well (the 11/01 columns of the pin multiplex table).
-    pub(crate) fn strap_utopia(&mut self, phy: u8, wide: bool) {
+    /// Strap CFGGP[4:0], DEVSTAT bits 21:17 (Figure 3-3), which each C6472 boot mode reads its
+    /// own way (SPRUEC6G Table 22).
+    pub(crate) fn strap_cfggp(&mut self, value: u8) {
         const CFGGP_SHIFT: u32 = 17;
         const CFGGP_MASK: u32 = 0x1f << CFGGP_SHIFT;
+        self.devstat = (self.devstat & !CFGGP_MASK) | (u32::from(value & 0x1f) << CFGGP_SHIFT);
+    }
+
+    /// Strap the pins a UTOPIA boot reads: the PHY ID on CFGGP[4:0] and the UTOPIA_EN pins,
+    /// which "initialize at reset from GP01/UTOPIA_EN" into DEVCTL bits 2:1 (SPRS612G Table
+    /// 3-4): 01b powers the 8-bit port's I/O and 11b the upper byte as well (the 11/01 columns
+    /// of the pin multiplex table).
+    pub(crate) fn strap_utopia(&mut self, phy: u8, wide: bool) {
         const UTOPIA_EN_SHIFT: u32 = 1;
-        self.devstat = (self.devstat & !CFGGP_MASK) | (u32::from(phy & 0x1f) << CFGGP_SHIFT);
+        self.strap_cfggp(phy);
         let enable = if wide { 0b11 } else { 0b01 };
         self.devctl = (self.devctl & !(0b11 << UTOPIA_EN_SHIFT)) | (enable << UTOPIA_EN_SHIFT);
     }

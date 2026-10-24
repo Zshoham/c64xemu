@@ -330,9 +330,9 @@ def test_c6472_firmware_releases_the_other_cores_and_meets_them(
             str(multicore_firmware),
             "--device",
             "c6472",
-            # Master I2C boot: a ROM mode, so cores 1-5 start held in reset.
+            # I2C slave boot has no modelled source: the ELF loads and cores 1-5 start held.
             "--boot-mode",
-            "2",
+            "4",
             "--max-cycles",
             "5000000",
             "--dump",
@@ -510,9 +510,10 @@ def test_c6472_echo_needs_every_core_out_of_reset(
             "64",
             "--duration",
             "0.2",
-            # A ROM mode: core 0 leaves reset and the rest wait for a release that never comes.
+            # A boot mode with no modelled source: core 0 leaves reset and the rest wait for a
+            # release that never comes.
             "--boot-mode",
-            "2",
+            "4",
             # Core 0 announces itself in a few hundred thousand cycles; a wait an order of
             # magnitude longer than that is enough to call the other five held.
             "--ready-timeout",
@@ -594,7 +595,7 @@ def test_c6472_timers_all_count_alike(
             "--device",
             "c6472",
             "--boot-mode",
-            "2",
+            "4",
             "--max-cycles",
             "120000000",
             "--dump",
