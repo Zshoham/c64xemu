@@ -35,6 +35,10 @@ _Avoid_: memory, RAM, physical memory
 The per-device table that answers which physical memory an access lands in, given the requester and the address: the local windows a megamodule sees, the global alias block a multicore device gives every core's memories, the shared memories, and the DDR2 window. It deliberately does not canonicalise the aliases away, because two addresses for one byte are two cache tags on silicon.
 _Avoid_: memory map, decoder
 
+**privilege**:
+The identity memory protection judges an access by: a PrivID (a core's index, 0 for the system masters, the programmer's for an EDMA3 transfer) and a user or supervisor mode. It is not the requester, which only chooses the address view an access resolves through in the address map; the two travel separately because one master can issue accesses under another's privilege.
+_Avoid_: AID for the PrivID itself (an AID is the page-attribute bit a PrivID is checked against)
+
 **megamodule**:
 One core's private half of the device: its memory hierarchy, its interrupt controller and event latches, its memory protection units, its bandwidth manager, its power-down control and its IDMA. A C6455 has one, a C6472 six.
 _Avoid_: core state, CPU context

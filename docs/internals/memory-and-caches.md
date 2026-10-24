@@ -315,9 +315,20 @@ consulting LOCAL plus the supervisor or user permission bit — the AID fields g
 requester id, and the CPU is the local requester. `check_dma_access` checks the AID bit for the
 requester id (IDs 0–5 have their own bit, 6 and above share AIDX) and the permission bit for the
 requester's privilege mode: IDMA and the HPI's DMA are ID 0 supervisor, the EMACs and the UTOPIA
-PDMA ID 0 user (SPRS612G section 5.2 and Table 5-3), and the EDMA3's transfers AIDX supervisor.
-One gap is open in the ROADMAP: the EDMA3 should carry the PrivID and mode of the core that
-programmed it (SPRU966C section 2.10.2).
+PDMA ID 0 user (SPRS612G section 5.2 and Table 5-3); `Privilege` carries the pair, and
+`Privilege::allowed_id_bit` is the one AID decode both this check and the EDMA3's use. The
+EDMA3's transfers are made for whoever programmed them: every write of a PaRAM word stamps PRIV
+and PRIVID into the set's OPT (bit 31, bits 27–24) from the identity the fabric last presented
+to the channel controller — a CPU access presents its core index and mode through
+`check_access`, a system master's register access its own through `master_register_read` and
+`master_register_write` — and `Edma::transfer` issues the reads and writes under the stamp the
+set carries when the request runs, not the CPU's privilege at that moment (SPRU966C section
+2.10.2). Any new path into the EDMA3's slave port has to present its identity the same way, or
+it is judged and stamped as whoever came before it. The channel controller's own register
+protection judges the presented PrivID against the AID bits, so a system master's write to an
+EDMA3 register is its own: an EMAC or UTOPIA PDMA write (ID 0 user) to a page attribute register,
+which is supervisor-only, is refused. A refusal there records the PrivID in MPFSR's FID
+(bits 12–9) beside the error bit (SPRU966C Table 4-27).
 A refused access is discarded, and `record_mpu_fault` latches the address in MPFAR and the
 attempted permission in MPFSR and raises the unit's system event: 124, 120, 122 for a CPU fault
 on L2, L1P, L1D, and 125, 121, 123 for a requester's. That event reaches the CPU as `EXCEP`

@@ -7,12 +7,36 @@
 //! driver's "wait for the completion interrupt" loop behave like hardware.
 
 use crate::edma_tc::ServicedRequest;
-use crate::emac::DmaMemory;
 use crate::port::{PortContext, PortWrite, SlavePort};
+use crate::system::Privilege;
 #[cfg(test)]
 const TEST_CONTEXT: PortContext = PortContext {
     endian: crate::system::Endian::Little,
 };
+
+/// PRIV (OPT bit 31, set for supervisor) and PRIVID (OPT bits 27-24), the fields the channel
+/// controller stamps on a PaRAM set when a master writes it (SPRU966C Table 2-3).
+const OPT_STAMP: u32 = (1 << 31) | (0xf << 24);
+
+fn opt_stamp(privilege: Privilege) -> u32 {
+    (u32::from(!privilege.user) << 31) | (u32::from(privilege.id & 0xf) << 24)
+}
+
+/// The identity a PaRAM set carries, which its transfer requests are issued under: whoever
+/// last wrote any word of it (SPRU966C section 2.10.2), not the controller.
+fn stamped_privilege(opt: u32) -> Privilege {
+    Privilege {
+        id: ((opt >> 24) & 0xf) as u8,
+        user: opt >> 31 == 0,
+    }
+}
+
+/// What the transfer controllers move data through. Each access names the privilege it is
+/// made with, so the memory system can apply that identity's protection.
+pub trait TransferMemory {
+    fn read(&mut self, privilege: Privilege, address: u32, length: usize) -> Vec<u8>;
+    fn write(&mut self, privilege: Privilege, address: u32, bytes: &[u8]);
+}
 
 const BASE: u32 = 0x02a0_0000;
 const PARAM_BASE: u32 = 0x02a0_4000;
@@ -102,16 +126,16 @@ const ETYPE_QDMA: u32 = 3;
 /// A page attribute register resets with every requestor id allowed, external ids allowed, and
 /// read and write permitted at both privilege levels but not execute (SPRU966C Figure 4-28).
 const MPPA_RESET: u32 = 0xfef6;
-const MPPA_AID0: u32 = 1 << 10;
 const MPPA_SR: u32 = 1 << 5;
 const MPPA_SW: u32 = 1 << 4;
 const MPPA_UR: u32 = 1 << 2;
 const MPPA_UW: u32 = 1 << 1;
-/// MPFSR error bits (SPRU966C Table 4-27).
+/// MPFSR error bits, and FID: the PrivID of the request that faulted (SPRU966C Table 4-27).
 const MPFSR_SRE: u32 = 1 << 5;
 const MPFSR_SWE: u32 = 1 << 4;
 const MPFSR_URE: u32 = 1 << 2;
 const MPFSR_UWE: u32 = 1 << 1;
+const MPFSR_FID: u32 = 0xf << 9;
 
 /// One event queue: sixteen entry slots the debug windows read directly, plus the head, the
 /// occupancy, the high-water mark and the threshold flag QSTAT reports (SPRU966C §4.2.4).
@@ -278,7 +302,7 @@ pub struct Edma {
     fault_address: u32,
     fault_status: u32,
     fault_pulse: bool,
-    requestor_user: bool,
+    privilege: Privilege,
     /// The error interrupt only pulses when the latched error state goes from clear to set.
     error_latched: bool,
     error_pulse: bool,
@@ -327,7 +351,7 @@ impl Default for Edma {
             fault_address: 0,
             fault_status: 0,
             fault_pulse: false,
-            requestor_user: false,
+            privilege: Privilege::ID0_SUPERVISOR,
         }
     }
 }
@@ -342,11 +366,11 @@ fn high(mask: u64) -> u32 {
 }
 
 impl Edma {
-    /// The privilege the access in flight carries. Every CPU access records it, so the model
-    /// can apply active memory protection and stamp a PaRAM set with its programmer's
-    /// privilege (SPRU966C sections 2.10.1 and 2.10.2).
-    pub fn set_requestor_privilege(&mut self, user: bool) {
-        self.requestor_user = user;
+    /// The identity the access in flight carries. Every access to the controller's registers
+    /// presents it first, so the model can apply active memory protection and stamp a PaRAM
+    /// set with its programmer's identity (SPRU966C sections 2.10.1 and 2.10.2).
+    pub fn set_privilege(&mut self, privilege: Privilege) {
+        self.privilege = privilege;
     }
 }
 
@@ -431,9 +455,7 @@ impl SlavePort for Edma {
             // The set carries its programmer's privilege and requestor id from then on
             // (SPRU966C §2.10.2 and Table 2-3).
             let option = index & !7;
-            self.param[option] &= !(1 << 31);
-            self.param[option] |= u32::from(!self.requestor_user) << 31;
-            self.param[option] &= !(0xf << 24);
+            self.param[option] = (self.param[option] & !OPT_STAMP) | opt_stamp(self.privilege);
             // A write to the trigger word of a PaRAM set a QCHMAP names is a QDMA event, when
             // the channel is enabled (SPRU966C §2.4.2.1).
             self.check_qdma_trigger(index);
@@ -535,7 +557,7 @@ impl SlavePort for Edma {
                     self.qrae[region] = value & 0xf;
                 } else if let Some(region) = indexed(address, MPPA_BASE, REGIONS) {
                     // A page attribute register is supervisor-writable only (Table 2-13).
-                    if !self.requestor_user {
+                    if !self.privilege.user {
                         self.mppa[region] = value & 0xffff;
                     }
                 } else {
@@ -613,9 +635,9 @@ impl Edma {
             || (BASE..BASE + 0x2000).contains(&address) && address % 4 == 0
     }
 
-    /// Active memory protection: a request needs its requestor id allowed and the permission
-    /// its privilege level asks for, and a refusal records the address and the failing
-    /// permission for the fault registers (SPRU966C §2.10.1 and Table 4-27).
+    /// Active memory protection: a request needs its PrivID allowed and the permission its
+    /// privilege level asks for, and a refusal records the address, the failing permission and
+    /// the PrivID for the fault registers (SPRU966C §2.10.1 and Table 4-27).
     fn permitted(&mut self, address: u32, write: bool) -> bool {
         if !self.owns(address) {
             return true;
@@ -626,23 +648,25 @@ impl Edma {
             return true;
         }
         let attributes = self.page_attributes(address);
-        let permission = match (self.requestor_user, write) {
+        let Privilege { id, user } = self.privilege;
+        let permission = match (user, write) {
             (false, false) => MPPA_SR,
             (false, true) => MPPA_SW,
             (true, false) => MPPA_UR,
             (true, true) => MPPA_UW,
         };
-        // The CPU is requestor id zero on this device.
-        if attributes & MPPA_AID0 != 0 && attributes & permission != 0 {
+        if attributes & self.privilege.allowed_id_bit() != 0 && attributes & permission != 0 {
             return true;
         }
         self.fault_address = address;
-        self.fault_status |= match (self.requestor_user, write) {
+        let error = match (user, write) {
             (false, false) => MPFSR_SRE,
             (false, true) => MPFSR_SWE,
             (true, false) => MPFSR_URE,
             (true, true) => MPFSR_UWE,
         };
+        // FID names the requestor of the fault the address describes.
+        self.fault_status = (self.fault_status & !MPFSR_FID) | (u32::from(id & 0xf) << 9) | error;
         self.fault_pulse = true;
         false
     }
@@ -767,7 +791,7 @@ impl Edma {
         self.queues.iter().any(|queue| queue.length != 0)
     }
 
-    pub fn tick(&mut self, memory: &mut impl DmaMemory) {
+    pub fn tick(&mut self, memory: &mut impl TransferMemory) {
         let Some(queue) = (0..QUEUES)
             .filter(|queue| self.queues[*queue].length > 0)
             .min_by_key(|queue| ((self.quepri >> (queue * 4)) & 7, *queue))
@@ -839,7 +863,7 @@ impl Edma {
     /// One transfer request out of the PaRAM set at `base`: move the data, update the set as
     fn request(
         &mut self,
-        memory: &mut impl DmaMemory,
+        memory: &mut impl TransferMemory,
         base: usize,
         controller: usize,
         priority: u32,
@@ -947,7 +971,7 @@ impl Edma {
 
     /// One transfer request: `arrays` arrays of ACNT bytes each, stepping by the B indexes.
     /// Constant addressing mode holds the address still (SPRU966C §2.3.8).
-    fn transfer(&self, memory: &mut impl DmaMemory, set: &ParamSet, arrays: u32) {
+    fn transfer(&self, memory: &mut impl TransferMemory, set: &ParamSet, arrays: u32) {
         let source_fixed = set.opt & OPT_SAM != 0;
         let destination_fixed = set.opt & OPT_DAM != 0;
         for array in 0..arrays {
@@ -961,8 +985,9 @@ impl Edma {
             } else {
                 offset_address(set.dst, set.dst_bidx, array)
             };
-            let bytes = memory.dma_read_bytes(source, set.acnt as usize);
-            memory.dma_write_bytes(destination, &bytes);
+            let privilege = stamped_privilege(set.opt);
+            let bytes = memory.read(privilege, source, set.acnt as usize);
+            memory.write(privilege, destination, &bytes);
         }
     }
 
@@ -1069,7 +1094,17 @@ mod tests {
 
     struct Memory(BTreeMap<u32, u8>);
 
-    impl DmaMemory for Memory {
+    impl TransferMemory for Memory {
+        fn read(&mut self, _privilege: Privilege, address: u32, length: usize) -> Vec<u8> {
+            self.dma_read_bytes(address, length)
+        }
+
+        fn write(&mut self, _privilege: Privilege, address: u32, bytes: &[u8]) {
+            self.dma_write_bytes(address, bytes);
+        }
+    }
+
+    impl Memory {
         fn dma_read_bytes(&mut self, address: u32, length: usize) -> Vec<u8> {
             (0..length)
                 .map(|offset| {
@@ -1090,9 +1125,23 @@ mod tests {
         fn dma_read_u32(&mut self, address: u32) -> u32 {
             u32::from_le_bytes(self.dma_read_bytes(address, 4).try_into().unwrap())
         }
+    }
 
-        fn dma_write_u32(&mut self, address: u32, value: u32) {
-            self.dma_write_bytes(address, &value.to_le_bytes());
+    /// A memory that notes the privilege each access was made with.
+    struct Witness {
+        memory: Memory,
+        seen: Vec<Privilege>,
+    }
+
+    impl TransferMemory for Witness {
+        fn read(&mut self, privilege: Privilege, address: u32, length: usize) -> Vec<u8> {
+            self.seen.push(privilege);
+            self.memory.read(privilege, address, length)
+        }
+
+        fn write(&mut self, privilege: Privilege, address: u32, bytes: &[u8]) {
+            self.seen.push(privilege);
+            self.memory.write(privilege, address, bytes);
         }
     }
 
@@ -1104,6 +1153,80 @@ mod tests {
                 TEST_CONTEXT,
             );
         }
+    }
+
+    #[test]
+    fn a_transfer_runs_as_whoever_wrote_its_set_however_the_presented_privilege_has_changed() {
+        // SPRU966C section 2.10.2 and Table 2-3: the set is stamped with the identity of the
+        // master that wrote it, and that stamp - not the controller's current view of the bus -
+        // is what the transfer is issued under.
+        let user_core_three = Privilege { id: 3, user: true };
+        let supervisor_core_one = Privilege { id: 1, user: false };
+        let mut memory = Witness {
+            memory: Memory(BTreeMap::new()),
+            seen: Vec::new(),
+        };
+        let mut edma = Edma::default();
+        edma.write(DCHMAP_BASE, 2 << 5, TEST_CONTEXT);
+        edma.write(DCHMAP_BASE + 4, 4 << 5, TEST_CONTEXT);
+        edma.set_privilege(user_core_three);
+        program(
+            &mut edma,
+            2,
+            [0, 0x1000, (1 << 16) | 4, 0x2000, 0, 0xffff, 0, 1],
+        );
+        edma.set_privilege(supervisor_core_one);
+        program(
+            &mut edma,
+            4,
+            [0, 0x1000, (1 << 16) | 4, 0x3000, 0, 0xffff, 0, 1],
+        );
+        // The next access is a different identity again, and neither transfer notices.
+        edma.set_privilege(Privilege { id: 5, user: true });
+        edma.write(ESR, 3, TEST_CONTEXT);
+        edma.tick(&mut memory);
+        edma.tick(&mut memory);
+        assert_eq!(
+            memory.seen,
+            [
+                user_core_three,
+                user_core_three,
+                supervisor_core_one,
+                supervisor_core_one
+            ]
+        );
+    }
+
+    #[test]
+    fn a_register_access_is_judged_by_its_privid_and_a_refusal_names_it() {
+        // SPRU966C section 2.10.1, Figure 4-28 and Table 4-27: a page admits PrivIDs 0 to 5
+        // by their own AID bit and every higher one by AIDX, and MPFSR's FID records whose
+        // request faulted.
+        const AIDX: u32 = 1 << 9;
+        fn aid(id: u32) -> u32 {
+            1 << (10 + id)
+        }
+        let mut edma = Edma::default();
+        // PaRAM set 0 lies in region 0's page; only core 3 may touch it.
+        edma.write(MPPA_BASE, aid(3) | MPPA_SR | MPPA_SW, TEST_CONTEXT);
+        edma.set_privilege(Privilege { id: 1, user: false });
+        edma.write(PARAM_BASE + 4, 0x1234, TEST_CONTEXT);
+        assert_eq!(edma.read(MPFAR, TEST_CONTEXT), Some(PARAM_BASE + 4));
+        assert_eq!(edma.read(MPFSR, TEST_CONTEXT), Some((1 << 9) | MPFSR_SWE));
+        edma.write(MPFCR, 1, TEST_CONTEXT);
+        edma.set_privilege(Privilege { id: 3, user: false });
+        edma.write(PARAM_BASE + 4, 0x1234, TEST_CONTEXT);
+        assert_eq!(edma.read(PARAM_BASE + 4, TEST_CONTEXT), Some(0x1234));
+        assert_eq!(edma.read(MPFSR, TEST_CONTEXT), Some(0));
+        // PrivID 7 is no AID of its own: refused until the page grants AIDX.
+        edma.set_privilege(Privilege { id: 7, user: false });
+        edma.write(PARAM_BASE + 8, 0x5678, TEST_CONTEXT);
+        assert_eq!(edma.read(MPFSR, TEST_CONTEXT), Some((7 << 9) | MPFSR_SWE));
+        edma.write(MPFCR, 1, TEST_CONTEXT);
+        edma.write(MPPA_BASE, AIDX | MPPA_SR | MPPA_SW, TEST_CONTEXT);
+        edma.write(PARAM_BASE + 8, 0x5678, TEST_CONTEXT);
+        assert_eq!(edma.read(PARAM_BASE + 8, TEST_CONTEXT), Some(0x5678));
+        assert_eq!(edma.read(MPFSR, TEST_CONTEXT), Some(0));
     }
 
     #[test]

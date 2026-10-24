@@ -22,7 +22,7 @@ use crate::chipcfg::{ChipConfig, DEVSTAT_LITTLE_ENDIAN};
 use crate::ddr2::Ddr2;
 use crate::devcfg::DeviceConfig;
 use crate::device::{DeviceProfile, MpuRegion};
-use crate::edma::Edma;
+use crate::edma::{Edma, TransferMemory};
 use crate::edma_tc::TransferController;
 use crate::emac::{DmaMemory as EmacDmaMemory, Emac};
 use crate::emic::{EmacInterruptControl, Sources as EmacSources};
@@ -166,6 +166,36 @@ pub(crate) enum Permission {
     Read,
     Write,
     Execute,
+}
+
+/// Whom a master's access is made for: the PrivID and privilege mode memory protection judges
+/// it by. Not to be confused with `Requester`, which only picks the address view an access
+/// resolves through. A core's PrivID is its index - AID0 to AID5 on the C6472 (SPRS612G Table
+/// 5-3), 0 on the one-core C6455 (SPRS276M section 5.2) - and an EDMA3 transfer carries the
+/// one stamped on its PaRAM set (SPRU966C section 2.10.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Privilege {
+    pub id: u8,
+    pub user: bool,
+}
+
+impl Privilege {
+    /// The HPI's DMA and the IDMA: PrivID 0, supervisor (SPRS276M section 5.2, SPRS612G
+    /// Table 5-3).
+    pub const ID0_SUPERVISOR: Self = Self { id: 0, user: false };
+    /// The EMACs and the UTOPIA PDMA: PrivID 0, always user (SPRS612G section 5.2).
+    pub const ID0_USER: Self = Self { id: 0, user: true };
+
+    /// The bit of a page attribute register that admits this PrivID: AID0 to AID5 at bits 10
+    /// to 15, and every id above them with AIDX at bit 9 (SPRU966C Figure 4-28; the
+    /// megamodule's MPPA registers share the layout).
+    pub fn allowed_id_bit(self) -> u32 {
+        if self.id < 6 {
+            1 << (10 + u32::from(self.id))
+        } else {
+            1 << 9
+        }
+    }
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -838,9 +868,12 @@ pub(crate) struct Shared {
     /// has to be relatched every cycle, so the cached "nothing is asserted" is the only
     /// answer the tick may act on without asking again.
     levels_asserted: bool,
-    /// The privilege the EDMA3 was last told a CPU access carried, so the seam every load and
-    /// store crosses does not restate it.
-    edma_user_privilege: bool,
+    /// The identity the EDMA3 was last told its current bus master carried, so the seam every
+    /// load and store crosses does not restate it. A register access the EDMA3 sees is made
+    /// for this identity, so every path that reaches its slave port must present its own
+    /// first: the CPU through `check_access`, the system masters through
+    /// `master_register_read`/`master_register_write`.
+    edma_privilege: Privilege,
     /// Whether any megamodule's interrupt selector reads a combiner output, which the latched
     /// flags a pulse sets can change without any level source moving.
     combiner_in_use: bool,
@@ -1118,7 +1151,7 @@ impl Shared {
             dynamic_active: u8::MAX,
             peripheral_dirty: true,
             levels_asserted: true,
-            edma_user_privilege: false,
+            edma_privilege: Privilege::ID0_SUPERVISOR,
             combiner_in_use: true,
             ports: Self::port_order(profile),
         }
@@ -2332,12 +2365,17 @@ impl Fabric {
         permission: Permission,
         user: bool,
     ) -> bool {
-        // The bus carries the requesting privilege, which the EDMA3's active memory protection
-        // filters on (SPRU966C section 2.10.1). Every load and store crosses this seam, and the
-        // channel controller is a cold allocation away, so the privilege is pushed into it only
-        // when it changes rather than restated on every access.
-        if self.shared.edma_user_privilege != user {
-            self.set_edma_privilege(user);
+        // The bus carries the requesting core's PrivID and privilege, which the EDMA3's active
+        // memory protection filters on and which it stamps on every PaRAM set this access
+        // writes (SPRU966C sections 2.10.1 and 2.10.2). Every load and store crosses this seam,
+        // and the channel controller is a cold allocation away, so the comparison stays here,
+        // inline, and the call is only made when the identity changes.
+        let privilege = Privilege {
+            id: core as u8,
+            user,
+        };
+        if self.shared.edma_privilege != privilege {
+            self.present_to_edma(privilege);
         }
         // Every page grants the CPU everything until software narrows one, which is the reset
         // state and the state the whole of this project's firmware runs in.
@@ -2347,14 +2385,19 @@ impl Fabric {
         self.check_restricted_access(core, address, permission, user)
     }
 
+    /// Tell the EDMA3 which master its next register access is made for. The system masters'
+    /// paths call this directly, so it repeats the comparison `check_access` makes inline. The
+    /// channel controller is out on loan while it services a request, and nothing reads its
+    /// privilege then.
     #[inline(never)]
-    fn set_edma_privilege(&mut self, user: bool) {
-        self.shared.edma_user_privilege = user;
-        self.shared
-            .edma
-            .as_mut()
-            .unwrap()
-            .set_requestor_privilege(user);
+    fn present_to_edma(&mut self, privilege: Privilege) {
+        if self.shared.edma_privilege == privilege {
+            return;
+        }
+        if let Some(edma) = self.shared.edma.as_mut() {
+            edma.set_privilege(privilege);
+            self.shared.edma_privilege = privilege;
+        }
     }
 
     /// The check itself, once some page has stopped granting everything.
@@ -2385,31 +2428,25 @@ impl Fabric {
     }
 
     /// DMA accesses carry a requestor PrivID rather than LOCAL, and the privilege mode the
-    /// master transfers in. IDMA, the HPI's DMA, the UTOPIA PDMA and the EMACs use ID 0; the
-    /// EDMA3's transfers are judged as an external master (AIDX, IDs >= 6). The unit consulted
-    /// belongs to whichever megamodule owns the memory, which on a multicore device is decided by
-    /// the global address the master used.
+    /// master transfers in. IDMA, the HPI's DMA, the UTOPIA PDMA and the EMACs use ID 0; an
+    /// EDMA3 transfer carries the identity stamped on its PaRAM set. The unit consulted belongs
+    /// to whichever megamodule owns the memory, which on a multicore device is decided by the
+    /// global address the master used.
     fn check_dma_access(
         &mut self,
         address: u32,
         permission: Permission,
-        id: u8,
-        user: bool,
+        privilege: Privilege,
     ) -> bool {
         let Some((core, unit, page)) = self.dma_mpu_page(address) else {
             return true;
         };
         let attributes = self.mm[core].mpu_pages[unit][page];
-        let permission_bit = permission_bit(permission, user);
-        let allowed_id = if id < 6 {
-            1 << (10 + u32::from(id))
-        } else {
-            1 << 9
-        };
-        if attributes & allowed_id != 0 && attributes & permission_bit != 0 {
+        let permission_bit = permission_bit(permission, privilege.user);
+        if attributes & privilege.allowed_id_bit() != 0 && attributes & permission_bit != 0 {
             return true;
         }
-        let status = (u32::from(id) << 9) | permission_bit;
+        let status = (u32::from(privilege.id) << 9) | permission_bit;
         self.mm[core].record_mpu_fault(unit, address, status, self.profile.events);
         false
     }
@@ -2557,9 +2594,9 @@ impl Fabric {
     /// `None` when protection refuses the read.
     pub(crate) fn master_read32(&mut self, address: u32) -> Option<u32> {
         if !is_memory(address) {
-            return Some(self.master_register_read(address));
+            return Some(self.master_register_read(address, Privilege::ID0_SUPERVISOR));
         }
-        self.checked_dma_word(address, 0, false)
+        self.checked_dma_word(address, Privilege::ID0_SUPERVISOR)
     }
 
     pub(crate) fn master_write32(&mut self, address: u32, value: u32) {
@@ -2569,11 +2606,12 @@ impl Fabric {
     /// `master_write32` for a master whose transfers carry `user` privilege rather than the
     /// supervisor's, with PrivID 0.
     fn master_write32_as(&mut self, address: u32, value: u32, user: bool) {
+        let privilege = Privilege { id: 0, user };
         if !is_memory(address) {
-            self.master_register_write(address, value);
+            self.master_register_write(address, value, privilege);
             return;
         }
-        self.checked_dma_store_word(address, value, 0, user);
+        self.checked_dma_store_word(address, value, privilege);
     }
 
     /// A system master's word in the configuration space. A chip-level peripheral answers
@@ -2582,7 +2620,8 @@ impl Fabric {
     /// accessible by the CPU" (SPRU871K section 5.3.1): a master reads zero there and its
     /// writes go nowhere. Whatever else the configuration space holds that no port claims is
     /// device memory, reached as any other memory is.
-    fn master_register_read(&mut self, address: u32) -> u32 {
+    fn master_register_read(&mut self, address: u32, privilege: Privilege) -> u32 {
+        self.present_to_edma(privilege);
         self.shared.touched();
         let context = self.port_context();
         if let Some(value) = self.peripheral_read(address, context) {
@@ -2594,7 +2633,8 @@ impl Fabric {
         self.dma_word(address)
     }
 
-    fn master_register_write(&mut self, address: u32, value: u32) {
+    fn master_register_write(&mut self, address: u32, value: u32, privilege: Privilege) {
+        self.present_to_edma(privilege);
         self.shared.touched();
         let context = self.port_context();
         if self.peripheral_write(address, value, context) || MEGAMODULE_REGISTERS.contains(&address)
@@ -2669,11 +2709,11 @@ impl Fabric {
         }
     }
 
-    fn dma_register_read(&mut self, address: u32, length: usize) -> Vec<u8> {
+    fn dma_register_read(&mut self, address: u32, length: usize, privilege: Privilege) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(length);
         while bytes.len() < length {
             let byte_address = address.wrapping_add(bytes.len() as u32);
-            let word = self.master_register_read(byte_address & !3);
+            let word = self.master_register_read(byte_address & !3, privilege);
             let word = if self.shared.backing.endian_big() {
                 word.to_be_bytes()
             } else {
@@ -2691,12 +2731,12 @@ impl Fabric {
 
     /// Write the configuration space for a DMA master, assembling whole words around the bytes
     /// the transfer supplies.
-    fn dma_register_write(&mut self, address: u32, bytes: &[u8]) {
+    fn dma_register_write(&mut self, address: u32, bytes: &[u8], privilege: Privilege) {
         let mut written = 0usize;
         while written < bytes.len() {
             let byte_address = address.wrapping_add(written as u32);
             let word_address = byte_address & !3;
-            let current = self.master_register_read(word_address);
+            let current = self.master_register_read(word_address, privilege);
             let mut word = if self.shared.backing.endian_big() {
                 current.to_be_bytes()
             } else {
@@ -2714,88 +2754,86 @@ impl Fabric {
             } else {
                 u32::from_le_bytes(word)
             };
-            self.master_register_write(word_address, value);
+            self.master_register_write(word_address, value, privilege);
         }
     }
 
-    /// Whether protection lets a master with PrivID `id` in `user` or supervisor mode make
-    /// `permission` accesses to all of `length` bytes at `address`; the first protected byte
-    /// latches the fault and refuses the whole access.
+    /// Whether protection lets a master with `privilege` make `permission` accesses to all of
+    /// `length` bytes at `address`; the first protected byte latches the fault and refuses the
+    /// whole access.
     fn dma_access_allowed(
         &mut self,
         address: u32,
         length: usize,
         permission: Permission,
-        id: u8,
-        user: bool,
+        privilege: Privilege,
     ) -> bool {
         if !self.dma_protection_active() {
             return true;
         }
         (0..length).all(|offset| {
             let byte_address = address.wrapping_add(offset as u32);
-            self.check_dma_access(byte_address, permission, id, user)
+            self.check_dma_access(byte_address, permission, privilege)
         })
     }
 
-    /// A memory word for a master that carries PrivID `id` in `user` or supervisor mode, its
-    /// four bytes judged as `dma_access_allowed` says; `None` when protection refuses it.
-    fn checked_dma_word(&mut self, address: u32, id: u8, user: bool) -> Option<u32> {
-        if !self.dma_access_allowed(address, 4, Permission::Read, id, user) {
+    /// A memory word for a master with `privilege`, its four bytes judged as
+    /// `dma_access_allowed` says; `None` when protection refuses it.
+    fn checked_dma_word(&mut self, address: u32, privilege: Privilege) -> Option<u32> {
+        if !self.dma_access_allowed(address, 4, Permission::Read, privilege) {
             return None;
         }
         Some(self.dma_word(address))
     }
 
     /// `checked_dma_word` for a store: a refused word is discarded.
-    fn checked_dma_store_word(&mut self, address: u32, value: u32, id: u8, user: bool) {
-        if self.dma_access_allowed(address, 4, Permission::Write, id, user) {
+    fn checked_dma_store_word(&mut self, address: u32, value: u32, privilege: Privilege) {
+        if self.dma_access_allowed(address, 4, Permission::Write, privilege) {
             self.dma_store_word(address, value);
         }
     }
 
-    /// `length` bytes for a byte-moving system master that carries PrivID `id` in `user` or
-    /// supervisor mode. A DMA access inside a peripheral aperture reaches that peripheral's
-    /// register through its slave port, with all the side effects a CPU read would have, rather
-    /// than the memory map behind it; a protected byte refuses the whole access.
-    fn requestor_read_bytes(&mut self, address: u32, length: usize, id: u8, user: bool) -> Vec<u8> {
+    /// `length` bytes for a byte-moving system master with `privilege`. A DMA access inside a
+    /// peripheral aperture reaches that peripheral's register through its slave port, with all
+    /// the side effects a CPU read would have, rather than the memory map behind it; a
+    /// protected byte refuses the whole access.
+    fn requestor_read_bytes(
+        &mut self,
+        address: u32,
+        length: usize,
+        privilege: Privilege,
+    ) -> Vec<u8> {
         if !is_memory(address) {
-            return self.dma_register_read(address, length);
+            return self.dma_register_read(address, length, privilege);
         }
-        if !self.dma_access_allowed(address, length, Permission::Read, id, user) {
+        if !self.dma_access_allowed(address, length, Permission::Read, privilege) {
             return vec![0; length];
         }
         self.dma_bytes(address, length)
     }
 
-    fn requestor_write_bytes(&mut self, address: u32, bytes: &[u8], id: u8, user: bool) {
+    fn requestor_write_bytes(&mut self, address: u32, bytes: &[u8], privilege: Privilege) {
         if !is_memory(address) {
-            self.dma_register_write(address, bytes);
+            self.dma_register_write(address, bytes, privilege);
             return;
         }
-        if !self.dma_access_allowed(address, bytes.len(), Permission::Write, id, user) {
+        if !self.dma_access_allowed(address, bytes.len(), Permission::Write, privilege) {
             return;
         }
         self.dma_store(address, bytes);
     }
 }
 
-/// The EDMA3's transfers, judged as an external master (AIDX) in supervisor mode.
-impl EmacDmaMemory for Fabric {
-    fn dma_read_bytes(&mut self, address: u32, length: usize) -> Vec<u8> {
-        self.requestor_read_bytes(address, length, 6, false)
+/// The EDMA3's transfers, each made with the privilege stamped on its PaRAM set: that of the
+/// master that programmed it (SPRU966C section 2.10.2, SPRS612G Table 5-3). The checks and the
+/// L2 snoop are the ones every other DMA master gets.
+impl TransferMemory for Fabric {
+    fn read(&mut self, privilege: Privilege, address: u32, length: usize) -> Vec<u8> {
+        self.requestor_read_bytes(address, length, privilege)
     }
 
-    fn dma_write_bytes(&mut self, address: u32, bytes: &[u8]) {
-        self.requestor_write_bytes(address, bytes, 6, false);
-    }
-
-    fn dma_read_u32(&mut self, address: u32) -> u32 {
-        self.dma_word(address)
-    }
-
-    fn dma_write_u32(&mut self, address: u32, value: u32) {
-        self.dma_store_word(address, value);
+    fn write(&mut self, privilege: Privilege, address: u32, bytes: &[u8]) {
+        self.requestor_write_bytes(address, bytes, privilege);
     }
 }
 
@@ -2808,11 +2846,13 @@ struct EmacMaster<'a>(&'a mut Fabric);
 
 impl EmacDmaMemory for EmacMaster<'_> {
     fn dma_read_bytes(&mut self, address: u32, length: usize) -> Vec<u8> {
-        self.0.requestor_read_bytes(address, length, 0, true)
+        self.0
+            .requestor_read_bytes(address, length, Privilege::ID0_USER)
     }
 
     fn dma_write_bytes(&mut self, address: u32, bytes: &[u8]) {
-        self.0.requestor_write_bytes(address, bytes, 0, true);
+        self.0
+            .requestor_write_bytes(address, bytes, Privilege::ID0_USER);
     }
 
     /// A descriptor word in memory is judged like the packet buffers, and a refused one reads
@@ -2822,7 +2862,9 @@ impl EmacDmaMemory for EmacMaster<'_> {
         if !is_memory(address) {
             return self.0.dma_word(address);
         }
-        self.0.checked_dma_word(address, 0, true).unwrap_or(0)
+        self.0
+            .checked_dma_word(address, Privilege::ID0_USER)
+            .unwrap_or(0)
     }
 
     fn dma_write_u32(&mut self, address: u32, value: u32) {
@@ -2830,7 +2872,8 @@ impl EmacDmaMemory for EmacMaster<'_> {
             self.0.dma_store_word(address, value);
             return;
         }
-        self.0.checked_dma_store_word(address, value, 0, true);
+        self.0
+            .checked_dma_store_word(address, value, Privilege::ID0_USER);
     }
 }
 
@@ -4205,10 +4248,13 @@ mod tests {
             vec![0, 0, 0, 0]
         );
         // The EMAC reads the buffer through the global alias and sees the CPU's data.
-        assert_eq!(fabric.dma_read_u32(0x1380_2000), 0xdead_beef);
+        assert_eq!(
+            EmacMaster(&mut fabric).dma_read_u32(0x1380_2000),
+            0xdead_beef
+        );
         // And a DMA write through the alias is snooped into that core's L1D, so the CPU sees
         // it without any cache operation.
-        fabric.dma_write_u32(0x1380_2000, 0x0bad_c0de);
+        EmacMaster(&mut fabric).dma_write_u32(0x1380_2000, 0x0bad_c0de);
         assert_eq!(fabric.read32(3, 0x0080_2000), 0x0bad_c0de);
         // No other core's memory moved.
         assert_eq!(fabric.read32(2, 0x0080_2000), 0);
@@ -4577,6 +4623,158 @@ mod tests {
             assert!(!print_flagged(&fabric));
             assert!(fabric.utopia_master_send_cell(SLAVE, &cell(2)));
             assert_eq!(fabric.utopia_master_poll_receive(SLAVE), Some(false));
+        }
+    }
+
+    /// An EDMA3 transfer is made for the core that programmed it: that core's PrivID and
+    /// privilege mode, captured when it wrote the PaRAM set (SPRU966C section 2.10.2, SPRS612G
+    /// Table 5-3), and judged by the memory protection of the page it touches.
+    mod edma_privilege {
+        use super::*;
+
+        const PARAM: u32 = 0x02a0_4000;
+        const ESR: u32 = 0x02a0_1010;
+        const L2MPFAR: u32 = 0x0184_a000;
+        const L2MPFSR: u32 = 0x0184_a004;
+        const L2MPPA0: u32 = 0x0184_a200;
+        const AIDX: u32 = 1 << 9;
+        const LOCAL: u32 = 1 << 8;
+        const SR: u32 = 1 << 5;
+        const SW: u32 = 1 << 4;
+        const UR: u32 = 1 << 2;
+        const UW: u32 = 1 << 1;
+        const SOURCE: u32 = 0x0080_0100;
+        const DESTINATION: u32 = 0x0080_0200;
+        const DATA: [u8; 4] = [0xde, 0xad, 0xbe, 0xef];
+
+        fn aid(id: u32) -> u32 {
+            1 << (10 + id)
+        }
+
+        /// The address a DMA master uses for `local` in `core`'s memory: the C6472 gives each
+        /// core's L2 a global alias, the C6455 has none.
+        fn dma_address(fabric: &Fabric, core: usize, local: u32) -> u32 {
+            if fabric.profile.map.has_global_aliases() {
+                local + 0x1000_0000 + 0x0100_0000 * core as u32
+            } else {
+                local
+            }
+        }
+
+        /// One CPU store as the core issues it: the access check precedes it, and carries the
+        /// core's privilege to the EDMA3.
+        fn store(fabric: &mut Fabric, core: usize, user: bool, address: u32, value: u32) {
+            assert!(fabric.check_access(core, address, Permission::Write, user));
+            fabric.write32(core, address, value);
+        }
+
+        /// `core` programs channel 0 to copy `DATA` across a protected page, in `user` or
+        /// supervisor mode, and raises its event; the CPU then runs on in `then_user` mode before
+        /// the controller services the request.
+        fn transfer(
+            profile: &'static DeviceProfile,
+            core: usize,
+            user: bool,
+            attributes: u32,
+            then_user: bool,
+        ) -> (Vec<u8>, u32, u32) {
+            let mut fabric = Fabric::new(profile);
+            fabric.load_bytes(core, SOURCE, &DATA);
+            fabric.write32(core, L2MPPA0, attributes);
+            let source = dma_address(&fabric, core, SOURCE);
+            let destination = dma_address(&fabric, core, DESTINATION);
+            let set = [0, source, (1 << 16) | 4, destination, 0, 0xffff, 0, 1];
+            for (index, word) in set.into_iter().enumerate() {
+                store(&mut fabric, core, user, PARAM + 4 * index as u32, word);
+            }
+            store(&mut fabric, core, user, ESR, 1);
+            // The CPU changes privilege - an exception, or a return from one - while the request
+            // waits; a lookup at execution time would see this and not the submitter.
+            assert!(fabric.check_access(core, SOURCE, Permission::Read, then_user));
+            for _ in 0..16 {
+                fabric.tick_once();
+            }
+            (
+                fabric.read_bytes(core, DESTINATION, 4),
+                fabric.read32(core, L2MPFAR),
+                fabric.read32(core, L2MPFSR),
+            )
+        }
+
+        #[test]
+        fn a_user_mode_submitter_is_refused_by_a_page_granting_only_supervisor_writes() {
+            let attributes = aid(0) | LOCAL | SR | SW | UR;
+            let (destination, address, status) =
+                transfer(&crate::device::C6455, 0, true, attributes, true);
+            assert_eq!(destination, [0; 4], "the user write is refused");
+            assert_eq!(address, DESTINATION);
+            assert_eq!(status, UW, "PrivID 0, user write");
+        }
+
+        #[test]
+        fn a_supervisor_mode_submitter_completes_the_same_transfer() {
+            let attributes = aid(0) | LOCAL | SR | SW | UR;
+            let (destination, _, status) =
+                transfer(&crate::device::C6455, 0, false, attributes, false);
+            assert_eq!(destination, DATA);
+            assert_eq!(status, 0);
+        }
+
+        #[test]
+        fn a_c6472_cpu_submitter_carries_its_core_id_not_aidx() {
+            // A page granting AIDX alone: core 3 is AID3, so its transfer is refused - at the
+            // first read, as a supervisor with every permission the page can give.
+            let attributes = AIDX | LOCAL | SR | SW | UR | UW;
+            let (destination, _, status) =
+                transfer(&crate::device::C6472, 3, false, attributes, false);
+            assert_eq!(destination, [0; 4]);
+            assert_eq!(status, (3 << 9) | SR, "PrivID 3, supervisor read");
+            // Granting that core's own AID lets the same transfer through.
+            let attributes = aid(3) | LOCAL | SR | SW | UR | UW;
+            let (destination, _, status) =
+                transfer(&crate::device::C6472, 3, false, attributes, false);
+            assert_eq!(destination, DATA);
+            assert_eq!(status, 0);
+            // And the fault names the submitter whose privilege failed.
+            let attributes = aid(3) | LOCAL | SR | SW | UR;
+            let (destination, address, status) =
+                transfer(&crate::device::C6472, 3, true, attributes, true);
+            assert_eq!(destination, [0; 4]);
+            assert_eq!(
+                address,
+                dma_address(&Fabric::new(&crate::device::C6472), 3, DESTINATION)
+            );
+            assert_eq!(status, (3 << 9) | UW, "PrivID 3, user write");
+        }
+
+        #[test]
+        fn the_cpu_changing_privilege_before_the_transfer_runs_does_not_change_its_judge() {
+            let attributes = aid(0) | LOCAL | SR | SW | UR;
+            // Submitted in user mode, serviced after the CPU is back in supervisor mode: still a
+            // user write, still refused.
+            let (destination, _, status) =
+                transfer(&crate::device::C6455, 0, true, attributes, false);
+            assert_eq!(destination, [0; 4]);
+            assert_eq!(status, UW);
+            // Submitted in supervisor mode, serviced while the CPU is in user mode: still a
+            // supervisor write, still granted.
+            let (destination, _, status) =
+                transfer(&crate::device::C6455, 0, false, attributes, true);
+            assert_eq!(destination, DATA);
+            assert_eq!(status, 0);
+        }
+
+        #[test]
+        fn a_dma_master_writing_a_set_stamps_its_own_identity_not_the_last_cpu_access() {
+            let mut fabric = Fabric::new(&crate::device::C6472);
+            // Core 3 in user mode is the last thing to have touched the bus.
+            store(&mut fabric, 3, true, ESR, 0);
+            fabric.master_write32(PARAM + 4, 0x1234);
+            // PRIV (bit 31) says supervisor and PRIVID (bits 27-24) says 0: the HPI's identity.
+            assert_eq!(fabric.read32(3, PARAM) >> 24, 0x80);
+            // A CPU write stamps its own.
+            store(&mut fabric, 3, true, PARAM + 4, 0x1234);
+            assert_eq!(fabric.read32(3, PARAM) >> 24, 0x03);
         }
     }
 }

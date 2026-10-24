@@ -629,17 +629,28 @@ and its completion write records a write fault (`memory:emac-tx-descriptor-witho
 The receive side has the matching vectors, and `-with-user-access` proves normal processing.
 Descriptors in the EMAC's own descriptor RAM (peripheral aperture) are not protected.
 
-**[ ] EDMA3 transfers carry the programmer's privilege.** Every EDMA3 transfer is judged as an
-external master - AIDX in supervisor mode - whoever set it up. SPRS612G Table 5-3 says the
-opposite: a CPU-programmed EDMA transfer inherits that core's PrivID (AID0-AID5) and privilege
-mode ("Also applies to EDMA transfers that are programmed by the CPU"), and SPRS276M section 5.2
-gives every C6455 master PrivID 0. SPRU966C section 2.10.2 is the mechanism: proxied memory
-protection records the submitter's PRIV and PRIVID with the transfer, and the transfer
-controller reads and writes with them (SAMPPRXY and DFMPPRXY, Tables 4-80 and 4-89). The channel
-controller already tracks the requesting privilege for its own active protection
-(`set_requestor_privilege`); the transfer path does not use it. The checks are a User-mode
-core's transfer refused by a page granting only supervisor writes to its AID, the same transfer
-accepted from Supervisor mode, and a page granting AIDX alone refusing it on a C6472.
+**[x] EDMA3 transfers carry the programmer's privilege.** *Done.* An EDMA3 transfer is made for
+the master that programmed it, not for the controller. SPRU966C section 2.10.2: the PRIV and
+PRIVID bits of OPT are set "when any part of the PaRAM set is written", and the transfer
+controller issues its reads and writes under them (SAMPPRXY and DFMPPRXY already report the same
+stamp). The channel controller stamps every PaRAM word write with the identity `Fabric` last
+presented to it - a CPU access presents its core index as PrivID (SPRS612G Table 5-3: AID0-AID5
+on the C6472, the one core's 0 on the C6455, SPRS276M section 5.2) and its mode; a DMA master's
+register access presents that master's - and `Edma::transfer` reads the identity back out of the
+set's OPT when the request runs, so a privilege change between submission and service changes
+nothing. The controller's own active protection judges the PrivID too, no longer always AID0,
+and a refusal there now records it in MPFSR's FID (bits 12-9, SPRU966C Table 4-27), which the
+model had never filled. `Privilege` is the one type for a PrivID and mode, shared by the fabric's
+checks and the EDMA3, with `Privilege::allowed_id_bit` the single AID decode.
+`system::tests::edma_privilege` has a User-mode core's transfer refused by a page granting only
+supervisor writes to its AID (fault with its PrivID and UW), the same transfer accepted from
+Supervisor mode, a page granting AIDX alone refusing a C6472 core's transfer, the CPU changing
+privilege before the request is serviced in both directions, and a DMA master's write to a set
+stamped with its own identity rather than the last CPU's. `edma::tests` checks the transfer is
+issued under the set's stamp whatever privilege is presented later, and that a register access
+is admitted by its own AID or by AIDX for an id above 5, with a refusal naming its PrivID in FID.
+A link update copies the linked set's OPT with the rest of it, so the set keeps the linked set's
+stamp; the manual was not found to say otherwise, and no case pins it.
 
 **[x] Which fault a protection block keeps.** *Fixed defect, and the method's sixth find.* Each
 unit's fault registers hold one fault, and both halves of the model latched one - the CPU path on
