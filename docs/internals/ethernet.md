@@ -18,6 +18,11 @@ C6455's only MAC at `0x02C8_0000` and a C6472's EMAC0 and EMAC1 at `0x02C8_0000`
 EMAC control module, or the C6472's EMIC, which owns that same address and is a separate slave
 port.
 
+SOFTRESET resets only EMAC-module state, preserving the C6455's EWCTL even though it is stored
+in `Emac` (SPRU975E §2.14.1). EWINTTCNT is not modelled. On the C6472 the separately stored
+EMIC configuration, shared MDIO and CPPI descriptor RAM likewise survive either MAC's
+SOFTRESET (SPRUEF8F §2.15.1).
+
 Both are ordinary slave ports (`SlavePort for Emac`, `SlavePort for Mdio`), so the CPU, the EDMA3
 and the HPI all reach them through the router. The MAC is also a DMA master: `Emac::tick` takes
 `&mut impl DmaMemory`, and the fabric lends the MAC out for its cycle
@@ -303,6 +308,11 @@ unacknowledged. On the C6455 that single line is system event 17 for every core
 (`C6455_EVENTS.emac[0].common` in `src/events.rs`), and the fabric raises it from
 `latch_emac_interrupts` and replays it through the idle level-event set so a dormant device does
 not lose it. [Interrupts and exceptions](interrupts.md) has the megamodule side.
+
+The fabric combines the MDIO's pending sources with the MAC line through
+`combined_interrupt_pending`: on the C6455 EWCTL gates both, including in the dormant replay
+path (SPRU975E §3.2 Table 12). MACINVECTOR still reports masked pending sources with EWCTL off;
+the gate affects delivery to the CPU, not the input vector.
 
 The two MACINT sources are STATPEND (bit 0) and HOSTPEND (bit 1). STATPEND stands while any
 statistics register has its most significant bit set — the half-full level, not an edge — and
