@@ -234,6 +234,25 @@ $ target/release/c64xemu run IMAGE.out --device c6472 --boot-mode 3 --boot-param
     --i2c-pll-x19 --i2c-eeprom eeprom.bin --state-out /tmp/i2c-state.json
 ```
 
+### TI's IBL
+
+The EEPROM can also hold what TI's C6472 EVM shipped with: TI's Intermediate Boot Loader, whose
+first stage the ROM loads and which then reads the rest of itself off the EEPROM with its own
+I2C driver, sets up PLL1 and DDR2, and boots over Ethernet by BOOTP and TFTP.
+`tests/tools/ibl_build.py` builds it from TI's source (`make evm_c6472`, one EEPROM per byte
+order) into `tests/build/ibl-c6472/`, and `tests/tools/ibl_peer.py` launches the emulator and
+serves the BOOTP reply and the file. The IBL loads the file as a binary blob at 0xE0000000 and
+branches there, so the program it boots must be linked to start at the base of DDR2;
+`tests/test_ibl.py` shows the link and the conversion. The image passed as `--image` names the
+device's byte order and the symbols; nothing in it is loaded.
+
+```console
+$ python3 tests/tools/ibl_build.py le
+$ python3 tests/tools/ibl_peer.py --emulator target/release/c64xemu --image APP.out \
+    --eeprom tests/build/ibl-c6472/le/bin/i2crom_0x50_c6472_le.bin \
+    --blob app.bin --file-name app.bin --max-cycles 3000000000 --state-out /tmp/ibl.json
+```
+
 ## UTOPIA boot
 
 `--device c6472 --boot-mode 5` through `8` selects UTOPIA cold boot

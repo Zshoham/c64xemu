@@ -10,18 +10,21 @@ prints each result for several inputs localises a mismatch in two runs; the manu
 examples make good unit tests; a host build of the same C source is the strongest oracle for
 anything the compiler can express.
 
-Current state: 1988 collected pytest cases and 777 native tests, including 390 component vectors.
+Current state: 1992 collected pytest cases and 781 native tests, including 390 component vectors.
 Three differentials against TI's own tools run inside every suite pass: all 2195 instruction
 words in binutils' tic6x vectors, and 436813 instructions
 across the firmware and program images compared with `dis6x` on seven dimensions - mnemonic,
 functional unit, cross-path marking, predicate, memory data path, every memory access's address
 operand, and every operand list the model reads, 285856 of them.
 
-One `[ ]` item is open: booting TI's IBL itself on the C6472, beside the boot items. The three
-before it put TI's own IBL tools into the suite as the oracle for the C6472 I2C boot, and the
-first EEPROM those tools made found that the ROM model read boot-table words in the wrong byte
-order on a little-endian device - a model and a set of fixtures that agreed with each other and
-with nothing TI made. The method at the head of *Where to look next* remains **two rules each
+No `[ ]` item is open. The last one booted TI's IBL itself on the C6472, built from TI's source,
+through the ROM, its own I2C driver, BOOTP and TFTP to a program in DDR2, and running TI's
+firmware found four defects the suite's own fixtures had agreed with: a repeat-mode I2C STOP
+that never happened, an inverted CSR.EN, byte-reversed EMAC address registers, and big-endian
+doubleword accesses pairing their words the little-endian way. The items before it had found the
+ROM model reading boot-table words in the wrong byte order the same way - a model and a set of
+fixtures that agreed with each other and with nothing TI made. The method at the head of *Where
+to look next* remains **two rules each
 modelled and each pinned, with nothing asking what they do together.** It has found six defects.
 The cache manual's worked examples found a 4% error between a correct miss cost and a correct
 write buffer. Making a cache size carve its SRAM
@@ -1529,11 +1532,59 @@ length (30 bytes for Table 25, 20 for Table 26) and a zero checksum, which disab
 in a zero-filled 128-byte slot. The UTOPIA handover cases rest on this builder, since `romparse`
 writes no Table 26 block.
 
-**[ ] Boot TI's IBL on the C6472.** Build the IBL for the C6472 EVM with the suite's 8.5 code
-generation tools and boot the real EVM EEPROM image through the ROM model: the ROM loads the
-IBL's first stage, and that stage then drives the I2C module from firmware to read the rest. A
-feasibility check comes first. The IBL's PLL and DDR2 set-up and the EMAC or NAND it boots from
-next are where the device model is expected to fall short, and how far it gets decides the scope.
+**[x] Boot TI's IBL on the C6472.** *Done, and it found four defects.* `tests/tools/ibl_build.py`
+builds the IBL for the C6472 EVM the way TI's `doc/build_instructions.txt` gives it, `make
+evm_c6472 ENDIAN=little` and `ENDIAN=big`, step by step from TI's makefiles: every object the
+stage templates name, compiled with `makedefs.mk`'s flags; the first stage linked, its map run
+through TI's `symExtract` for the five symbols the second stage calls back into; both stages
+blocked by `hex6x`, `bconvert64x`, `b2i2c` and `b2ccs`; `i2crom.map.pre` laid out by `romparse
+-compact`, `ccs2bin -swap` and TI's `iblConfig` writing the EVM's configuration table at 0x500.
+The 8.5 tools build only EABI, which cost two adjustments, both stated in the module: EABI's
+extra sections are placed beside their COFF counterparts, and both stages link with
+`--zero_init=off` so the second stage's start-up does not wipe the configuration and status
+tables the first stage filled in for it.
+
+`tests/test_ibl.py` boots each EEPROM with nothing preloaded. The ROM loads the first stage;
+that stage drives the I2C module from firmware to read its map, its configuration table and the
+second stage; the second stage sets PLL1 to x28 and the DDR2 controller from TI's EVM values,
+broadcasts a BOOTP request from the fused MAC address, resolves the server by ARP and reads a
+binary blob into DDR2 by TFTP, then branches to 0xE0000000 - where a compiled `sum_loop`, or
+`big_endian` on the big-endian board, returns 55. `tests/tools/ibl_peer.py` is the network: a
+BOOTP, ARP and TFTP server with the EVM configuration's own addresses over the Unix-socket
+frame transport. `tests/test_ibl_peer.py` drives that server over Unix datagrams through TFTP's
+16-bit block rollover: an empty final block zero, payload continuing through two wraps, stale
+ACK rejection and retransmission with a controlled clock. Each boot is about half a billion
+cycles and thirty seconds of wall time. The feasibility worry was the device model; PLL, DDR2,
+PSC, timer and EMAC needed nothing. What
+stood in the way, in order:
+
+- *The I2C module never sent a repeat-mode STOP.* TI's driver reads in repeat mode (RM = 1)
+  and ends the read by writing STP alone, which SPRU974A Table 15 makes a STOP. The model only
+  stopped when a non-repeat counter ran out, so the bus stayed busy and every later
+  transaction timed out; the first stage retried its map read forever.
+  `stp_ends_a_repeat_mode_read_after_the_byte_on_the_bus` pins it.
+- *CSR.EN was inverted.* SPRU732J Table 2-9: EN is 0 for big endian and 1 for little. The model
+  read it the other way round, and `cpu:big-endian-load-and-fetch` had pinned the wrong value;
+  the IBL's `deviceIsLittleEndian` reads it to decide whether to byte-swap its map, so a
+  little-endian device read the big-endian half of the map.
+- *The EMAC address registers were byte-reversed.* SPRU975E and SPRUEF8F Tables 71 and 72 put
+  the address's least significant bits, the last octet on the wire, in MACADDRLO bits 15:8 and
+  its first octet in MACADDRHI bits 7:0. The model, the ROM's Ethernet boot, the NDK NIMU
+  driver and every program had the opposite order and agreed with each other; TI's
+  `cpmacdrv.c` did not, and the IBL's first BOOTP request named 02:00:00:00:00:00. The MAC ID
+  fuse words, whose split had been an UNCERTAIN choice, now follow TI's own reader
+  (`c6472.c::deviceLoadDefaultEthAddress`): bytes 4 and 5 in MACID1 bits 31:16.
+- *Big-endian doubleword accesses paired their words the little-endian way.* SPRU732J LDDW: "In
+  big-endian mode, the first 32-bit word in memory is loaded into the odd register." Every
+  LDDW, LDNDW, STDW and STNDW, 32-bit and compact, put the first word in the even register.
+  Pushes and pops round-trip either way, which is why `big_endian` and `big_endian_rts` never
+  saw it; the RTS heap's STNDW headers, read back a word at a time, did, and the big-endian
+  first stage could never allocate its block buffer.
+  `a_doubleword_puts_its_first_memory_word_in_the_even_register_only_on_little_endian` pins it
+  with the manual's Example 2.
+
+Three of the four are the method's pattern again: model and fixtures agreeing with each other
+and with nothing TI made. TI's own firmware was the oracle each time.
 
 **[x] C6455 HPI boot.** *Done, as the hardware boot it is.* SPRS276M section 2.4: "the HPI host
 boot is a hardware boot mode", and "the CPU is actually held in reset until a DSP interrupt is
