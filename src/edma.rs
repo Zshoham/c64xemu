@@ -869,31 +869,27 @@ impl Edma {
         priority: u32,
     ) -> bool {
         let mut set = ParamSet::load(&self.param[base..base + 8]);
-        if set.is_null() {
-            if set.opt & OPT_STATIC == 0 {
-                self.link(base, set.link);
-            }
-            return true;
-        }
+        let null = set.is_null();
         let ab_synchronised = set.opt & OPT_SYNCDIM != 0;
         let arrays = if ab_synchronised { set.bcnt } else { 1 };
         // A constant-addressing transfer must be 256-bit aligned; the transfer controller
         // rejects the request and signals a TR error when it is not, so no data moves
         // (SPRU966C sections 2.3.2.2, 2.3.2.3 and Table 4-69).
+        let empty = null || set.is_dummy();
         let misaligned = (set.opt & OPT_SAM != 0 && set.src & 0x1f != 0)
             || (set.opt & OPT_DAM != 0 && set.dst & 0x1f != 0);
-        if misaligned {
+        if !empty && misaligned {
             // The details register keeps the completion code and the two completion enables
             // the failing request carried (SPRU966C Table 4-72).
             let detail = (u32::from(set.opt & OPT_TCCHEN != 0) << 17)
                 | (u32::from(set.opt & OPT_TCINTEN != 0) << 16)
                 | ((set.transfer_code() as u32) << 8);
             self.transfer_error = Some((controller, detail));
-        } else if !set.is_dummy() {
+        } else if !empty {
             self.transfer(memory, &set, arrays);
             self.serviced = Some((controller, self.serviced_request(&set, arrays, priority)));
         }
-        let final_request = if set.is_dummy() {
+        let final_request = if empty {
             true
         } else if ab_synchronised {
             set.ccnt <= 1
@@ -923,7 +919,7 @@ impl Edma {
             self.chained |= 1 << code;
             self.trigger(1 << code, ETYPE_CHAIN);
         }
-        false
+        null
     }
 
     /// Table 2-8: a shadow view of a channel register is filtered by that region's DRAE, the
@@ -1333,6 +1329,63 @@ mod tests {
         edma.write(SECR, 1 << 7, TEST_CONTEXT);
         assert_eq!(edma.read(EMR, TEST_CONTEXT), Some(0));
         assert_eq!(edma.read(SER, TEST_CONTEXT), Some(0));
+    }
+
+    #[test]
+    fn null_and_dummy_completion_interrupts_and_chains_without_moving_data() {
+        // SPRU966C §2.5.3 p.46: a dummy/null set programmed to return completion
+        // "will set the appropriate bits" in IPR or CER without submitting a TC request.
+        // Enable both intermediate and final completion: this does not assume a separate
+        // intermediate/final classification for a null set's already-zero counts.
+        for counts in [(0, 0), (0, 1)] {
+            for enables in [0, OPT_TCINTEN | OPT_TCCHEN | OPT_ITCINTEN | OPT_ITCCHEN] {
+                let mut memory = Memory(BTreeMap::new());
+                memory.dma_write_bytes(0x1000, &[1, 2, 3, 4]);
+                let mut edma = Edma::default();
+                edma.write(DCHMAP_BASE + 3 * 4, 1 << 5, TEST_CONTEXT);
+                program(
+                    &mut edma,
+                    0,
+                    [
+                        OPT_STATIC | enables | (3 << 12),
+                        0x1000,
+                        counts.0,
+                        0x2000,
+                        0,
+                        NULL_LINK,
+                        0,
+                        counts.1,
+                    ],
+                );
+                program(
+                    &mut edma,
+                    1,
+                    [OPT_STATIC, 0x1000, 0x10004, 0x3000, 0, NULL_LINK, 0, 1],
+                );
+                edma.write(IESR, 1 << 3, TEST_CONTEXT);
+                edma.write(ESR, 1, TEST_CONTEXT);
+                edma.tick(&mut memory);
+                let completion = if enables == 0 { 0 } else { 1 << 3 };
+                assert_eq!(edma.read(IPR, TEST_CONTEXT), Some(completion));
+                assert_eq!(edma.read(CER, TEST_CONTEXT), Some(completion));
+                assert_eq!(edma.interrupt_pending(), enables != 0);
+                assert_eq!(
+                    edma.read(EMR, TEST_CONTEXT),
+                    Some(u32::from(counts == (0, 0)))
+                );
+                assert_eq!(
+                    edma.read(SER, TEST_CONTEXT),
+                    Some(u32::from(counts == (0, 0)))
+                );
+                assert_eq!(memory.dma_read_u32(0x2000), 0);
+                assert!(edma.take_serviced_request().is_none());
+                edma.tick(&mut memory);
+                assert_eq!(
+                    memory.dma_read_u32(0x3000),
+                    if enables == 0 { 0 } else { 0x0403_0201 }
+                );
+            }
+        }
     }
 
     #[test]

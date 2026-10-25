@@ -998,6 +998,16 @@ could incorrectly defer it. `null_and_dummy_sets_link_without_losing_their_event
 all eight reloaded words, FFFFh null links, STATIC suppression, DMA and QDMA, the link's QDMA
 trigger, and the unchanged EMR/SER or QEMR/QSER distinction.
 
+**[x] Null EDMA3 sets can interrupt and chain.** *Fixed defect.* SPRU966C section 2.5.3,
+p.46: a dummy/null set programmed to return a completion code "will set the appropriate bits
+in the interrupt pending registers (IPR/IPRH) or chained event register (CER/CERH)." Null-set
+error reporting and ordinary completion were pinned separately, but the null early return
+discarded completion. `null_and_dummy_completion_interrupts_and_chains_without_moving_data`
+enables both intermediate and final completion, checks IPR/CER and the chained copy, and
+contrasts disabled completion and the already-working dummy path. It assumes no separate
+intermediate-versus-final classification for an all-zero null set. Neither empty set submits
+a request to the transfer controller, and null missed/secondary bits remain intact.
+
 **[x] The transfer controllers' debug windows.** *Done.* SPRU966C §2.12.4 says the source-active and
 destination-FIFO register sets exist "to derive a brief history of TRs serviced through the
 transfer controller", and that is what they now report. A serviced request leaves its parameters
