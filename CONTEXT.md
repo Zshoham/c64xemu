@@ -137,3 +137,10 @@ _Avoid_: pending writes, delay buckets
 **functional unit**:
 The execution resource an instruction claims — L, S, D or M on side 1 or 2. Packet validity is unit-conflict checking.
 _Avoid_: unit slot, pipe
+
+**interrupt entry**:
+The one way a cycle boundary vectors to a handler, whatever won it: a maskable interrupt, NMI,
+or an exception. The source decides only the return address, which register pair saves the
+interrupted context, and what becomes of a software-pipelined loop; everything else - no branch
+surviving, Supervisor mode, annulled NOPs, the pipeline refill - is the same for every source.
+_Avoid_: take, vectoring, exception entry (for the whole)

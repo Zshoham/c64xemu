@@ -1,4 +1,4 @@
-use crate::control::{restricted_in_user, Control};
+use crate::control::{restricted_in_user, Control, Entry, Exception, Interrupted};
 use crate::decoder::{
     compact_add_constant, compact_constant5, compact_constant8, compact_memory_shape,
     compact_register, compact_stack_constant, long_roles, mpy_roles, AluOp, CmpOp, CompactOpcode,
@@ -174,21 +174,6 @@ impl FetchLine {
 #[derive(Clone, Copy)]
 enum BranchTarget {
     Address(u32),
-}
-
-/// The exception sources this model delivers.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum PendingException {
-    /// A CPU-detected fault - illegal opcode, resource conflict, duplicate write, a privilege
-    /// violation - with the cause already recorded in IERR.
-    Internal,
-    /// `SWE`, or `SWENR` when `restricted` is set, which enters at REP instead of the vector.
-    Software { restricted: bool },
-    /// The external NMI pin while GEE is set.
-    Nmi,
-    /// The megamodule exception combiner's `EXCEP` output: some latched system event that
-    /// `EXPMASK` lets through, gated by `TSR.XEN`.
-    External,
 }
 
 /// The execution counters without the histogram, so a snapshot can carry them by value.
@@ -372,7 +357,7 @@ pub struct Cpu {
     packet_address: u32,
     /// An exception recognised this cycle, delivered by `finish_cycle` once the packet that
     /// raised it has finished. `None` while no exception is pending.
-    pending_exception: Option<PendingException>,
+    pending_exception: Option<Exception>,
     /// The first cycle a maskable interrupt was ready to be taken but the pipeline was not
     /// (a branch shadow or an SPLOOP drain), for the interrupt-latency statistic.
     interrupt_ready_since: Option<u64>,
@@ -902,9 +887,7 @@ impl Cpu {
             self.stats.idle_cycles += 1;
             self.commit_writes(bus);
             self.finish_cycle(bus);
-            if self.interrupt_stall != 0 {
-                self.idling = false;
-            }
+            // Entering a service routine ends the idle (`Cpu::enter`).
             return;
         }
         // Pending branches are resolved at the end of the previous cycle (see
@@ -2496,7 +2479,7 @@ impl Cpu {
             // cannot choose where it lands in the supervisor (SPRU732J 8.4).
             Opcode::SoftwareException => {
                 if self.control.exceptions_enabled() {
-                    self.pending_exception = Some(PendingException::Software {
+                    self.pending_exception = Some(Exception::Software {
                         restricted: word & 0x2000 != 0,
                     });
                 }
@@ -4306,8 +4289,7 @@ impl Cpu {
             // running, so the cause is recorded for a diagnostic caller to report: an emulator
             // defect and a firmware bug look identical from outside without it.
             self.last_exception_cause = Some(format!("{message} (fetch pc {:#010x})", self.pc));
-            self.pending_exception
-                .get_or_insert(PendingException::Internal);
+            self.pending_exception.get_or_insert(Exception::Internal);
             return;
         }
         if self.fault.is_none() {
@@ -4341,55 +4323,75 @@ impl Cpu {
         true
     }
 
-    /// Vector a recognised exception. NRP holds the address of the first annulled execute
-    /// packet, which differs by source: `SWE`/`SWENR` complete, so the first annulled packet
-    /// is the one after them and the return resumes there, while an illegal opcode or a
-    /// resource conflict annuls the offending packet itself - Linux relies on exactly that
-    /// when it reads the faulting word back through NRP to recognise its breakpoint opcode
-    /// (`arch/c6x/kernel/traps.c`, `process_iexcept`).
-    fn take_exception(&mut self, pending: PendingException) {
-        let return_pc = match pending {
-            PendingException::Internal => self.packet_address,
-            // A service request completes and an asynchronous input arrives between packets,
-            // so in all three cases the first annulled packet is the one `pc` names.
-            PendingException::Software { .. }
-            | PendingException::Nmi
-            | PendingException::External => self.pc,
-        };
-        // SPRU732J Table 6-2: exceptions may interrupt a branch shadow, but that
-        // context is not resumable and must be marked with NTSR.IB.
-        self.control.set_interrupts_blocked(
-            !self.branches.is_empty() || self.cycle < self.branch_block_until,
-        );
-        // An exception leaves the loop buffer idle without running an epilog, and records in
-        // NTSR.SPLX that a loop was destroyed so the handler knows it cannot resume.
-        let in_sploop = self.sploop.abandon();
-        self.interrupted_sploop = None;
-        self.pipe_up = false;
-        self.control.set_sploop_executing(false);
-        self.pc = if self.control.in_exception() {
-            self.control.enter_nested_exception(return_pc)
-        } else {
-            match pending {
-                PendingException::Internal => {
-                    self.control.enter_internal_exception(return_pc, in_sploop)
-                }
-                PendingException::Software { restricted } => {
-                    self.control.enter_software_exception(return_pc, restricted)
-                }
-                PendingException::Nmi => self.control.enter_nmi_exception(return_pc, in_sploop),
-                PendingException::External => {
-                    self.control.enter_external_exception(return_pc, in_sploop)
+    /// Interrupt entry, the one way a cycle boundary vectors to a handler whatever the
+    /// source. The source decides the return address and what becomes of an SPLOOP; the
+    /// control registers save the context; everything after is the same for every source:
+    /// no branch survives, the vector runs in Supervisor with any restore the interrupted
+    /// code had queued cancelled with the branch that would have applied it, the pipeline
+    /// refills, and remaining multicycle NOPs - IDLE and generated NOPs (BNOP/ADDKPC/CALLP
+    /// and PROT loads) included - are annulled (SPRU732J §5.6.2 / §6.4.2). Memory stalls
+    /// live in `pending_stalls` and still delay processing.
+    fn enter(&mut self, entry: Entry) {
+        let from = self.pc;
+        let interrupted = match entry {
+            // NRP holds the address of the first annulled execute packet, which differs by
+            // source: `SWE`/`SWENR` complete, so the first annulled packet is the one after
+            // them, while an illegal opcode or a resource conflict annuls the offending
+            // packet itself - Linux relies on exactly that when it reads the faulting word
+            // back through NRP to recognise its breakpoint opcode (`arch/c6x/kernel/traps.c`,
+            // `process_iexcept`). A service request, an NMI and EXCEP all arrive between
+            // packets, so for them the first annulled packet is the one `pc` names.
+            //
+            // An exception may interrupt a branch shadow, and leaves the loop buffer idle
+            // without running an epilog.
+            Entry::Exception(source) => {
+                let in_sploop = self.sploop.abandon();
+                self.interrupted_sploop = None;
+                self.pipe_up = false;
+                Interrupted {
+                    return_pc: if source == Exception::Internal {
+                        self.packet_address
+                    } else {
+                        self.pc
+                    },
+                    in_sploop,
+                    interrupts_blocked: !self.branches.is_empty()
+                        || self.cycle < self.branch_block_until,
                 }
             }
+            // An interrupt waits out branch shadows and SPLOOP drains, so it arrives between
+            // packets with the loop, if any, already piped down for the return to resume.
+            Entry::Interrupt(_) | Entry::NmiInterrupt => Interrupted {
+                return_pc: self.pc,
+                in_sploop: self.interrupted_sploop.take().is_some(),
+                interrupts_blocked: false,
+            },
         };
+        self.pc = self.control.enter(entry, interrupted);
+        if matches!(
+            entry,
+            Entry::NmiInterrupt | Entry::Exception(Exception::Nmi)
+        ) {
+            self.nmi_pending = false;
+        }
         self.branches.clear();
         self.branch_block_until = self.cycle;
-        // The vector runs in Supervisor and any restore the interrupted code had queued is
-        // cancelled with the branch that would have applied it.
         self.user_mode = false;
         self.mode_change = None;
         self.interrupt_stall = 9;
+        self.stall_cycles = 0;
+        self.idling = false;
+        match entry {
+            Entry::Interrupt(interrupt) => {
+                self.note_interrupt(interrupt, from);
+                self.record_interrupt_take();
+            }
+            Entry::NmiInterrupt => {
+                self.note_interrupt(0, from);
+                self.record_interrupt_take();
+            }
+            Entry::Exception(_) => {}
+        }
     }
 
     /// The interrupt-latency statistic: an interrupt that became ready while a branch shadow
@@ -4448,68 +4450,42 @@ impl Cpu {
         // With GEE set, NMI is the highest-priority exception and is not held off by branch
         // delay slots. Other exceptions follow, then the maskable EXCEP input.
         if self.interrupt_stall == 0 && self.nmi_pending && self.control.nmi_exception_ready() {
-            self.nmi_pending = false;
-            self.take_exception(PendingException::Nmi);
+            self.enter(Entry::Exception(Exception::Nmi));
         } else if let Some(pending) = self.pending_exception.take() {
-            self.take_exception(pending);
+            self.enter(Entry::Exception(pending));
         } else if self.interrupt_stall == 0
             && self.control.external_exception_ready()
             && exception_pending
         {
-            self.take_exception(PendingException::External);
-        }
-        if self.interrupt_stall == 0 {
-            if self.nmi_pending && self.control.nmi_interrupt_ready(branches_clear) {
-                // NMI uses the interrupt pipe-down rules while GEE is clear, including
-                // waiting for an active SPLOOP to drain.
-                if self.sploop.active() {
-                    if self.ready_to_drain_for_interrupt() {
-                        self.begin_interrupt_drain();
-                    }
-                    self.interrupt_ready_since.get_or_insert(self.cycle);
-                } else {
-                    let piped_down = self.interrupted_sploop.take().is_some();
-                    let from = self.pc;
-                    self.pc = self.control.enter_nmi_interrupt(self.pc, piped_down);
-                    self.nmi_pending = false;
-                    self.branches.clear();
-                    self.user_mode = false;
-                    self.mode_change = None;
-                    self.interrupt_stall = 9;
-                    self.note_interrupt(0, from);
-                    self.record_interrupt_take();
-                }
-            } else if let Some(interrupt) = self.control.takeable_interrupt(branches_clear) {
-                // A loop is never left mid-iteration: the interrupt waits while the buffer
-                // drains, and only then is it taken, returning to the SPLOOP packet so the
-                // loop pipes back up (SPRUFE8B 7.13.1 and 7.13.4).
-                if self.sploop.active() {
-                    if self.ready_to_drain_for_interrupt() {
-                        self.begin_interrupt_drain();
-                    }
-                    self.interrupt_ready_since.get_or_insert(self.cycle);
-                } else {
-                    let piped_down = self.interrupted_sploop.take().is_some();
-                    let from = self.pc;
-                    self.pc = self.control.enter_interrupt(interrupt, self.pc, piped_down);
-                    self.branches.clear();
-                    self.user_mode = false;
-                    self.mode_change = None;
-                    self.interrupt_stall = 9;
-                    self.note_interrupt(interrupt, from);
-                    self.record_interrupt_take();
-                }
-            } else if takeable_any.is_some() {
-                // Ready, but a branch shadow defers the take until the delay slots finish.
-                self.interrupt_ready_since.get_or_insert(self.cycle);
-            }
+            self.enter(Entry::Exception(Exception::External));
         }
         if self.interrupt_stall != 0 {
-            // SPRU732J §5.6.2 / §6.4.2: entry annuls remaining multicycle NOPs,
-            // including IDLE and generated NOPs (BNOP/ADDKPC/CALLP and PROT loads).
-            // Actual memory stalls live in pending_stalls and still delay processing.
-            self.stall_cycles = 0;
-            self.idling = false;
+            return;
+        }
+        // NMI uses the interrupt rules while GEE is clear, ahead of every maskable interrupt.
+        let interrupt = if self.nmi_pending && self.control.nmi_interrupt_ready(branches_clear) {
+            Some(Entry::NmiInterrupt)
+        } else {
+            self.control
+                .takeable_interrupt(branches_clear)
+                .map(Entry::Interrupt)
+        };
+        match interrupt {
+            // A loop is never left mid-iteration: the interrupt waits while the buffer drains,
+            // and only then is it taken, returning to the SPLOOP packet so the loop pipes back
+            // up (SPRUFE8B 7.13.1 and 7.13.4).
+            Some(_) if self.sploop.active() => {
+                if self.ready_to_drain_for_interrupt() {
+                    self.begin_interrupt_drain();
+                }
+                self.interrupt_ready_since.get_or_insert(self.cycle);
+            }
+            Some(entry) => self.enter(entry),
+            // Ready, but a branch shadow defers the take until the delay slots finish.
+            None if takeable_any.is_some() => {
+                self.interrupt_ready_since.get_or_insert(self.cycle);
+            }
+            None => {}
         }
     }
 

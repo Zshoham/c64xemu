@@ -90,9 +90,11 @@ ISTP, ITSR, NTSR, REP and DIER, which is the union of SPRU732J §8.2.4.1 and Tab
 
 ## Taking an interrupt
 
-`take_exceptions_and_interrupts` in `src/cpu.rs` runs the priority order: NMI as an exception
-first when GEE is set, then a pending internal or software exception, then the maskable `EXCEP`
-input, then NMI as an interrupt, then the highest-priority maskable interrupt.
+`take_exceptions_and_interrupts` in `src/cpu.rs` decides which source wins a cycle boundary, in
+priority order: NMI as an exception first when GEE is set, then a pending internal or software
+exception, then the maskable `EXCEP` input, then NMI as an interrupt, then the
+highest-priority maskable interrupt. It does not vector itself; every winner goes through
+the one interrupt entry, `Cpu::enter`.
 
 Three conditions defer a take rather than cancel it. A branch shadow (`branches` non-empty, or
 `cycle < branch_block_until`) holds the interrupt until the delay slots finish. An interrupt
@@ -101,10 +103,13 @@ holds it until the buffer has drained. In all three cases `interrupt_ready_since
 cycle the interrupt became ready, so the interrupt-latency statistic measures from readiness
 rather than from the take.
 
-Entry itself is `Control::enter_interrupt` (or `enter_nmi_interrupt`): it saves the return
-address in IRP, copies TSR into ITSR, clears GIE, and returns the ISFP address the PC is set to.
-`branches` is cleared, `user_mode` drops to Supervisor, any queued mode change is cancelled, and
-`interrupt_stall` is set to 9. That number is the documented overhead for all CPU interrupts —
+Entry is `Cpu::enter(Entry)`, whatever the source — `Entry::Interrupt(n)`, `Entry::NmiInterrupt`
+or `Entry::Exception(_)`. The source decides only the return address and what becomes of an
+SPLOOP; `Control::enter` saves the context into the register pair the source returns through
+(ITSR/IRP for an interrupt, NTSR/NRP for NMI and exceptions) and returns the vector. Everything
+after is shared: `branches` is cleared, `user_mode` drops to Supervisor, any queued mode
+change is cancelled, remaining multicycle NOPs and IDLE are annulled, and `interrupt_stall` is
+set to 9. That number is the documented overhead for all CPU interrupts —
 [SPRUFE8B](../reference/sprufe8b.pdf) §5.5.1, which the test
 `interrupt_overhead_is_nine_cycles` in `src/cpu.rs` pins directly.
 
@@ -113,20 +118,20 @@ address in IRP, copies TSR into ITSR, clears GIE, and returns the ISFP address t
 A loop is never interrupted mid-iteration. When an interrupt becomes takeable while the SPLOOP
 buffer is active, `ready_to_drain_for_interrupt` decides whether the buffer is at a point where
 it may drain, `begin_interrupt_drain` starts the pipe-down, and the take waits. When the drain
-completes the interrupt is taken with `piped_down` true, so the return address is the SPLOOP
+completes the interrupt is taken with `in_sploop` true, so the return address is the SPLOOP
 packet itself and the loop pipes back up on return. The mechanism lives in `src/sploop.rs`; see
 [Execution and timing](execution.md) for the buffer.
 
-An *exception* does not drain. `take_exception` calls `sploop.abandon()`, which leaves the buffer
+An *exception* does not drain. Its entry calls `sploop.abandon()`, which leaves the buffer
 idle with no epilog, clears `pipe_up`, and records in NTSR.SPLX that a loop was destroyed — the
 handler can then tell that it cannot resume the loop.
 
 ## Exceptions
 
-`PendingException` has four shapes: `Internal` (cause in IERR), `Software` (`SWE`/`SWENR`, with
-a `restricted` flag for a privilege violation), `Nmi` and `External`. Each has its own entry
-function on `Control`, and a nested exception — one taken while TSR.EXC is already set — goes
-through `enter_nested_exception` instead, which is what vectors it to reset.
+`control::Exception` has four shapes: `Internal` (cause in IERR), `Software` (`SWE`/`SWENR`,
+with a `restricted` flag that enters at REP), `Nmi` and `External`. Each flags its own EFR bit
+in `Control::enter`, and a nested exception — one taken while TSR.EXC is already set — saves
+into ITSR/IRP instead and vectors to reset.
 
 An exception the firmware does not handle is still an exception the model took; `--trace-exceptions`
 reports the cause of each one, which is the difference between "the image is wrong" and "the

@@ -15,6 +15,9 @@ const TSR_EXC: u32 = 1 << 10;
 const TSR_CXM: u32 = 1 << 6;
 /// TSR bit 14: set by hardware while the SPLOOP buffer is executing (SPRUFE8B Table 2-23).
 const TSR_SPLX: u32 = 1 << 14;
+/// TSR bit 15, IB: the interrupted code was in a branch shadow, which makes an exception's
+/// saved context unresumable (SPRU732J Table 6-2).
+const TSR_IB: u32 = 1 << 15;
 /// NTSR bit 16: the exception was taken by hardware (NMI, EXCEP or internal) rather than by
 /// `SWE`/`SWENR`, which is how a handler tells a service request from a fault (SPRU732J
 /// Table 2-23).
@@ -33,6 +36,44 @@ const IER_NMIE: u32 = 1 << 1;
 /// GFPGFR after reset: field size 7h in bits 24-26 and polynomial 1Dh in bits 0-7
 /// (SPRUFE8B section 2.8.5).
 const GFPGFR_RESET: u32 = 0x0700_001d;
+
+/// The exception sources the CPU delivers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Exception {
+    /// A CPU-detected fault - illegal opcode, resource conflict, duplicate write, a privilege
+    /// violation - with the cause already recorded in IERR.
+    Internal,
+    /// `SWE`, or `SWENR` when `restricted` is set, which enters at REP instead of the vector.
+    Software { restricted: bool },
+    /// The external NMI pin while GEE is set.
+    Nmi,
+    /// The megamodule exception combiner's `EXCEP` output: some latched system event that
+    /// `EXPMASK` lets through, gated by `TSR.XEN`.
+    External,
+}
+
+/// What an interrupt entry vectors for: a maskable interrupt, NMI through the legacy interrupt
+/// path while GEE is clear, or an exception.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Entry {
+    Interrupt(u8),
+    NmiInterrupt,
+    Exception(Exception),
+}
+
+/// The interrupted program as an entry saves it.
+#[derive(Clone, Copy)]
+pub struct Interrupted {
+    /// The address the return resumes at: the first annulled execute packet.
+    pub return_pc: u32,
+    /// For an interrupt, that the code was inside an SPLOOP drained for it, so ITSR or NTSR
+    /// keeps SPLX and the return pipes the loop back up (SPRUFE8B 7.13.4). For an exception,
+    /// that a loop was destroyed, which makes the context unresumable.
+    pub in_sploop: bool,
+    /// The CPU was in a branch shadow. Only an exception records it, as NTSR.IB (SPRU732J
+    /// Table 6-2): an interrupt is never taken there.
+    pub interrupts_blocked: bool,
+}
 
 pub struct Control {
     amr: u32,
@@ -308,19 +349,75 @@ impl Control {
         (pending != 0).then(|| pending.trailing_zeros() as u8)
     }
 
-    /// `in_sploop` records whether the interrupted code was inside a drained SPLOOP: ITSR
-    /// keeps the SPLX bit so the return pipes the loop back up (SPRUFE8B 7.13.4).
-    pub fn enter_interrupt(&mut self, interrupt: u8, return_pc: u32, in_sploop: bool) -> u32 {
-        self.itsr = if in_sploop {
-            self.tsr | TSR_SPLX
-        } else {
-            self.tsr & !TSR_SPLX
-        };
-        self.tsr = self.tsr & TSR_GEE | TSR_INT;
-        self.irp = return_pc;
-        self.ifr &= !(1 << interrupt);
-        self.istp_base.wrapping_add((interrupt as u32) << 5)
+    /// Interrupt entry: save the interrupted context into the register pair the source
+    /// returns through, enter the handler's context and return the vector address.
+    ///
+    /// - A maskable interrupt saves into ITSR/IRP and clears its IFR flag.
+    /// - NMI with GEE clear saves into NTSR/NRP with `NTSR.HWE`, and returns with `B NRP`.
+    /// - An exception saves into NTSR/NRP and flags its source in EFR (SPRU732J Table 6-3 -
+    ///   GIE, SGIE, XEN, INT and SPLX clear, EXC set, CXM back to Supervisor, GEE untouched).
+    ///   One recognised while `TSR.EXC` is already set cannot save its context without
+    ///   destroying the outer one, so it saves TSR and the PC into the interrupt pair instead
+    ///   and vectors through the service table's RESET entry, which boot code inspects to
+    ///   tell this apart from a pin reset (SPRU732J 6.3.4).
+    ///
+    /// Every NMI entry and every nested exception clears NMIE.
+    pub fn enter(&mut self, entry: Entry, interrupted: Interrupted) -> u32 {
+        let Interrupted {
+            return_pc,
+            in_sploop,
+            interrupts_blocked,
+        } = interrupted;
+        let splx = if in_sploop { TSR_SPLX } else { 0 };
+        match entry {
+            Entry::Interrupt(interrupt) => {
+                self.itsr = self.tsr & !TSR_SPLX | splx;
+                self.tsr = self.tsr & TSR_GEE | TSR_INT;
+                self.irp = return_pc;
+                self.ifr &= !(1 << interrupt);
+                self.istp_base.wrapping_add((interrupt as u32) << 5)
+            }
+            Entry::NmiInterrupt => {
+                self.ntsr = self.tsr & !TSR_SPLX | splx | NTSR_HWE;
+                self.tsr = self.tsr & TSR_GEE | TSR_INT;
+                self.nrp = return_pc;
+                self.ier &= !(IER_NMIE as u16);
+                self.istp_base.wrapping_add(0x20)
+            }
+            Entry::Exception(source) => {
+                self.tsr = (self.tsr & !TSR_IB) | if interrupts_blocked { TSR_IB } else { 0 };
+                if self.in_exception() {
+                    self.itsr = self.tsr & !TSR_SPLX;
+                    self.irp = return_pc;
+                    self.ier &= !(IER_NMIE as u16);
+                    return self.istp_base;
+                }
+                // A service request completes, so it never destroys a loop; `NTSR.HWE` tells
+                // a hardware source (NMI, EXCEP, internal) from `SWE`/`SWENR`.
+                let (flag, hardware) = match source {
+                    Exception::Internal => (EFR_IXF, true),
+                    Exception::Software { .. } => (EFR_SXF, false),
+                    Exception::Nmi => (EFR_NXF, true),
+                    Exception::External => (EFR_EXF, true),
+                };
+                self.efr |= flag;
+                self.ntsr = self.tsr & !TSR_SPLX | if hardware { splx | NTSR_HWE } else { 0 };
+                // Clearing XEN here is what makes a second `EXCEP` wait for the handler to
+                // enable it again.
+                self.tsr = self.tsr & TSR_GEE | TSR_EXC;
+                self.nrp = return_pc;
+                match source {
+                    Exception::Nmi => self.ier &= !(IER_NMIE as u16),
+                    // `SWENR` enters at REP, so User code cannot choose where it lands in the
+                    // supervisor (SPRU732J 8.4).
+                    Exception::Software { restricted: true } => return self.rep,
+                    _ => {}
+                }
+                self.istp_base.wrapping_add(0x20)
+            }
+        }
     }
+
     pub fn return_from_irp(&mut self) -> u32 {
         self.tsr = self.itsr;
         self.irp
@@ -392,50 +489,6 @@ impl Control {
         }
     }
 
-    /// Capture the CPU's branch-blocking state before saving exception context
-    /// (SPRU732J Table 6-2). GIE is saved separately and does not define IB.
-    pub fn set_interrupts_blocked(&mut self, blocked: bool) {
-        self.tsr = (self.tsr & !(1 << 15)) | if blocked { 1 << 15 } else { 0 };
-    }
-
-    /// Take an exception: save TSR into NTSR and the address of the first annulled execute
-    /// packet into NRP, then enter the exception context (SPRU732J Table 6-3 - GIE, SGIE,
-    /// XEN, INT and SPLX clear, EXC set, CXM back to Supervisor, GEE untouched).  `hardware`
-    /// distinguishes an NMI, EXCEP or internal exception, which sets `NTSR.HWE`, from a
-    /// `SWE`/`SWENR` service request, which clears it.  `in_sploop` records that a loop was
-    /// terminated, which is one of the conditions that make the exception unresumable.
-    /// Returns the vector address.
-    pub fn enter_exception(
-        &mut self,
-        flag: u32,
-        return_pc: u32,
-        hardware: bool,
-        in_sploop: bool,
-    ) -> u32 {
-        self.efr |= flag;
-        self.ntsr = (self.tsr & !TSR_SPLX)
-            | if in_sploop { TSR_SPLX } else { 0 }
-            | if hardware { NTSR_HWE } else { 0 };
-        self.tsr = self.tsr & TSR_GEE | TSR_EXC;
-        self.nrp = return_pc;
-        self.istp_base.wrapping_add(0x20)
-    }
-
-    /// `SWENR` behaves like `SWE` but enters at `REP` instead of the exception vector.
-    pub fn enter_software_exception(&mut self, return_pc: u32, restricted: bool) -> u32 {
-        let vector = self.enter_exception(EFR_SXF, return_pc, false, false);
-        if restricted {
-            self.rep
-        } else {
-            vector
-        }
-    }
-
-    /// An internal exception reports its cause in IERR, which the raising site has already
-    /// set, and flags itself in `EFR.IXF`.
-    pub fn enter_internal_exception(&mut self, return_pc: u32, in_sploop: bool) -> u32 {
-        self.enter_exception(EFR_IXF, return_pc, true, in_sploop)
-    }
     /// Whether a rising NMI edge can be latched. Once an NMI exception has set NXF, another
     /// edge is ignored until the handler acknowledges the flag through ECR.
     pub fn nmi_edge_allowed(&self) -> bool {
@@ -452,23 +505,6 @@ impl Control {
         branches_clear && self.tsr & TSR_GEE == 0 && self.ier & IER_NMIE as u16 != 0
     }
 
-    /// Enter NMI through the legacy interrupt path. Unlike a maskable interrupt, NMI saves
-    /// NTSR/NRP and returns with `B NRP`; NTSR.HWE identifies the hardware source.
-    pub fn enter_nmi_interrupt(&mut self, return_pc: u32, in_sploop: bool) -> u32 {
-        self.ntsr = (self.tsr & !TSR_SPLX) | if in_sploop { TSR_SPLX } else { 0 } | NTSR_HWE;
-        self.tsr = self.tsr & TSR_GEE | TSR_INT;
-        self.nrp = return_pc;
-        self.ier &= !(IER_NMIE as u16);
-        self.istp_base.wrapping_add(0x20)
-    }
-
-    /// With GEE set, NMI uses the exception context and reports EFR.NXF.
-    pub fn enter_nmi_exception(&mut self, return_pc: u32, in_sploop: bool) -> u32 {
-        let vector = self.enter_exception(EFR_NXF, return_pc, true, in_sploop);
-        self.ier &= !(IER_NMIE as u16);
-        vector
-    }
-
     /// The maskable external exception input. It needs GEE, `TSR.XEN` and `IER.NMIE`, and is
     /// ignored while `EFR.EXF` is still set: taking the exception does not clear the flag, so
     /// an input that is still asserted cannot re-enter a handler that has not acknowledged it
@@ -480,23 +516,6 @@ impl Control {
             && self.efr & EFR_EXF == 0
     }
 
-    /// Taking `EXCEP` also clears `TSR.XEN`, which `enter_exception` does along with the rest
-    /// of the context, so a second external exception needs the handler to enable it again.
-    pub fn enter_external_exception(&mut self, return_pc: u32, in_sploop: bool) -> u32 {
-        self.enter_exception(EFR_EXF, return_pc, true, in_sploop)
-    }
-
-    /// An exception recognised while `TSR.EXC` is already set cannot save its context without
-    /// destroying the outer one, so the CPU leaves NTSR and NRP alone, saves TSR and the PC
-    /// into the interrupt pair instead, clears NMIE and vectors through the service table's
-    /// RESET entry, which boot code inspects to tell this apart from a pin reset
-    /// (SPRU732J 6.3.4).
-    pub fn enter_nested_exception(&mut self, return_pc: u32) -> u32 {
-        self.itsr = self.tsr;
-        self.irp = return_pc;
-        self.ier &= !(IER_NMIE as u16);
-        self.istp_base
-    }
     #[inline(always)]
     fn highest_pending(&self) -> Option<u8> {
         let pending = self.ifr & self.ier & !1;
@@ -585,7 +604,14 @@ mod tests {
             control.tick(cycle, line);
         }
         assert_eq!(control.takeable_interrupt(true), Some(4));
-        control.enter_interrupt(4, 0x1000, false);
+        control.enter(
+            Entry::Interrupt(4),
+            Interrupted {
+                return_pc: 0x1000,
+                in_sploop: false,
+                interrupts_blocked: false,
+            },
+        );
         assert_eq!(control.takeable_interrupt(true), None);
 
         // The routine returns with the line still high: nothing new is pending.
