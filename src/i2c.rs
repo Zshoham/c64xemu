@@ -353,7 +353,25 @@ impl I2c {
                 }
             }
             self.load_shift_register();
+            return;
         }
+        // Repeat mode runs until software asks for the STOP (SPRU974A Table 15, RM = 1 and
+        // STP = 1 without STT). A word already on the bus finishes first and the STOP follows
+        // it in `finish_word`; with nothing on the bus the STOP goes out at once.
+        if self.mdr & (MDR_RM | MDR_STP | MDR_MST) == MDR_RM | MDR_STP | MDR_MST
+            && self.status & BB != 0
+            && !self.transfer_active()
+        {
+            self.stop();
+        }
+    }
+
+    /// A STOP condition: the bus is free, the module drops back to slave and STP clears
+    /// (SPRU974A Table 7 and Table 14).
+    fn stop(&mut self) {
+        self.status |= SCD;
+        self.status &= !BB;
+        self.mdr &= !(MDR_STP | MDR_MST);
     }
 
     /// A byte only starts shifting while the module is enabled, is the master transmitter and
@@ -464,9 +482,14 @@ impl I2c {
 
     /// Count the word off the internal counter and act on the end of the transfer: a STOP when
     /// STP is set, otherwise the register-access-ready flag (SPRU974A Table 7 and Table 15).
+    /// Repeat mode never counts; the word STP was set during is its last.
     fn finish_word(&mut self) {
         if self.mdr & MDR_RM != 0 {
-            self.status |= ARDY;
+            if self.mdr & MDR_STP != 0 {
+                self.stop();
+            } else {
+                self.status |= ARDY;
+            }
             return;
         }
         self.counter = self.counter.saturating_sub(1);
@@ -474,9 +497,7 @@ impl I2c {
             return;
         }
         if self.mdr & MDR_STP != 0 {
-            self.status |= SCD;
-            self.status &= !BB;
-            self.mdr &= !(MDR_STP | MDR_MST);
+            self.stop();
         } else {
             self.status |= ARDY;
         }
@@ -587,5 +608,67 @@ mod tests {
         i2c.write(ICMDR, 0, TEST_CONTEXT);
         assert_eq!(i2c.read(ICSTR, TEST_CONTEXT), Some(STATUS_RESET));
         assert_eq!(i2c.read(ICSTR, TEST_CONTEXT).unwrap() & SLAVE_FLAGS, 0);
+    }
+
+    fn tick_until(i2c: &mut I2c, flag: u32) {
+        for _ in 0..1000 {
+            if i2c.read(ICSTR, TEST_CONTEXT).unwrap() & flag != 0 {
+                return;
+            }
+            i2c.tick();
+        }
+        panic!("ICSTR flag {flag:#x} never came up");
+    }
+
+    /// An EEPROM read the way TI's IBL driver does it (hw/i2c/i2c.c hwI2cMasterRead): repeat
+    /// mode throughout, so ICCNT plays no part, and the STOP comes from writing STP alone.
+    fn read_in_repeat_mode(i2c: &mut I2c, address: u16, count: usize) -> Vec<u8> {
+        let transmit = MDR_IRS | MDR_MST | MDR_TRX | MDR_RM;
+        i2c.write(ICSAR, 0x50, TEST_CONTEXT);
+        i2c.write(ICMDR, transmit, TEST_CONTEXT);
+        i2c.write(ICDXR, u32::from(address >> 8), TEST_CONTEXT);
+        i2c.write(ICMDR, transmit | MDR_STT, TEST_CONTEXT);
+        tick_until(i2c, ICXRDY);
+        i2c.write(ICDXR, u32::from(address & 0xff), TEST_CONTEXT);
+        tick_until(i2c, ICXRDY);
+        // A repeated START turns the bus round without a STOP in between.
+        i2c.write(ICMDR, MDR_IRS | MDR_MST | MDR_RM | MDR_STT, TEST_CONTEXT);
+        let mut bytes = Vec::new();
+        for _ in 0..count {
+            tick_until(i2c, ICRRDY);
+            bytes.push(i2c.read(ICDRR, TEST_CONTEXT).unwrap() as u8);
+        }
+        i2c.write(ICMDR, MDR_IRS | MDR_MST | MDR_RM | MDR_STP, TEST_CONTEXT);
+        bytes
+    }
+
+    #[test]
+    fn stp_ends_a_repeat_mode_read_after_the_byte_on_the_bus() {
+        // SPRU974A Table 15: with RM = 1, STT = 0 and STP = 1 the master sends a STOP. The
+        // receiver had already started on the next byte when STP was written, so that byte
+        // lands first; then the bus is free and the module is a slave again.
+        let mut i2c = I2c::default();
+        i2c.attach_eeprom(0x50, (0..=255).collect());
+        i2c.write(ICMDR, MDR_IRS, TEST_CONTEXT);
+        assert_eq!(
+            read_in_repeat_mode(&mut i2c, 0x20, 4),
+            [0x20, 0x21, 0x22, 0x23]
+        );
+        assert_ne!(i2c.read(ICSTR, TEST_CONTEXT).unwrap() & BB, 0);
+        tick_until(&mut i2c, ICRRDY);
+        assert_eq!(i2c.read(ICDRR, TEST_CONTEXT), Some(0x24));
+        let status = i2c.read(ICSTR, TEST_CONTEXT).unwrap();
+        assert_eq!(status & (BB | SCD), SCD);
+        assert_eq!(
+            i2c.read(ICMDR, TEST_CONTEXT).unwrap() & (MDR_MST | MDR_STP),
+            0
+        );
+        // Nothing more is clocked in once the STOP is out.
+        for _ in 0..1000 {
+            i2c.tick();
+        }
+        assert_eq!(i2c.read(ICSTR, TEST_CONTEXT).unwrap() & ICRRDY, 0);
+        // With the bus free the next transaction starts from its own address.
+        assert_eq!(read_in_repeat_mode(&mut i2c, 0x80, 2), [0x80, 0x81]);
     }
 }
