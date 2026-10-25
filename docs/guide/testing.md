@@ -3,7 +3,7 @@
 The two suites, what each kind of case proves, how to select cases, and how to add one.
 
 The emulator is written to be checkable, and the suites are the point rather than an afterthought:
-`cargo nextest` runs 739 native tests, `pytest` collects 1965 cases that build target firmware and
+`cargo nextest` runs 806 native tests, `pytest` collects 1965 cases that build target firmware and
 drive it through the same `c64xemu run` command anyone else uses.
 
 ## Running them
@@ -88,7 +88,7 @@ reproduces entry for entry. Table 3-2 does the same for the data side. The reaso
 **Live network cases.** A host process leases the firmware an address over DHCP and then holds a
 real TCP connection with it; see [Networking and host I/O](networking-and-host-io.md).
 
-**Component conformance cases.** 396 JSON vectors under `tests/vectors/component/`, executed
+**Component conformance cases.** 398 JSON vectors under `tests/vectors/component/`, executed
 natively in-process by `src/component_conformance.rs`. `build.rs` walks that directory and
 generates one `#[test]` per file, so each vector is its own nextest case with its own name.
 `tests/vectors/component-python-baseline.json` remains a historical migration record, not an

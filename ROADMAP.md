@@ -796,6 +796,16 @@ This is what the item promised and the reason it was ranked first: neither rule 
 own - the miss costs were solved out of Table 1-3 and Table 3-2, and both were pinned - but no
 case here had ever asked what the two of them do to a loop, and the answer was off by 4%.
 
+**[x] Frozen L1D hits preserve replacement order.** *Fixed defect.* Freeze already prevented
+allocation and ordinary hits already updated LRU, but their meeting still promoted frozen hits.
+SPRU871K section 3.3.4, p.54: "The L1D cache services read hits and write hits normally while in
+freeze mode, with the small exception that the LRU bit is not modified."
+`cache:l1d-frozen-read-preserves-lru` and `cache:l1d-frozen-write-preserves-lru` fill one two-way
+set, hit its older line while frozen, then unfreeze and force a conflict. The older line must
+still be the victim; writes still update data and dirty state. L1P is direct-mapped and its
+freeze description (section 2.4.4) gives no LRU rule. L2's Table 4-6 also forbids LRU updates
+while frozen, but L2 freeze control remains unmodelled.
+
 **[~] The victim buffer.** *Half done, and honestly so.* SPRU862B Table 3-2 says a victim buffer
 flush on a read miss "disrupts miss pipelining plus maximum 11 stalls" - a mechanism and a bound,
 not a number. The disruption needs no number and is modelled: a fill that evicts a dirty line

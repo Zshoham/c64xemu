@@ -156,8 +156,10 @@ impl Cache {
             return None;
         };
         self.stats.read_hits = self.stats.read_hits.wrapping_add(N as u64);
-        self.clock = self.clock.wrapping_add(N as u64);
-        self.lines[index].used = self.clock;
+        if !self.frozen {
+            self.clock = self.clock.wrapping_add(N as u64);
+            self.lines[index].used = self.clock;
+        }
         let mut bytes = [0; N];
         bytes.copy_from_slice(&self.lines[index].data[offset..offset + N]);
         Some(bytes)
@@ -204,8 +206,11 @@ impl Cache {
             return None;
         };
         self.stats.read_hits = self.stats.read_hits.wrapping_add(1);
-        self.clock = self.clock.wrapping_add(1);
-        self.lines[index].used = self.clock;
+        // SPRU871K 3.3.4: frozen hits service data without modifying replacement order.
+        if !self.frozen {
+            self.clock = self.clock.wrapping_add(1);
+            self.lines[index].used = self.clock;
+        }
         Some(self.lines[index].data[(address - base) as usize])
     }
 
@@ -216,9 +221,11 @@ impl Cache {
             return false;
         };
         self.stats.write_hits = self.stats.write_hits.wrapping_add(1);
-        self.clock = self.clock.wrapping_add(1);
+        if !self.frozen {
+            self.clock = self.clock.wrapping_add(1);
+            self.lines[index].used = self.clock;
+        }
         let line = &mut self.lines[index];
-        line.used = self.clock;
         line.data[(address - base) as usize] = value;
         line.dirty = true;
         true
@@ -235,9 +242,11 @@ impl Cache {
             return false;
         };
         self.stats.write_hits = self.stats.write_hits.wrapping_add(N as u64);
-        self.clock = self.clock.wrapping_add(N as u64);
+        if !self.frozen {
+            self.clock = self.clock.wrapping_add(N as u64);
+            self.lines[index].used = self.clock;
+        }
         let line = &mut self.lines[index];
-        line.used = self.clock;
         line.data[offset..offset + N].copy_from_slice(&bytes);
         line.dirty = true;
         true

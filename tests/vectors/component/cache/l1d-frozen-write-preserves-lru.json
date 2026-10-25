@@ -1,0 +1,25 @@
+{
+  "domain": "cache",
+  "source": "SPRU871K section 3.3.4 p.54: frozen write hits update data and mark the line dirty but do not modify the LRU bit. A must be evicted and written back on the next conflicting fill, without evicting B.",
+  "request": {
+    "action": "system",
+    "id": "cache:l1d-frozen-write-preserves-lru",
+    "operations": [
+      {"op":"write32", "address":25461632, "value":1},
+      {"op":"write32", "address":25428032, "value":1},
+      {"op":"write_bytes", "address":3758096384, "hex":"01000000"},
+      {"op":"write_bytes", "address":3758098432, "hex":"02000000"},
+      {"op":"read32", "address":3758096384},
+      {"op":"read32", "address":3758098432},
+      {"op":"write_bytes", "address":3758098432, "hex":"03000000"},
+      {"op":"write32", "address":25428036, "value":1},
+      {"op":"write32", "address":3758096384, "value":4},
+      {"op":"read32", "address":3758096384},
+      {"op":"write32", "address":25428036, "value":0},
+      {"op":"read32", "address":3758100480},
+      {"op":"read32", "address":3758098432},
+      {"op":"read32", "address":3758096384}
+    ]
+  },
+  "expected": {"observations":[1,2,4,0,2,4]}
+}

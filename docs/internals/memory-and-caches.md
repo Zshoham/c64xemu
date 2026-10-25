@@ -221,7 +221,9 @@ cycles: a maintenance operation is not charged.
 Freezing is `Cache::freeze`, and L1PCC/L1DCC keep the returned previous value in bit 16. A frozen
 cache still serves hits and still updates a line it already holds, but `insert` allocates
 nothing, so a miss is served from the level below and leaves no line
-(`cache:l1d-freeze-blocks-allocation`). L2 has no freeze register in this model.
+(`cache:l1d-freeze-blocks-allocation`). Frozen L1D read and write hits leave replacement order
+unchanged (SPRU871K section 3.3.4), so the first conflicting fill after unfreezing evicts the
+same line it would have before the frozen hits. L2 has no freeze register in this model.
 
 ## The write buffer
 
