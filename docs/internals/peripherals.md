@@ -298,12 +298,14 @@ which is real state the model has.
 | Power/sleep controller, `src/psc.rs` | `02AE 0000h` | a global PSC owning every register plus one local PSC per clock domain; software stages MDCTLn.NEXT, writes the domain's GO bit in PTCMD, PTSTAT.GOSTAT reads 1 in flight, MDSTATn.STATE reports what was reached ([SPRUEG3B](../reference/sprueg3b.pdf) §4.1.2 and §9.6) |
 | Shared-memory controller, `src/smc.rs` | control at `02AA 8000h` (32K), profilers SMCP0-5 at `02C2 0000h` + 16K per core | the SL2 register file and the six per-core profilers on the UMAP1 interface |
 
-The SMC module is the register file plus the queries the device model drives it with. It models
-neither the SL2 storage nor the prefetch buffers, arbitration, write token controller or wait
-states of [SPRUEG5D](../reference/sprueg5d.pdf) §2.3 to §2.5 — those live in the memory path,
-which reads the levels this block exposes (`prefetchable_pages`, `page_sleep_state`) and pushes
-events into it (`note_protection_fault`, `SharedMemoryProfiler::note_access`). SPRUEG5D gives no
-base addresses at all; both come from SPRS612G Table 2-2.
+The SMC module is the register file plus the queries the device model is meant to drive it with.
+It models neither the SL2 storage nor the prefetch buffers, arbitration, write token controller or
+wait states of [SPRUEG5D](../reference/sprueg5d.pdf) §2.3 to §2.5. The queries it exposes
+(`prefetchable_pages`, `page_sleep_state`, `note_protection_fault`, the link monitor and
+`SharedMemoryProfiler::note_access`) are compiled for the unit tests only: nothing in the memory
+path calls them yet, so the register file is real and its effects are not (see the ROADMAP item
+*The SMC is a register file nothing drives*). SPRUEG5D gives no base addresses at all; both come
+from SPRS612G Table 2-2.
 
 The C6455's equivalent of the chip configuration block is `src/devcfg.rs` at a different address
 with different fields. The two devices share no register there beyond the idea.

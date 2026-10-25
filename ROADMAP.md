@@ -631,6 +631,20 @@ pinned; `interrupt_makes_an_outstanding_load_visible_to_its_early_consumer` now 
 meeting using Example 5-14 p.558: ADD sees old A1 uninterrupted, but loaded A1 after
 an intervening interrupt and B IRP return. No execution change was needed.
 
+**[ ] A predicated-off branch and the interrupt block.** *Observation from the interrupt fix;
+unverified, no case, no quote checked yet.* While writing the NTSR.IB case, an exploratory
+assertion found that a predicated-off wide branch did not set `branch_block_until`. SPRU732J
+§5.5.2 p.549 is the passage to read first: if it says the block applies whether or not the
+branch is taken, this is a defect with a quote; if it speaks only of taken branches, it is
+nothing. Settle that before writing anything.
+
+**[ ] Several QDMA channels mapped to one PaRAM set.** *Observation from the null-set fix;
+unverified, no case, no quote checked yet.* `link_triggers_qdma` (`src/edma.rs`) walks every
+QCHMAP entry whose set matches the link target, so a link copy into a set that several channels
+map may set QEMR for an enabled channel spuriously. Whether the guide allows two channels to
+share a set, and what a link copy into one triggers, is for SPRU966C §2.3.7 and the QCHMAP
+register description to say; read both before writing a case.
+
 **[x] Privilege.** *Done for the CPU.* `TSR.CXM` is tracked, User mode is entered the only way the
 architecture allows - returning from a context whose CXM is set - and the restored mode takes
 effect at the branch target rather than in the delay slots, so a restricted instruction in a
@@ -1410,6 +1424,28 @@ registers need to be re-initialized". All twenty-six are inside the frozen Pytho
 record, which is why this is written down: every case id and every expectation was unchanged,
 so the amendment was to the setup and not to an answer. That historical record remains in
 `tests/vectors/component-python-baseline.json`; the current per-case vectors are executable.
+
+**[ ] The SMC is a register file nothing drives.** *Found by the interaction audit; open.* Every
+query the C6472 shared-memory controller offers the memory path - `load_link`, `link`,
+`take_link`, `note_protection_fault`, `prefetchable_pages`, `page_sleep_state`,
+`SharedMemoryProfiler::note_access`, `note_prefetch` - is `#[cfg(test)]` in `src/smc.rs`, and
+nothing in the device calls any of them: the unit tests pin each rule through direct calls, and
+the CPU, the EDMA3 and the EMAC never reach it. Three consequences are documented answers the
+model gives wrongly today. (1) Linked atomics on SL2 bypass the monitor: the CPU keeps its
+reservation privately (`src/cpu.rs` LL/SL/CMTL), so a second SL after a stored link overwrites the
+buffered word and CMTL commits, where SPRUEG5D section 3.1.2 Table 3 says a matching SL with
+LinkdtV already set must "Invalidate the Link (LinkV = 0)" and section 3.1.3 Table 4 says a commit
+against LinkV = 0 must "Discard the request and return '0'". (2) A User-mode CPU write to an SMC
+register raises nothing, where section 5.1 says the SMC "generates an exception back to that
+C64x+ megamodule as well as to other C64x+ megamodules connected to it" and section 5.3 says it
+records the megamodule ID in SL2MPFSR.Faulted_CPU_ID and the mode in SL2MPFSR.MODE; event 63 can
+therefore never assert. (3) Page sleep, prefetchability and the profilers' access counters never
+see an access. The cases to write are firmware on the C6472 with caches off and a non-prefetchable
+SL2 word: LL, SL(A), SL(B), CMTL must return zero and leave memory unchanged, with the monitor's
+LinkData still A; and a User-mode write to SL2PFCPEN on one core must leave CPU_ID, MODE and
+MPFAR in SL2MPFSR/SL2MPFAR and assert event 63 on all six cores. Which bank a given address
+selects is not settled by SPRUEG5D (the unit tests take address bits 6-5 from the monitor
+granule), so a two-core contention case must use the same address for both cores.
 
 **[-] PERCFG0 gating.** The registers are modelled and pinned - the lock sequence, PERSTAT0 and
 PERSTAT1 with the five documented states, the write-once EMIFACTL/DDR2CTL - and what the control
@@ -2243,6 +2279,18 @@ came from these methods, in this order of what they have actually paid.
    observed through a transmitted frame; the other was SPRU871K 4.6.2.4.3's local-replaces-remote
    rule, and it turned out to be a defect in both halves of the fault path plus a third in
    MPFCLR. Anything found this way gets its own item and its own box the day it is found.
+
+   The second deliberate pass, run per domain by five read-only scouts and fixed in separate
+   worktrees, kept the bar and paid in proportion: ten candidates were taken, eight were defects
+   (an interrupt left a multicycle NOP's remaining cycles ahead of its handler; an NMI taken in a
+   branch shadow saved NTSR.IB clear; a null PaRAM set neither linked nor completed, which is two
+   defects; the C6455 MDIO interrupt bypassed EWCTL; SOFTRESET cleared the separate control
+   module's EWCTL; frozen L1D hits advanced the LRU; User-mode CPU writes changed
+   supervisor-only cache registers) and two were coverage gaps that passed at once. One more
+   scout finding, the SMC, was not an interaction defect but a block no production path reaches,
+   and became the open item *The SMC is a register file nothing drives*. Scouts sketch tests and
+   predict verdicts; each defect was settled by writing its test red first, and the scouts'
+   predictions held in all eight.
 2. **Reading a manual closely enough to solve it rather than quote it.** The L1P and L1D miss
    numbers came out of a table of averages that one occupancy explains; the cache aperture
    geometry came out of a figure. The same reading is what refuted an item this list used to
