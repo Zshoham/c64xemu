@@ -5503,6 +5503,35 @@ mod tests {
     }
 
     #[test]
+    fn interrupt_makes_an_outstanding_load_visible_to_its_early_consumer() {
+        // SPRU732J §5.7.1 p.557 / Example 5-14 p.558: ADD in LDW's delay
+        // slots sees old A1 normally, but loaded A1 after an intervening interrupt.
+        for interrupted in [false, true] {
+            let mut cpu = Cpu::new(0);
+            cpu.set_register("A0", 0x1000).unwrap();
+            cpu.set_register("A2", 7).unwrap();
+            cpu.write_bytes(0x1000, &10u32.to_le_bytes());
+            cpu.write_words(0, &[0x0080_0264, 0x0188_2078, 0x0000_4000]);
+            // LDW .D1 *A0,A1 ; ADD .L1 A1,A2,A3 ; NOP 3
+            cpu.write_words(0x4a0, &[0x0018_00e2, 0x0000_8000]); // B IRP ; NOP 5
+            cpu.control.write(0x05, 0x400);
+            cpu.control.write(0x04, (1 << 5) | 2);
+            cpu.control.write(0x01, 1);
+            if interrupted {
+                cpu.control.write(0x02, 1 << 5);
+            }
+            cpu.run(1); // interrupt, if requested, is taken after LDW and before ADD
+            if interrupted {
+                assert_eq!(cpu.control.read(0x06, 0), 4);
+                cpu.run(15); // nine entry cycles and B IRP with five delay slots
+            }
+            cpu.run(1);
+            assert_eq!(cpu.register('A', 3), if interrupted { 17 } else { 7 });
+            assert_eq!(cpu.fault(), None);
+        }
+    }
+
+    #[test]
     fn interrupt_and_exception_annul_multicycle_nop_tails() {
         // SPRU732J §5.6.2 p.557 and §6.4.2 p.572: annulled later cycles of a
         // multicycle NOP save the next packet in IRP/NRP, not the NOP itself.

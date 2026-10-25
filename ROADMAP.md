@@ -623,6 +623,14 @@ the branch-blocking state before discarding the pending branch and its shadow.
 `nmi_exception_saves_branch_blocking_in_ntsr_ib` checks NTSR.IB, NRP, vector and
 handler execution both inside and outside a taken branch's shadow.
 
+**[x] Interrupt entry versus an outstanding load's early consumer.** *Coverage gap closed.*
+SPRU732J §5.7.1 p.557 says, “The instructions encountered after the return from
+the interrupt do not experience any delay slots from the instructions prior to
+processing the interrupt.” Load writeback and interrupt entry/return were independently
+pinned; `interrupt_makes_an_outstanding_load_visible_to_its_early_consumer` now pins their
+meeting using Example 5-14 p.558: ADD sees old A1 uninterrupted, but loaded A1 after
+an intervening interrupt and B IRP return. No execution change was needed.
+
 **[x] Privilege.** *Done for the CPU.* `TSR.CXM` is tracked, User mode is entered the only way the
 architecture allows - returning from a context whose CXM is set - and the restored mode takes
 effect at the branch target rather than in the delay slots, so a restricted instruction in a
