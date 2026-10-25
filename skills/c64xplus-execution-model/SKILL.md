@@ -192,6 +192,11 @@ no alignment fault. Regular `LDW`/`LDDW` etc. assume alignment; the hardware sim
 the low address bits, so an emulator should mask rather than fault (or fault behind a
 debug flag — this catches real firmware bugs).
 
+A doubleword access is endian-dependent in which register gets which word: on little endian the
+word at the lower address goes to the even register, on big endian to the odd one (SPRU732J
+LDDW). The same holds for `STDW`, `LDNDW`, `STNDW` and their compact forms. A push and pop of a
+pair round-trip either way, so only code that reads half a pair back with `LDW` notices.
+
 ## 40-bit and 64-bit values in register pairs
 
 Pairs are `odd:even`, always written odd-first in assembly (`A1:A0`). The even register

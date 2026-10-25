@@ -64,8 +64,19 @@ struct Fetched {
     prot: bool,
 }
 
+/// The two 32-bit words of a doubleword access, paired with the register pair. Little endian
+/// puts the word at the lower address in the even register and big endian in the odd one
+/// (SPRU732J LDDW: "In big-endian mode, the first 32-bit word in memory is loaded into the odd
+/// register"); the same swap maps a pair's (even, odd) to (first, second) word in memory, so
+/// one function serves loads and stores.
+fn doubleword_halves(endian: Endian, first: u32, second: u32) -> (u32, u32) {
+    match endian {
+        Endian::Little => (first, second),
+        Endian::Big => (second, first),
+    }
+}
+
 /// A fetch packet's last word is a header when its top nibble is 0xE (SPRUFE8B section 3.7).
-#[inline(always)]
 fn is_packet_header(word: u32) -> bool {
     word & 0xf000_0000 == 0xe000_0000
 }
@@ -2271,8 +2282,11 @@ impl Cpu {
                 let aligned = effective & !7;
                 let data_bank = encoded_data_bank(word);
                 let dst = ((word >> 23) & 0x1f) as usize;
-                let low = self.read_u32(bus, aligned);
-                let high = self.read_u32(bus, aligned.wrapping_add(4));
+                let (low, high) = doubleword_halves(
+                    bus.endian(),
+                    self.read_u32(bus, aligned),
+                    self.read_u32(bus, aligned.wrapping_add(4)),
+                );
                 self.schedule_load(data_bank, dst, low, 4);
                 self.schedule_load(data_bank, dst + 1, high, 4);
             }
@@ -2287,8 +2301,11 @@ impl Cpu {
                 }
                 let data_bank = encoded_data_bank(word);
                 let dst = (((word >> 24) & 0x0f) * 2) as usize;
-                let low = self.read_u32(bus, effective);
-                let high = self.read_u32(bus, effective.wrapping_add(4));
+                let (low, high) = doubleword_halves(
+                    bus.endian(),
+                    self.read_u32(bus, effective),
+                    self.read_u32(bus, effective.wrapping_add(4)),
+                );
                 self.schedule_load(data_bank, dst, low, 4);
                 self.schedule_load(data_bank, dst + 1, high, 4);
             }
@@ -2381,18 +2398,12 @@ impl Cpu {
                 self.note_store(bus, aligned);
                 let data_bank = encoded_data_bank(word);
                 let src = ((word >> 23) & 0x1f) as usize;
-                self.writeback.schedule_store(StoreWrite {
-                    due: self.cycle,
-                    address: aligned,
-                    size: 4,
-                    value: self.read_register(data_bank, src),
-                });
-                self.writeback.schedule_store(StoreWrite {
-                    due: self.cycle,
-                    address: aligned.wrapping_add(4),
-                    size: 4,
-                    value: self.read_register(data_bank, src + 1),
-                });
+                let (first, second) = doubleword_halves(
+                    bus.endian(),
+                    self.read_register(data_bank, src),
+                    self.read_register(data_bank, src + 1),
+                );
+                self.schedule_doubleword_store(aligned, first, second);
             }
             Opcode::Stndw => {
                 // The `sc` bit selects a scaled offset: 1 shifts the offset left by three (SPRUFE8B
@@ -2406,18 +2417,12 @@ impl Cpu {
                 let data_bank = encoded_data_bank(word);
                 self.note_store(bus, effective);
                 let src = (((word >> 24) & 0x0f) * 2) as usize;
-                self.writeback.schedule_store(StoreWrite {
-                    due: self.cycle,
-                    address: effective,
-                    size: 4,
-                    value: self.read_register(data_bank, src),
-                });
-                self.writeback.schedule_store(StoreWrite {
-                    due: self.cycle,
-                    address: effective.wrapping_add(4),
-                    size: 4,
-                    value: self.read_register(data_bank, src + 1),
-                });
+                let (first, second) = doubleword_halves(
+                    bus.endian(),
+                    self.read_register(data_bank, src),
+                    self.read_register(data_bank, src + 1),
+                );
+                self.schedule_doubleword_store(effective, first, second);
             }
             Opcode::Stnw => {
                 let (effective, update) =
@@ -3393,26 +3398,33 @@ impl Cpu {
                 self.schedule(Bank::B, 15, updated, 0);
                 let aligned = if doubleword { base & !7 } else { base & !3 };
                 if load {
-                    let low = self.read_u32(bus, aligned);
-                    self.schedule_load(data_bank, register, low, 4);
                     if doubleword {
-                        let high = self.read_u32(bus, aligned.wrapping_add(4));
+                        let (low, high) = doubleword_halves(
+                            bus.endian(),
+                            self.read_u32(bus, aligned),
+                            self.read_u32(bus, aligned.wrapping_add(4)),
+                        );
+                        self.schedule_load(data_bank, register, low, 4);
                         self.schedule_load(data_bank, register + 1, high, 4);
+                    } else {
+                        let value = self.read_u32(bus, aligned);
+                        self.schedule_load(data_bank, register, value, 4);
                     }
                 } else {
                     self.note_store(bus, aligned);
-                    self.writeback.schedule_store(StoreWrite {
-                        due: self.cycle,
-                        address: aligned,
-                        size: 4,
-                        value: self.read_register(data_bank, register),
-                    });
                     if doubleword {
+                        let (first, second) = doubleword_halves(
+                            bus.endian(),
+                            self.read_register(data_bank, register),
+                            self.read_register(data_bank, register + 1),
+                        );
+                        self.schedule_doubleword_store(aligned, first, second);
+                    } else {
                         self.writeback.schedule_store(StoreWrite {
                             due: self.cycle,
-                            address: aligned.wrapping_add(4),
+                            address: aligned,
                             size: 4,
-                            value: self.read_register(data_bank, register + 1),
+                            value: self.read_register(data_bank, register),
                         });
                     }
                 }
@@ -3476,8 +3488,11 @@ impl Cpu {
                 if shape.load {
                     if size == 8 {
                         let aligned = if aligned_access { base & !7 } else { base };
-                        let low = self.read_u32(bus, aligned);
-                        let high = self.read_u32(bus, aligned.wrapping_add(4));
+                        let (low, high) = doubleword_halves(
+                            bus.endian(),
+                            self.read_u32(bus, aligned),
+                            self.read_u32(bus, aligned.wrapping_add(4)),
+                        );
                         self.schedule_load(data_bank, register, low, 4);
                         self.schedule_load(data_bank, register + 1, high, 4);
                     } else {
@@ -3502,18 +3517,12 @@ impl Cpu {
                 } else if size == 8 {
                     let aligned = if aligned_access { base & !7 } else { base };
                     self.note_store(bus, aligned);
-                    self.writeback.schedule_store(StoreWrite {
-                        due: self.cycle,
-                        address: aligned,
-                        size: 4,
-                        value: self.read_register(data_bank, register),
-                    });
-                    self.writeback.schedule_store(StoreWrite {
-                        due: self.cycle,
-                        address: aligned.wrapping_add(4),
-                        size: 4,
-                        value: self.read_register(data_bank, register + 1),
-                    });
+                    let (first, second) = doubleword_halves(
+                        bus.endian(),
+                        self.read_register(data_bank, register),
+                        self.read_register(data_bank, register + 1),
+                    );
+                    self.schedule_doubleword_store(aligned, first, second);
                 } else {
                     self.writeback.schedule_store(StoreWrite {
                         due: self.cycle,
@@ -3951,6 +3960,19 @@ impl Cpu {
         self.prot_load |= self.prot_packet;
         let timing = bus.access_timing(address);
         self.accesses.push(Access { address, timing });
+    }
+
+    /// A doubleword store as two word writes in this cycle, `first` at `address` and `second`
+    /// four bytes above it; `doubleword_halves` has already put the pair in memory order.
+    fn schedule_doubleword_store(&mut self, address: u32, first: u32, second: u32) {
+        for (offset, value) in [(0, first), (4, second)] {
+            self.writeback.schedule_store(StoreWrite {
+                due: self.cycle,
+                address: address.wrapping_add(offset),
+                size: 4,
+                value,
+            });
+        }
     }
 
     fn note_store(&mut self, bus: &mut CoreBus<'_>, address: u32) {
@@ -6145,6 +6167,71 @@ mod tests {
             0x1122_3344_5566_7788u64.to_le_bytes()
         );
         assert_eq!(cpu.fault(), None);
+    }
+
+    #[test]
+    fn a_doubleword_puts_its_first_memory_word_in_the_even_register_only_on_little_endian() {
+        // SPRU732J LDDW: "In little-endian mode, the first 32-bit word in memory is loaded into
+        // the even register. In big-endian mode, the first 32-bit word in memory is loaded into
+        // the odd register", and Example 2 loads mem 18h = 4021 3333h, 3333 3333h into
+        // A1:A0 = 4021 3333h:3333 3333h in big-endian mode. A push with STDW and a pop with
+        // LDDW round-trip either way; what the rule decides is the memory image in between,
+        // which a word load of one half of a pushed pair sees.
+        const STDW_A11_A10_B15_POSTDEC: u32 = 0x053c_35c4;
+        const LDDW_B15_PREINC_A11_A10: u32 = 0x053c_33e4;
+        for endian in [Endian::Little, Endian::Big] {
+            let mut cpu = Cpu::new_with_endian(0, endian);
+            cpu.write_words(
+                0,
+                &[
+                    STDW_A11_A10_B15_POSTDEC,
+                    0x0000_8000,
+                    LDDW_B15_PREINC_A11_A10,
+                    0x0000_8000,
+                    0,
+                    0,
+                    0,
+                    0,
+                ],
+            );
+            cpu.set_register("B15", 0x1010).unwrap();
+            cpu.set_register("A11", 0x4021_3333).unwrap();
+            cpu.set_register("A10", 0x3333_3333).unwrap();
+            cpu.run(1);
+            cpu.run(5);
+            let stored = cpu.host_read_bytes(0x1010, 8);
+            let expected: [u8; 8] = match endian {
+                Endian::Little => [0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x21, 0x40],
+                Endian::Big => [0x40, 0x21, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33],
+            };
+            assert_eq!(
+                stored,
+                expected,
+                "STDW memory image, big endian: {}",
+                endian == Endian::Big
+            );
+            // Overwrite the image with Example 2's doubleword in this byte order and load it.
+            let image: [u8; 8] = match endian {
+                Endian::Little => [0x11, 0x11, 0x11, 0x11, 0x22, 0x22, 0x22, 0x22],
+                Endian::Big => [0x22, 0x22, 0x22, 0x22, 0x11, 0x11, 0x11, 0x11],
+            };
+            cpu.write_bytes(0x1010, &image);
+            cpu.run(8);
+            assert_eq!(cpu.fault(), None);
+            assert_eq!(cpu.register('B', 15), 0x1010);
+            assert_eq!(
+                cpu.register('A', 11),
+                0x2222_2222,
+                "odd register, big endian: {}",
+                endian == Endian::Big
+            );
+            assert_eq!(
+                cpu.register('A', 10),
+                0x1111_1111,
+                "even register, big endian: {}",
+                endian == Endian::Big
+            );
+        }
     }
 
     #[test]
