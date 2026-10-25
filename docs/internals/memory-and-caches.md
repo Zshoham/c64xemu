@@ -197,6 +197,14 @@ registers read back what was written; the word-count and global operation regist
 because an operation completes within the write. Every accepted write bumps `l1p_epoch`, which
 invalidates the CPU's one-packet fetch buffer.
 
+CPU writes also pass `Fabric::check_access` before reaching this register file. SPRU871K
+Tables 2-12, 3-16 and 4-23 make L1PCFG, L1DCFG, L2CFG, MARs, L1DINV and L2INV read-only
+to User mode. Such writes are discarded even when all SRAM pages are unrestricted. L1PCFG
+additionally records LOCAL/UW in L1PMPFSR and raises the local protection event, as section
+2.9.1.2 explicitly requires; the L1D/L2 tables specify no register-fault subtype. User freeze,
+block coherence, global writeback/writeback-invalidate, and L1P invalidate writes remain
+permitted. These CPU checks do not restrict DMA, EMAC or HPI configuration accesses.
+
 | Register | Address | Effect of a write |
 |---|---|---|
 | L2CFG / L1PCFG / L1DCFG | 0184 0000h / 0020h / 0040h | flush as required, resize, re-report the SRAM remainder |
@@ -221,7 +229,9 @@ cycles: a maintenance operation is not charged.
 Freezing is `Cache::freeze`, and L1PCC/L1DCC keep the returned previous value in bit 16. A frozen
 cache still serves hits and still updates a line it already holds, but `insert` allocates
 nothing, so a miss is served from the level below and leaves no line
-(`cache:l1d-freeze-blocks-allocation`). L2 has no freeze register in this model.
+(`cache:l1d-freeze-blocks-allocation`). Frozen L1D read and write hits leave replacement order
+unchanged (SPRU871K section 3.3.4), so the first conflicting fill after unfreezing evicts the
+same line it would have before the frozen hits. L2 has no freeze register in this model.
 
 ## The write buffer
 
@@ -307,8 +317,8 @@ for the shared L2 in 64 KB pages, and 16 pages of 2 KB over each L1 at MPPA16–
 
 An MPPA register carries LOCAL in bit 8, SR SW SX UR UW UX in bits 5–0, and the AID enables above
 them. Reset is 0000 FFFFh, which grants everything, so firmware that never programs a unit sees
-no faults; `mpu_restrictive` and `mpu_dma_restrictive` are recomputed on every MPPA write so the
-common case is one boolean test on the access path.
+no page faults; `mpu_restrictive` and `mpu_dma_restrictive` are recomputed on every MPPA write so
+the common page-check case is one boolean test on the access path.
 
 `Fabric::check_access` checks a CPU access against the page of whichever local memory holds it,
 consulting LOCAL plus the supervisor or user permission bit — the AID fields gate DMA masters by

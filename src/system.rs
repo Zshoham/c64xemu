@@ -2455,6 +2455,25 @@ impl Fabric {
         if self.shared.edma_privilege != privilege {
             self.present_to_edma(privilege);
         }
+        // Cache-register permissions apply even when every SRAM page is unrestricted.
+        // Keep this at the CPU seam: DMA/EMAC/HPI configuration writes do not inherit
+        // the mode of whichever CPU access preceded them.
+        if user
+            && permission == Permission::Write
+            && crate::memory::cache_register_requires_supervisor(address)
+        {
+            // Only L1P specifies a register-write fault (SPRU871K 2.9.1.2).
+            // The L1D/L2 permission tables specify read-only access, not a fault subtype.
+            if address & !3 == crate::memory::L1PCFG {
+                self.mm[core].record_mpu_fault(
+                    1,
+                    address,
+                    MPFSR_LOCAL | permission_bit(permission, user),
+                    self.profile.events,
+                );
+            }
+            return false;
+        }
         // Every page grants the CPU everything until software narrows one, which is the reset
         // state and the state the whole of this project's firmware runs in.
         if !self.mm[core].mpu_restrictive {
@@ -4381,6 +4400,63 @@ mod tests {
         fabric.write32(0, 0x0184_ac08, 1);
         assert_eq!(fabric.read32(0, 0x0184_ac04), 0);
         assert_eq!(fabric.read32(0, 0x0184_ac00), 0);
+    }
+
+    /// SPRU871K Tables 2-12, 3-16 and 4-23 distinguish size/MAR/global invalidate
+    /// protection from User-writable freeze and coherence operations.
+    #[test]
+    fn user_cache_register_permissions_do_not_restrict_supervisor_or_other_masters() {
+        let mut fabric = Fabric::default();
+        let protected = [L2CFG, L1PCFG, L1DCFG, 0x0184_5008, L1DINV];
+        for address in protected
+            .into_iter()
+            .chain((0..256).map(|index| MAR_BASE + index * 4))
+        {
+            assert!(fabric.check_access(0, address, Permission::Read, true));
+            assert!(fabric.check_access(0, address, Permission::Write, false));
+            assert!(!fabric.check_access(0, address, Permission::Write, true));
+        }
+        for address in [
+            0x0184_0024,
+            0x0184_0044, // L1PCC, L1DCC
+            0x0184_4000,
+            0x0184_4004, // L2 writeback block
+            0x0184_4010,
+            0x0184_4014, // L2 writeback-invalidate block
+            0x0184_4018,
+            0x0184_401c, // L2 invalidate block
+            0x0184_4020,
+            0x0184_4024, // L1P invalidate block
+            0x0184_4030,
+            0x0184_4034, // L1D writeback-invalidate block
+            0x0184_4040,
+            0x0184_4044, // L1D writeback block
+            0x0184_4048,
+            0x0184_404c, // L1D invalidate block
+            0x0184_5000,
+            0x0184_5004, // L2WB, L2WBINV
+            0x0184_5028,
+            0x0184_5040,
+            0x0184_5044, // L1PINV, L1DWB, L1DWBINV
+        ] {
+            assert!(fabric.check_access(0, address, Permission::Write, true));
+        }
+        // Section 2.9.1.2 explicitly specifies a fault for the L1P register write.
+        assert_eq!(fabric.read32(0, 0x0184_a400), L1PCFG);
+        assert_eq!(fabric.read32(0, 0x0184_a404), MPFSR_LOCAL | 2);
+        assert_ne!(
+            fabric.megamodule(0).event_flag_registers()[3] & (1 << 24),
+            0
+        );
+        // No L1D/L2 register-fault subtype is specified by their permission tables.
+        assert_eq!(fabric.read32(0, 0x0184_ac04), 0);
+        assert_eq!(fabric.read32(0, 0x0184_a004), 0);
+        // Other masters do not call the CPU permission seam; a previous User access
+        // must not poison the configuration port for their next transfer.
+        fabric.write32(0, MAR_BASE + 224 * 4, 1);
+        fabric.write32(0, L2CFG, 1);
+        assert_eq!(fabric.read32(0, MAR_BASE + 224 * 4), 1);
+        assert_eq!(fabric.read32(0, L2CFG), 1);
     }
 
     /// Denying execute makes the fetch path deliver nothing, so an address in that page reads

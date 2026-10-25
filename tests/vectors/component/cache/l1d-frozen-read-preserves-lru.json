@@ -1,0 +1,23 @@
+{
+  "domain": "cache",
+  "source": "SPRU871K section 3.3.4 p.54: frozen read hits return cached data but do not modify the LRU bit. A and B share a two-way set; touching A while frozen must leave A the next victim.",
+  "request": {
+    "action": "system",
+    "id": "cache:l1d-frozen-read-preserves-lru",
+    "operations": [
+      {"op":"write32", "address":25461632, "value":1},
+      {"op":"write32", "address":25428032, "value":1},
+      {"op":"write_bytes", "address":3758096384, "hex":"01000000"},
+      {"op":"write_bytes", "address":3758098432, "hex":"02000000"},
+      {"op":"read32", "address":3758096384},
+      {"op":"read32", "address":3758098432},
+      {"op":"write_bytes", "address":3758096384, "hex":"03000000"},
+      {"op":"write32", "address":25428036, "value":1},
+      {"op":"read32", "address":3758096384},
+      {"op":"write32", "address":25428036, "value":0},
+      {"op":"read32", "address":3758100480},
+      {"op":"read32", "address":3758096384}
+    ]
+  },
+  "expected": {"observations":[1,2,1,0,3]}
+}

@@ -52,6 +52,13 @@ const L1DWBINV: u32 = 0x0184_5044;
 pub(crate) const L1DINV: u32 = 0x0184_5048;
 pub(crate) const MAR_BASE: u32 = 0x0184_8000;
 
+/// Read-only to CPU User mode (SPRU871K Tables 2-12, 3-16 and 4-23).
+/// Freeze, writeback and block coherence controls deliberately remain User-writable.
+pub(crate) fn cache_register_requires_supervisor(address: u32) -> bool {
+    matches!(address & !3, L2CFG | L1PCFG | L1DCFG | L2INV | L1DINV)
+        || (MAR_BASE..MAR_BASE + 256 * 4).contains(&address)
+}
+
 /// Whether an address is ordinary memory rather than a peripheral configuration space or a
 /// peripheral data port. A DMA master reaches the port rather than memory when this is false.
 pub(crate) fn is_memory(address: u32) -> bool {

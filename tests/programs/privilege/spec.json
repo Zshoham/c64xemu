@@ -9,7 +9,8 @@
     "-O2"
   ],
   "expect": {
-    "A4": 310437532
+    "A4": 244087886
   },
+  "cache_permissions_source": "SPRU871K Tables 2-12 (p.34), 3-16 (p.66), and 4-23 (p.106): Supervisor-only cache size/MAR/global data invalidate writes must not change state, while User freeze and block writeback remain permitted. Section 2.9.1.2 (p.37) explicitly requires a local memory protection fault for a disallowed L1P register write; Table 2-23 defines LOCAL | UW = 258. Supervisor readback checks retained sizes/MAR, and a dirty DDR line surviving prohibited invalidates and reaching backing memory checks permitted block writeback. Starting from the original privilege checksum 310437532, rotate left five then XOR each of [1, 1, 0, 1, 1, 1, 25428000, 258, 1, 1, 85] to obtain A4 = 244087886.",
   "expected_source": "hand-written assembly; the constant comes from an independent C model on the host of the documented privilege rules - SPRU732J 8.1 for entering User mode by returning from a context whose CXM is set and for the mode taking effect at the branch target, 8.2.4.1 for the fully restricted control registers raising an exception that reports IERR.RAX together with IERR.PRX (the union of that list and Table 3-22, which also names ISR and DIER), 8.2.4.2 for CSR and TSR being partially writable so that a User write of all ones to TSR reaches GIE and SGIE alone, 8.2.4.3 for B IRP, B NRP and IDLE raising IERR.OPX with IERR.PRX, 8.4 for SWENR entering at REP, Table 6-3 for the context each exception saves, and Table 2-9 for CSR.EN reading 1 on this little-endian device"
 }
