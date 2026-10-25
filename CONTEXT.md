@@ -85,6 +85,14 @@ zero count. A destination is any address a CPU access reaches, so a table places
 writes registers - which is how one starts the other cores.
 _Avoid_: image, load record
 
+**boot source**:
+What the strapped boot mode asks for, resolved once against the device profile: no boot (the
+image is placed directly), the HPI host, a serial EEPROM over I2C, the UTOPIA ATM master, or
+Ethernet on one MAC port. The pins themselves still reach the device, which latches them into
+its registers and lets the boot ROM read them; every host-side decision - which connections a
+boot needs, whether the image is loaded, which boot starts - reads the boot source instead.
+_Avoid_: boot mode (for the resolved value; the boot mode is the pins)
+
 **machine**:
 The module every front end drives: a loaded image, the CPU, and the host connections the
 device needs — the CIO handshake, the Ethernet backend, the HPI host side, the UTOPIA's ATM

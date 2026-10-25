@@ -16,7 +16,58 @@
 //! Words are read in the device's byte order, which is what the hex conversion utility's `-order`
 //! option matches to the build.
 
+use crate::device::DeviceProfile;
 use crate::system::Endian;
+
+/// What the strapped boot mode asks for, resolved once against the device profile. The pins
+/// themselves still reach the device, which latches them into its registers; every host-side
+/// decision - which arguments a boot needs, whether the ELF is loaded, which boot the ROM
+/// runs - reads this instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BootSource {
+    /// No ROM or host boot: the machine places the ELF image itself.
+    Image,
+    /// HPI host boot, mode 1 on either device (SPRS276M section 2.4, SPRUEC6G section 4.3.2).
+    Hpi,
+    /// The master I2C boot from a serial EEPROM: the C6455's mode 5, the C6472's modes 2 and
+    /// 3. Which EEPROM address the mode names is the boot ROM's own reading of the pins.
+    I2c,
+    /// The C6472 ROM's UTOPIA boot (SPRUEC6G section 4.3.4). The C6455's modes 5-8
+    /// are other boots (section 2.3).
+    Utopia,
+    /// Only the C6472 ROM boots over Ethernet (SPRUEC6G section 4.3.5, modes 9 and 10).
+    /// The C6455 boot mode table has no Ethernet entry (section 2.3), so these pins
+    /// are refused rather than quietly held in reset.
+    Ethernet { port: usize, base: u32 },
+}
+
+impl BootSource {
+    pub(crate) fn resolve(profile: &'static DeviceProfile, strap: u8) -> Result<Self, String> {
+        if strap == crate::hpi::BOOTMODE_HPI {
+            return Ok(Self::Hpi);
+        }
+        if profile.has_boot_controller && crate::utopiaboot::is_boot_mode(strap) {
+            return Ok(Self::Utopia);
+        }
+        if crate::i2cboot::eeprom_address(profile.has_boot_controller, strap).is_some() {
+            return Ok(Self::I2c);
+        }
+        if let Some(port) = crate::romboot::mac_boot_port(strap) {
+            if !profile.has_boot_controller || profile.emac_bases.len() <= port {
+                return Err(format!(
+                    "boot mode {strap} is the C6472's boot over MAC port {port}; the {} has no \
+                     Ethernet boot mode (SPRUEC6G sections 2.3 and 4.3.5)",
+                    profile.name
+                ));
+            }
+            return Ok(Self::Ethernet {
+                port,
+                base: profile.emac_bases[port],
+            });
+        }
+        Ok(Self::Image)
+    }
+}
 
 /// A section count large enough for any real image; a malformed table hits it instead of looping.
 const MAX_SECTIONS: usize = 4096;
@@ -273,6 +324,37 @@ impl BootStream {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn resolved_strap_table() {
+        use crate::device::{C6455, C6472};
+
+        for profile in [&C6455, &C6472] {
+            for strap in 0..=u8::MAX {
+                let expected = match (profile.name, strap) {
+                    (_, 1) => Some(BootSource::Hpi),
+                    ("c6455", 5) | ("c6472", 2..=3) => Some(BootSource::I2c),
+                    ("c6472", 5..=8) => Some(BootSource::Utopia),
+                    ("c6472", 9..=10) => {
+                        let port = usize::from(strap - 9);
+                        Some(BootSource::Ethernet {
+                            port,
+                            base: profile.emac_bases[port],
+                        })
+                    }
+                    // The C6455 has no Ethernet boot; its pins are refused, not ignored.
+                    ("c6455", 9..=10) => None,
+                    _ => Some(BootSource::Image),
+                };
+                assert_eq!(
+                    BootSource::resolve(profile, strap).ok(),
+                    expected,
+                    "{} strap {strap}",
+                    profile.name
+                );
+            }
+        }
+    }
 
     #[derive(Default)]
     struct Memory {

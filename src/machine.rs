@@ -7,6 +7,7 @@
 //! same in every subcommand. Drivers update their breakpoint addresses when the list changes,
 //! then run or resume with stop conditions and read the snapshot; halt lifecycle stays here.
 
+use crate::boot::BootSource;
 use crate::cache::CacheView;
 use crate::cio;
 #[cfg(test)]
@@ -242,6 +243,7 @@ pub struct Machine {
     /// Which device this is, so a reload rebuilds the same one.
     profile: &'static DeviceProfile,
     boot_mode: u8,
+    boot_source: BootSource,
     /// The address fused into the MAC ID words, and the UDP port an Ethernet boot listens on.
     mac_id: [u8; 6],
     boot_udp_port: u16,
@@ -322,9 +324,11 @@ impl Machine {
         };
         let profile = DeviceProfile::named(&args.device)
             .ok_or_else(|| format!("unknown device {}", args.device))?;
-        let hpi_boot = args.boot_mode == crate::hpi::BOOTMODE_HPI;
-        let utopia_boot = utopia_boot(profile, args.boot_mode);
-        if utopia_boot {
+        // The strap is an Ethernet boot the device does not have: nothing else about the
+        // command line matters until that is fixed.
+        let boot_source = BootSource::resolve(profile, args.boot_mode)?;
+        let i2c_boot = boot_source == BootSource::I2c;
+        if boot_source == BootSource::Utopia {
             if args.utopia_unix.is_none() {
                 return Err("C6472 UTOPIA boot requires an ATM master on --utopia-unix".into());
             }
@@ -342,7 +346,7 @@ impl Machine {
                     .into(),
             );
         }
-        if hpi_boot {
+        if boot_source == BootSource::Hpi {
             if args.hpi_unix.is_none() {
                 return Err(format!(
                     "boot mode {} is the {}'s HPI host boot; give it the host with --hpi-unix",
@@ -365,8 +369,6 @@ impl Machine {
             }
             None => None,
         };
-        let i2c_boot =
-            crate::i2cboot::eeprom_address(profile.has_boot_controller, args.boot_mode).is_some();
         if i2c_boot && i2c_eeprom.is_none() {
             return Err(format!(
                 "boot mode {} is the {}'s master I2C boot; give it the EEPROM with --i2c-eeprom",
@@ -403,12 +405,7 @@ impl Machine {
         let i2c_cfggp = args.boot_param_index as u8 | (u8::from(args.i2c_pll_x19) << 4);
         // A boot builds the memory image from the host, wire or bus, so the ELF supplies only
         // symbols (SPRS276M section 2.4, SPRUEC6G sections 2.3.4 and 4.3.5).
-        let ethernet_boot = match ethernet_boot_port(profile, args.boot_mode) {
-            Some(Ok(_)) => true,
-            Some(Err(message)) => return Err(message),
-            None => false,
-        };
-        let load = if ethernet_boot || hpi_boot || utopia_boot || i2c_eeprom.is_some() {
+        let load = if boot_source != BootSource::Image {
             Load::Wire
         } else {
             Load::Segments(image.segments)
@@ -416,9 +413,10 @@ impl Machine {
         // One wire, and it is attached to one of the device's MACs: MAC 0 unless the command
         // line says otherwise, or the MAC an Ethernet boot was strapped to, because that is the
         // port the board would have cabled.
-        let net_port = args
-            .net_port
-            .unwrap_or_else(|| crate::romboot::mac_boot_port(args.boot_mode).unwrap_or(0));
+        let net_port = args.net_port.unwrap_or(match boot_source {
+            BootSource::Ethernet { port, .. } => port,
+            _ => 0,
+        });
         if net_port >= profile.emac_bases.len() {
             return Err(format!(
                 "the {} has no Ethernet MAC {net_port}",
@@ -429,6 +427,7 @@ impl Machine {
             device: Device::with_boot_mode(profile, image.entry, image.endian, args.boot_mode),
             profile,
             boot_mode: args.boot_mode,
+            boot_source,
             entry: image.entry,
             load,
             boot_config,
@@ -484,7 +483,9 @@ impl Machine {
             }
             // A capture file cannot be the Ethernet boot's source: the boot code resets the MAC
             // before it configures it, so frames handed over before the announcement are gone.
-            if ethernet_boot && machine.ethernet.has_preload() {
+            if matches!(machine.boot_source, BootSource::Ethernet { .. })
+                && machine.ethernet.has_preload()
+            {
                 return Err(
                     "--pcap-in frames arrive before an Ethernet boot has configured the \
                             MAC and are lost with its reset; drive the boot through --net-unix"
@@ -549,6 +550,7 @@ impl Machine {
             device: Device::from_cpu(cpu),
             profile: &crate::device::C6455,
             boot_mode: 0,
+            boot_source: BootSource::Image,
             entry: 0,
             load: Load::Segments(Vec::new()),
             boot_config: None,
@@ -626,23 +628,24 @@ impl Machine {
         // The board's fused Ethernet address: what the ROM's Ethernet boot names itself by, and
         // what any firmware reads out of the MAC ID words (SPRS612G Table 3-2).
         self.device.fabric().fuse_mac_id(self.mac_id);
-        if let Some(Ok(base)) = ethernet_boot_port(self.profile, self.boot_mode) {
-            self.device.begin_ethernet_boot(
+        match self.boot_source {
+            BootSource::Ethernet { base, .. } => self.device.begin_ethernet_boot(
                 base,
                 BootParameters {
                     udp_destination_port: self.boot_udp_port,
                     ..BootParameters::default()
                 },
-            );
-        }
-        if utopia_boot(self.profile, self.boot_mode) {
-            self.device
-                .begin_utopia_boot(self.boot_mode, self.utopia_phy);
-        }
-        if let Some(contents) = &self.i2c_eeprom {
-            let contents = contents.clone();
-            self.device
-                .begin_i2c_boot(self.boot_mode, self.i2c_cfggp, contents);
+            ),
+            BootSource::Utopia => self
+                .device
+                .begin_utopia_boot(self.boot_mode, self.utopia_phy),
+            BootSource::I2c => {
+                if let Some(contents) = &self.i2c_eeprom {
+                    self.device
+                        .begin_i2c_boot(self.boot_mode, self.i2c_cfggp, contents.clone());
+                }
+            }
+            BootSource::Image | BootSource::Hpi => {}
         }
         if let Some((table, address)) = &self.boot_config {
             // The configuration table runs before the boot table, which is the order the ROM
@@ -1345,7 +1348,7 @@ impl Machine {
                 "error": boot.error,
             });
         }
-        if self.boot_mode == crate::hpi::BOOTMODE_HPI {
+        if matches!(self.boot_source, BootSource::Hpi) {
             state["hpi_boot"] = json!({
                 "entry": self.device.hpi_boot_entry(0),
                 "entries": (0..self.cores())
@@ -1563,33 +1566,6 @@ fn cio_handshake(image: &Image) -> Option<(u32, u32)> {
         .get("__CIOBUF_")
         .or_else(|| image.symbols.get("_CIOBUF_"))?;
     Some((*breakpoint, *buffer))
-}
-
-/// Whether the strapped boot mode is the C6472 ROM's UTOPIA boot (SPRUEC6G section 4.3.4). The
-/// C6455's modes 5-8 are other boots (section 2.3).
-fn utopia_boot(profile: &DeviceProfile, boot_mode: u8) -> bool {
-    profile.has_boot_controller && crate::utopiaboot::is_boot_mode(boot_mode)
-}
-
-/// The MAC port register base an Ethernet boot uses, when the strapped boot mode asks for one:
-/// nothing when it does not, and the reason when the device has no such boot mode.
-///
-/// Only the C6472's ROM boots over Ethernet (SPRUEC6G section 4.3.5, boot modes 9 and 10). The
-/// C6455's boot mode table has no Ethernet entry at all (section 2.3), so the same pins mean
-/// something else there and the option is refused rather than quietly held in reset.
-fn ethernet_boot_port(
-    profile: &'static DeviceProfile,
-    boot_mode: u8,
-) -> Option<Result<u32, String>> {
-    let port = crate::romboot::mac_boot_port(boot_mode)?;
-    if !profile.has_boot_controller || profile.emac_bases.len() <= port {
-        return Some(Err(format!(
-            "boot mode {boot_mode} is the C6472's boot over MAC port {port}; the {} has no \
-             Ethernet boot mode (SPRUEC6G sections 2.3 and 4.3.5)",
-            profile.name
-        )));
-    }
-    Some(Ok(profile.emac_bases[port]))
 }
 
 /// `FILE:ADDR`: the raw image a bootloader reads, and where it sits in memory.
