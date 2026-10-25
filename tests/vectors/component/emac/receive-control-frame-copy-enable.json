@@ -56,12 +56,12 @@
       {
         "address": 46662916,
         "op": "write32",
-        "value": 3254779905
+        "value": 12746753
       },
       {
         "address": 46662912,
         "op": "write32",
-        "value": 1573248
+        "value": 1573120
       },
       {
         "address": 46661892,

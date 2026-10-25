@@ -138,9 +138,9 @@ static void mac_setup(void)
     for (index = 0; index < CORES; index++) {
         core_address(index, address);
         MACINDEX = index;
-        MACADDRHI = ((unsigned)address[2] << 24) | ((unsigned)address[3] << 16) |
-                    ((unsigned)address[4] << 8) | (unsigned)address[5];
-        MACADDRLO = ((unsigned)address[0] << 8) | (unsigned)address[1] | MACADDR_VALID |
+        MACADDRHI = ((unsigned)address[3] << 24) | ((unsigned)address[2] << 16) |
+                    ((unsigned)address[1] << 8) | (unsigned)address[0];
+        MACADDRLO = ((unsigned)address[5] << 8) | (unsigned)address[4] | MACADDR_VALID |
                     MACADDR_MATCH | (index << 16);
     }
     /* Unicast reception is per channel, and nothing else routes these frames. */

@@ -403,29 +403,29 @@ impl SlavePort for Emac {
                 status
             }
             FIFOCONTROL => self.effective_fifo_control(),
-            MACSRCADDRLO => (u32::from(self.mac_source[0]) << 8) | u32::from(self.mac_source[1]),
+            MACSRCADDRLO => (u32::from(self.mac_source[5]) << 8) | u32::from(self.mac_source[4]),
             MACSRCADDRHI => {
-                (u32::from(self.mac_source[2]) << 24)
-                    | (u32::from(self.mac_source[3]) << 16)
-                    | (u32::from(self.mac_source[4]) << 8)
-                    | u32::from(self.mac_source[5])
+                (u32::from(self.mac_source[3]) << 24)
+                    | (u32::from(self.mac_source[2]) << 16)
+                    | (u32::from(self.mac_source[1]) << 8)
+                    | u32::from(self.mac_source[0])
             }
             RXPAUSE => u32::from(self.rx_pause_timer),
             TXPAUSE => u32::from(self.tx_pause_timer),
             MACHASH1 => self.hash[0],
             MACHASH2 => self.hash[1],
-            // MACADDRLO holds bytes 0 and 1 plus the control bits; MACADDRHI holds bytes 2
-            // to 5, most significant byte first (SPRU975E Tables 71 and 72).
+            // In wire order, LO holds bytes 5 and 4 in bits 15:8 and 7:0; HI holds bytes
+            // 3, 2, 1, 0 from most to least significant (SPRU975E Tables 71 and 72).
             MACADDRLO => {
                 let slot = self.addresses[self.slot_index()];
-                (u32::from(slot.bytes[0]) << 8) | u32::from(slot.bytes[1]) | slot.control
+                (u32::from(slot.bytes[5]) << 8) | u32::from(slot.bytes[4]) | slot.control
             }
             MACADDRHI => {
                 let slot = self.addresses[self.slot_index()];
-                (u32::from(slot.bytes[2]) << 24)
-                    | (u32::from(slot.bytes[3]) << 16)
-                    | (u32::from(slot.bytes[4]) << 8)
-                    | u32::from(slot.bytes[5])
+                (u32::from(slot.bytes[3]) << 24)
+                    | (u32::from(slot.bytes[2]) << 16)
+                    | (u32::from(slot.bytes[1]) << 8)
+                    | u32::from(slot.bytes[0])
             }
             TXTEARDOWN | RXTEARDOWN => 0,
             _ if statistics_register(address) => {
@@ -477,14 +477,14 @@ impl SlavePort for Emac {
                 self.fifo_control_written = true;
             }
             MACSRCADDRLO => {
-                self.mac_source[0] = (value >> 8) as u8;
-                self.mac_source[1] = value as u8;
+                self.mac_source[5] = (value >> 8) as u8;
+                self.mac_source[4] = value as u8;
             }
             MACSRCADDRHI => {
-                self.mac_source[2] = (value >> 24) as u8;
-                self.mac_source[3] = (value >> 16) as u8;
-                self.mac_source[4] = (value >> 8) as u8;
-                self.mac_source[5] = value as u8;
+                self.mac_source[3] = (value >> 24) as u8;
+                self.mac_source[2] = (value >> 16) as u8;
+                self.mac_source[1] = (value >> 8) as u8;
+                self.mac_source[0] = value as u8;
             }
             RXPAUSE | TXPAUSE => {}
             MACHASH1 => self.hash[0] = value,
@@ -493,17 +493,17 @@ impl SlavePort for Emac {
             MACADDRLO => {
                 let index = self.slot_index();
                 let slot = &mut self.addresses[index];
-                slot.bytes[0] = (value >> 8) as u8;
-                slot.bytes[1] = value as u8;
+                slot.bytes[5] = (value >> 8) as u8;
+                slot.bytes[4] = value as u8;
                 slot.control = value & 0x001f_0000;
             }
             MACADDRHI => {
                 let index = self.slot_index();
                 let slot = &mut self.addresses[index];
-                slot.bytes[2] = (value >> 24) as u8;
-                slot.bytes[3] = (value >> 16) as u8;
-                slot.bytes[4] = (value >> 8) as u8;
-                slot.bytes[5] = value as u8;
+                slot.bytes[3] = (value >> 24) as u8;
+                slot.bytes[2] = (value >> 16) as u8;
+                slot.bytes[1] = (value >> 8) as u8;
+                slot.bytes[0] = value as u8;
             }
             // The teardown registers carry the channel to tear down in their low three bits.
             RXTEARDOWN => self.rx_teardown |= 1 << (value & 7),
@@ -1348,6 +1348,23 @@ mod tests {
     use super::*;
     use crate::port::SlavePort;
     #[test]
+    fn address_registers_encode_wire_order_bytes() {
+        let mut emac = Emac::default();
+        let wire = [0x02, 0x13, 0x24, 0x35, 0x46, 0x57];
+        let low = 0x5746 | MACADDR_VALID | MACADDR_MATCH | (3 << 16);
+        emac.write(MACADDRHI, 0x3524_1302, TEST_CONTEXT);
+        emac.write(MACADDRLO, low, TEST_CONTEXT);
+        emac.write(MACSRCADDRHI, 0x3524_1302, TEST_CONTEXT);
+        emac.write(MACSRCADDRLO, 0x5746, TEST_CONTEXT);
+        assert_eq!(emac.addresses[0].bytes, wire);
+        assert_eq!(emac.mac_source, wire);
+        assert_eq!(emac.read(MACADDRHI, TEST_CONTEXT), Some(0x3524_1302));
+        assert_eq!(emac.read(MACADDRLO, TEST_CONTEXT), Some(low));
+        assert_eq!(emac.read(MACSRCADDRHI, TEST_CONTEXT), Some(0x3524_1302));
+        assert_eq!(emac.read(MACSRCADDRLO, TEST_CONTEXT), Some(0x5746));
+    }
+
+    #[test]
     fn each_class_of_frame_goes_to_the_channel_its_rules_name() {
         // SPRU975E section 2.10 and Table 49: an address RAM match routes to the slot's CHANNEL
         // when that channel is enabled in RXUNICASTSET, broadcast goes to RXBROADCH, a
@@ -1355,17 +1372,17 @@ mod tests {
         // promiscuous reception is on.
         let mut emac = Emac::default();
         emac.write(MACINDEX, 0, TEST_CONTEXT);
-        emac.write(MACADDRHI, 0x0011_2233, TEST_CONTEXT);
+        emac.write(MACADDRHI, 0x1100_0002, TEST_CONTEXT);
         emac.write(
             MACADDRLO,
-            0x0200 | MACADDR_VALID | MACADDR_MATCH,
+            0x3322 | MACADDR_VALID | MACADDR_MATCH,
             TEST_CONTEXT,
         );
         emac.write(MACINDEX, 1, TEST_CONTEXT);
-        emac.write(MACADDRHI, 0x0044_5566, TEST_CONTEXT);
+        emac.write(MACADDRHI, 0x4400_0002, TEST_CONTEXT);
         emac.write(
             MACADDRLO,
-            0x0200 | MACADDR_VALID | MACADDR_MATCH | (2 << 16),
+            0x6655 | MACADDR_VALID | MACADDR_MATCH | (2 << 16),
             TEST_CONTEXT,
         );
         emac.write(RXUNICASTSET, 0b101, TEST_CONTEXT);
@@ -1403,8 +1420,8 @@ mod tests {
         assert_eq!(emac.receive_channel(&stranger), Some((6, NOMATCH)));
         // A slot whose match bit is clear filters its address even in promiscuous mode.
         emac.write(MACINDEX, 2, TEST_CONTEXT);
-        emac.write(MACADDRHI, 0x0099_8877, TEST_CONTEXT);
-        emac.write(MACADDRLO, 0x0200 | MACADDR_VALID, TEST_CONTEXT);
+        emac.write(MACADDRHI, 0x9900_0002, TEST_CONTEXT);
+        emac.write(MACADDRLO, 0x7788 | MACADDR_VALID, TEST_CONTEXT);
         assert_eq!(emac.receive_channel(&stranger), None);
     }
 
@@ -1436,10 +1453,10 @@ mod tests {
     fn receive_filtering_follows_the_enable_bits_and_the_address_ram() {
         let mut emac = Emac::default();
         emac.write(MACINDEX, 0, TEST_CONTEXT);
-        emac.write(MACADDRHI, 0x0011_2233, TEST_CONTEXT);
+        emac.write(MACADDRHI, 0x1100_0002, TEST_CONTEXT);
         emac.write(
             MACADDRLO,
-            0x0200 | MACADDR_VALID | MACADDR_MATCH,
+            0x3322 | MACADDR_VALID | MACADDR_MATCH,
             TEST_CONTEXT,
         );
         emac.write(RXUNICASTSET, 1, TEST_CONTEXT);

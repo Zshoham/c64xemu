@@ -104,8 +104,8 @@ int main(void)
     poke(L1DCFG, L1D_32K_CACHE);
     poke(EWCTL, 1);
     poke(MACINDEX, 0);
-    poke(MACADDRHI, 0x00112233u);
-    poke(MACADDRLO, 0x0200u | MACADDR_VALID | MACADDR_MATCH);
+    poke(MACADDRHI, 0x11000002u);
+    poke(MACADDRLO, 0x3322u | MACADDR_VALID | MACADDR_MATCH);
     poke(RXUNICASTSET, 1);
     poke(RXMAXLEN, 1518);
     poke(RXBUFFEROFFSET, 0);

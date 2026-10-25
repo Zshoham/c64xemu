@@ -76,9 +76,9 @@ static unsigned int peek(unsigned int address)
 static void program_address(void)
 {
     poke(MACINDEX, 0);
-    /* Station address 02:00:00:11:22:33: bytes 2 to 5 live in MACADDRHI. */
-    poke(MACADDRHI, (0x00u << 24) | (0x11u << 16) | (0x22u << 8) | 0x33u);
-    poke(MACADDRLO, (0x02u << 8) | 0x00u | MACADDR_VALID | MACADDR_MATCH | (0u << 16));
+    /* Station address 02:00:00:11:22:33 in the EMAC's least-significant-octet layout. */
+    poke(MACADDRHI, 0x11000002u);
+    poke(MACADDRLO, 0x3322u | MACADDR_VALID | MACADDR_MATCH | (0u << 16));
     poke(RXUNICASTSET, 1);
     poke(RXMAXLEN, 1518);
     poke(MACCONTROL, MACCONTROL_GMIIEN);

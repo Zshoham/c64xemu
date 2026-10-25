@@ -158,7 +158,11 @@ six bytes, and returns `None` for a frame the address logic rejects. In order:
 
 An address RAM entry is six bytes plus the control bits of MACADDRLO: CHANNEL in 18-16, MATCHFILT
 in 19, VALID in 20 (`AddressSlot`, mask `0x001F_0000`). MACINDEX selects one of 32 entries;
-MACADDRLO holds bytes 0 and 1, MACADDRHI bytes 2 to 5 with byte 2 most significant.
+For wire-order bytes `w[0..6]`, MACADDRLO bits 15:8 hold `w[5]` and bits 7:0 hold `w[4]`;
+MACADDRHI holds `w[3]`, `w[2]`, `w[1]`, `w[0]` from most to least significant byte
+(SPRU975E Tables 71/72). MACSRCADDRLO/HI use the same address layout. The C6472 fused MAC ID
+instead holds `w[0..4]` most significant first in MACID0 and `w[4]`, `w[5]` in MACID1
+bits 31:24 and 23:16, as read by TI IBL ed3f098 `c6472.c::deviceLoadDefaultEthAddress`.
 
 `address_hash` folds the 48-bit destination into six bits: bit *i* is the exclusive-or of address
 bits *i*, *i*+6, … *i*+42. (The comment above the function says every eighth bit; the code and

@@ -177,9 +177,9 @@ static int emac_hw_init(EmacDriver *driver, UINT8 *mac_address)
 
     /* Station address in slot zero of the address RAM, matching on channel zero. */
     poke(MACINDEX, 0);
-    poke(MACADDRHI, ((UINT32)mac_address[2] << 24) | ((UINT32)mac_address[3] << 16) |
-                        ((UINT32)mac_address[4] << 8) | (UINT32)mac_address[5]);
-    poke(MACADDRLO, ((UINT32)mac_address[0] << 8) | (UINT32)mac_address[1] | MACADDR_VALID |
+    poke(MACADDRHI, ((UINT32)mac_address[3] << 24) | ((UINT32)mac_address[2] << 16) |
+                        ((UINT32)mac_address[1] << 8) | (UINT32)mac_address[0]);
+    poke(MACADDRLO, ((UINT32)mac_address[5] << 8) | (UINT32)mac_address[4] | MACADDR_VALID |
                         MACADDR_MATCH);
     poke(RXUNICASTSET, RXMBP_UNICAST0);
     poke(MACHASH1, 0);

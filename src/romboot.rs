@@ -265,12 +265,12 @@ impl EmacBoot {
             (fused[0] >> 16) as u8,
             (fused[0] >> 8) as u8,
             fused[0] as u8,
-            (fused[1] >> 8) as u8,
-            fused[1] as u8,
+            (fused[1] >> 24) as u8,
+            (fused[1] >> 16) as u8,
         ];
         bus.write32(base + SOFTRESET, 1);
-        let address_high = u32::from_be_bytes([self.mac[2], self.mac[3], self.mac[4], self.mac[5]]);
-        let address_low = (u32::from(self.mac[0]) << 8) | u32::from(self.mac[1]);
+        let address_high = u32::from_le_bytes([self.mac[0], self.mac[1], self.mac[2], self.mac[3]]);
+        let address_low = (u32::from(self.mac[5]) << 8) | u32::from(self.mac[4]);
         bus.write32(base + MACINDEX, 0);
         bus.write32(base + MACADDRHI, address_high);
         bus.write32(base + MACADDRLO, address_low | MACADDR_VALID_MATCH);

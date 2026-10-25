@@ -93,9 +93,8 @@ pub(crate) struct ChipConfig {
     /// Destination cores whose IPCG bit has been written since the device last looked.
     ipc_pulses: u32,
     nmi_pulses: u32,
-    /// UNCERTAIN: SPRS612G Table 3-2 lists "MAC ID" at 0x02A8 0700 with no field table, so how
-    /// the address is split across the two words is not documented here. Both words are
-    /// modelled as read-only and zero until a front end fuses an address into them.
+    /// The read-only MAC ID words, zero until a front end fuses an address. Their byte split
+    /// follows TI IBL ed3f098 c6472.c::deviceLoadDefaultEthAddress; see fuse_mac_id.
     mac_id: [u32; 2],
     timer_output: u32,
     reset_mux: [u32; CORES],
@@ -260,14 +259,13 @@ impl ChipConfig {
     /// Fuse the device's Ethernet address into the MAC ID words, which is what a board does
     /// before the ROM bootloader's Ethernet boot can name itself (SPRUEC6G section 4.3.5).
     ///
-    /// UNCERTAIN: SPRS612G Table 3-2 gives the two words no field table, so the split is a
-    /// choice. The address is held most significant byte first - MACID0 the four most
-    /// significant bytes, MACID1 the two least significant in bits 15-0 - which is the order
-    /// the EMAC's own MACADDRHI/MACADDRLO pair uses for the same six bytes.
+    /// TI IBL ed3f098, src/device/c6472/c6472.c::deviceLoadDefaultEthAddress reads
+    /// wire-order bytes 0-3 from MACID0 (most significant first), then bytes 4 and 5
+    /// from MACID1 bits 31-24 and 23-16.
     pub(crate) fn fuse_mac_id(&mut self, mac: [u8; 6]) {
         self.mac_id = [
             u32::from_be_bytes([mac[0], mac[1], mac[2], mac[3]]),
-            u32::from_be_bytes([0, 0, mac[4], mac[5]]),
+            u32::from_be_bytes([mac[4], mac[5], 0, 0]),
         ];
     }
 
@@ -291,6 +289,18 @@ fn index_of(address: u32, base: u32) -> Option<usize> {
 mod tests {
     use super::*;
     use crate::port::SlavePort;
+    #[test]
+    fn fused_mac_matches_the_ibl_word_split() {
+        let mut chip = ChipConfig::new(DEVSTAT_LITTLE_ENDIAN, 0x0009_102f);
+        chip.fuse_mac_id([0x02, 0x13, 0x24, 0x35, 0x46, 0x57]);
+        assert_eq!(chip.read(MACID0, TEST_CONTEXT), Some(0x0213_2435));
+        assert_eq!(chip.read(MACID1, TEST_CONTEXT), Some(0x4657_0000));
+        chip.write(MACID0, 0, TEST_CONTEXT);
+        chip.write(MACID1, 0, TEST_CONTEXT);
+        assert_eq!(chip.read(MACID0, TEST_CONTEXT), Some(0x0213_2435));
+        assert_eq!(chip.read(MACID1, TEST_CONTEXT), Some(0x4657_0000));
+    }
+
     #[test]
     fn an_address_outside_the_window_is_not_ours() {
         let mut chip = ChipConfig::new(DEVSTAT_LITTLE_ENDIAN, 0x0009_102f);

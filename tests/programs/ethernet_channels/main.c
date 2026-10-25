@@ -69,8 +69,8 @@ static unsigned int peek(unsigned int address)
     return *(volatile unsigned int *)address;
 }
 
-/* Program one address RAM slot: bytes 0 and 1 plus VALID, MATCH and the channel go in
-   MACADDRLO, bytes 2 to 5 in MACADDRHI (SPRU975E Tables 71 and 72). */
+/* Program one address RAM slot: wire bytes 5 and 4 plus VALID, MATCH and the channel go in
+   MACADDRLO, bytes 3, 2, 1, 0 in MACADDRHI (SPRU975E Tables 71 and 72). */
 static void program_address(unsigned int slot, const unsigned char *address, unsigned int channel)
 {
     /* MACINDEX selects which slot the next MACADDRLO/HI write lands in, so each write has to
@@ -79,10 +79,10 @@ static void program_address(unsigned int slot, const unsigned char *address, uns
        next index write above the previous address write. */
     poke(MACINDEX, slot);
     (void)peek(MACINDEX);
-    poke(MACADDRHI, ((unsigned int)address[2] << 24) | ((unsigned int)address[3] << 16)
-                        | ((unsigned int)address[4] << 8) | address[5]);
+    poke(MACADDRHI, ((unsigned int)address[3] << 24) | ((unsigned int)address[2] << 16)
+                        | ((unsigned int)address[1] << 8) | address[0]);
     (void)peek(MACINDEX);
-    poke(MACADDRLO, ((unsigned int)address[0] << 8) | address[1] | MACADDR_VALID | MACADDR_MATCH
+    poke(MACADDRLO, ((unsigned int)address[5] << 8) | address[4] | MACADDR_VALID | MACADDR_MATCH
                         | (channel << 16));
     (void)peek(MACADDRLO);
 }
