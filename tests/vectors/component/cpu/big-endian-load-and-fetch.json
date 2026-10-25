@@ -2,7 +2,7 @@
   "domain": "cpu",
   "expected": {
     "controls": {
-      "1": 268435712
+      "1": 268435456
     },
     "registers": {
       "A1": 287454020,

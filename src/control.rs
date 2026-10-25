@@ -1,7 +1,8 @@
 use std::cell::Cell;
 
 const CSR_CPU_ID: u32 = 0x10 << 24;
-const CSR_ENDIAN: u32 = 1 << 8;
+/// CSR bit 8, EN: 0 is big endian and 1 little endian (SPRU732J Table 2-9).
+const CSR_EN_LITTLE: u32 = 1 << 8;
 const TSR_GIE: u32 = 1 << 0;
 const TSR_SGIE: u32 = 1 << 1;
 const TSR_GEE: u32 = 1 << 2;
@@ -122,7 +123,7 @@ impl Control {
             0x01 => {
                 CSR_CPU_ID
                     | self.csr_misc
-                    | if self.big_endian { CSR_ENDIAN } else { 0 }
+                    | if self.big_endian { 0 } else { CSR_EN_LITTLE }
                     | u32::from(self.sat) << 9
                     | (self.itsr & 1) << 1
                     | (self.tsr & 1)

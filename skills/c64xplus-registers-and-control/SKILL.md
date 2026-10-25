@@ -102,7 +102,8 @@ reserved. Block size = `2^(N+1)` bytes where N is the BK field.
 - `SAT` is set by functional units, cleared only by `MVC`. A set by a unit wins over a
   simultaneous `MVC` clear. Set **one full cycle after** the instruction writes its result.
   Not modified by a conditional instruction whose predicate is false.
-- `EN` (bit 8) reads the endianness the device booted in.
+- `EN` (bit 8) reads the endianness the device booted in: **0 big endian, 1 little endian**
+  (SPRU732J Table 2-9) - not the polarity a name like "big-endian enable" suggests.
 - `PGIE` (bit 1) is physically the same bit as `ITSR.GIE`.
 - `GIE` (bit 0) is physically the same bit as `TSR.GIE`.
 - `PCC`/`DCC` are ignored on the C64x+ (legacy cache control; use L1PCFG/L1DCFG instead).
