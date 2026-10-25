@@ -4356,6 +4356,11 @@ impl Cpu {
             | PendingException::Nmi
             | PendingException::External => self.pc,
         };
+        // SPRU732J Table 6-2: exceptions may interrupt a branch shadow, but that
+        // context is not resumable and must be marked with NTSR.IB.
+        self.control.set_interrupts_blocked(
+            !self.branches.is_empty() || self.cycle < self.branch_block_until,
+        );
         // An exception leaves the loop buffer idle without running an epilog, and records in
         // NTSR.SPLX that a loop was destroyed so the handler knows it cannot resume.
         let in_sploop = self.sploop.abandon();
@@ -4379,6 +4384,7 @@ impl Cpu {
             }
         };
         self.branches.clear();
+        self.branch_block_until = self.cycle;
         // The vector runs in Supervisor and any restore the interrupted code had queued is
         // cancelled with the branch that would have applied it.
         self.user_mode = false;
@@ -4497,6 +4503,13 @@ impl Cpu {
                 // Ready, but a branch shadow defers the take until the delay slots finish.
                 self.interrupt_ready_since.get_or_insert(self.cycle);
             }
+        }
+        if self.interrupt_stall != 0 {
+            // SPRU732J §5.6.2 / §6.4.2: entry annuls remaining multicycle NOPs,
+            // including IDLE and generated NOPs (BNOP/ADDKPC/CALLP and PROT loads).
+            // Actual memory stalls live in pending_stalls and still delay processing.
+            self.stall_cycles = 0;
+            self.idling = false;
         }
     }
 
@@ -5487,6 +5500,134 @@ mod tests {
         let quiet = run(false);
         assert_eq!(quiet, 16);
         assert_eq!(run(true) - quiet, 15);
+    }
+
+    #[test]
+    fn interrupt_makes_an_outstanding_load_visible_to_its_early_consumer() {
+        // SPRU732J §5.7.1 p.557 / Example 5-14 p.558: ADD in LDW's delay
+        // slots sees old A1 normally, but loaded A1 after an intervening interrupt.
+        for interrupted in [false, true] {
+            let mut cpu = Cpu::new(0);
+            cpu.set_register("A0", 0x1000).unwrap();
+            cpu.set_register("A2", 7).unwrap();
+            cpu.write_bytes(0x1000, &10u32.to_le_bytes());
+            cpu.write_words(0, &[0x0080_0264, 0x0188_2078, 0x0000_4000]);
+            // LDW .D1 *A0,A1 ; ADD .L1 A1,A2,A3 ; NOP 3
+            cpu.write_words(0x4a0, &[0x0018_00e2, 0x0000_8000]); // B IRP ; NOP 5
+            cpu.control.write(0x05, 0x400);
+            cpu.control.write(0x04, (1 << 5) | 2);
+            cpu.control.write(0x01, 1);
+            if interrupted {
+                cpu.control.write(0x02, 1 << 5);
+            }
+            cpu.run(1); // interrupt, if requested, is taken after LDW and before ADD
+            if interrupted {
+                assert_eq!(cpu.control.read(0x06, 0), 4);
+                cpu.run(15); // nine entry cycles and B IRP with five delay slots
+            }
+            cpu.run(1);
+            assert_eq!(cpu.register('A', 3), if interrupted { 17 } else { 7 });
+            assert_eq!(cpu.fault(), None);
+        }
+    }
+
+    #[test]
+    fn interrupt_and_exception_annul_multicycle_nop_tails() {
+        // SPRU732J §5.6.2 p.557 and §6.4.2 p.572: annulled later cycles of a
+        // multicycle NOP save the next packet in IRP/NRP, not the NOP itself.
+        for exception in [false, true] {
+            for instruction in [0x0001_0000, 0x0001_e000, 0x0188_a162] {
+                let mut cpu = Cpu::new(0);
+                // NOP 9, IDLE, ADDKPC.S2 +32,B3,5 (all multicycle NOP generators).
+                cpu.write_words(0, &[instruction, 0]);
+                let vector = 0x400 + if exception { 32 } else { 5 * 32 };
+                cpu.write_words(vector, &[0x0210_2058]); // ADD .L1 1,A4,A4
+                cpu.control.write(0x05, 0x400);
+                cpu.control.write(0x04, (1 << 5) | 2);
+                cpu.control.write(0x01, 1);
+                if exception {
+                    cpu.control.write(0x1a, 4); // TSR.GEE
+                }
+                cpu.run(2);
+                if exception {
+                    cpu.set_nmi_line(true);
+                } else {
+                    cpu.control.write(0x02, 1 << 5);
+                }
+                cpu.run(1);
+                assert_eq!(cpu.pc(), vector);
+                assert_eq!(cpu.control.read(if exception { 0x07 } else { 0x06 }, 0), 4);
+                cpu.run(9);
+                assert_eq!(cpu.register('A', 4), 0);
+                cpu.run(1);
+                assert_eq!(cpu.register('A', 4), 1, "exception={exception}");
+                assert_eq!(cpu.fault(), None);
+            }
+        }
+    }
+
+    #[test]
+    fn nmi_exception_saves_branch_blocking_in_ntsr_ib() {
+        // SPRU732J §6.1.1.2 p.564 permits NMI in branch delay slots;
+        // Table 6-2 p.568: IB means "Exception occurred while interrupts were blocked."
+        // §5.5.2 p.549 blocks interrupts in a branch's delay slots.
+        for branch in [0, 0x0000_2010] {
+            let mut cpu = Cpu::new(0);
+            cpu.write_words(0, &[branch, 0, 0, 0, 0, 0]);
+            cpu.write_words(0x420, &[0x0210_2058]);
+            cpu.control.write(0x05, 0x400);
+            cpu.control.write(0x04, 2);
+            cpu.control.write(0x1a, 4);
+            cpu.run(1);
+            cpu.set_nmi_line(true);
+            cpu.run(1);
+            assert_eq!(cpu.pc(), 0x420);
+            assert_eq!(cpu.control.read(0x07, 0), 8);
+            assert_eq!(
+                cpu.control.read(0x1c, 0) & (1 << 15),
+                if branch == 0 { 0 } else { 1 << 15 }
+            );
+            cpu.run(10);
+            assert_eq!(cpu.register('A', 4), 1);
+            assert_eq!(cpu.pc(), 0x424); // the pending branch was discarded
+            assert_eq!(cpu.fault(), None);
+        }
+    }
+
+    #[test]
+    fn nmi_exception_annuls_generated_nops_without_cancelling_loads() {
+        // SPRU732J §3.9.2.2 p.82: PROT adds four NOP cycles, not a memory stall.
+        // §3.11 BNOP p.147 and CALLP p.153 likewise generate multicycle NOPs.
+        // §6.4.2 p.572 annuls their remaining cycles on exception entry.
+        for kind in 0..3 {
+            let mut cpu = Cpu::new(0);
+            let words = match kind {
+                0 => compact_packet(0x0d3c, 1 << 20).to_vec(), // protected LDW
+                1 => vec![0x0000_a120],                        // BNOP.S1 0,5
+                _ => vec![0x1000_0010],                        // CALLP.S1 0,A3
+            };
+            cpu.write_words(0, &words);
+            cpu.set_register("A6", 0x1000).unwrap();
+            cpu.write_bytes(0x1000, &10u32.to_le_bytes());
+            cpu.write_words(0x420, &[0x0210_2058]); // ADD .L1 1,A4,A4
+            cpu.control.write(0x05, 0x400);
+            cpu.control.write(0x04, 2);
+            cpu.control.write(0x1a, 4);
+            cpu.run(1);
+            let next = cpu.pc();
+            cpu.set_nmi_line(true);
+            cpu.run(1);
+            assert_eq!(cpu.pc(), 0x420);
+            assert_eq!(cpu.control.read(0x07, 0), next);
+            cpu.run(9);
+            assert_eq!(cpu.register('A', 4), 0);
+            cpu.run(1);
+            assert_eq!(cpu.register('A', 4), 1, "kind={kind}");
+            if kind == 0 {
+                assert_eq!(cpu.register('A', 3), 10);
+            }
+            assert_eq!(cpu.fault(), None);
+        }
     }
 
     #[test]
