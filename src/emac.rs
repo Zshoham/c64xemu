@@ -455,14 +455,16 @@ impl SlavePort for Emac {
             RXINTMASKCLEAR => self.rx_mask &= !(value & 0xff),
             RXMBPENABLE => self.rx_mbp_enable = value,
             TXIDVER | RXIDVER => {}
-            // A soft reset returns every register to its reset value, but not the port to a
-            // different address: the base is wiring, not state.
+            // SPRU975E §2.14.1: only the EMAC resets, not its separate control
+            // module. The address and wrapper selection are wiring, not reset state.
             SOFTRESET if value & 1 != 0 => {
                 let offset = self.offset;
                 let wrapper_control = self.wrapper_control;
+                let ewctl = self.ewctl;
                 *self = Self::default();
                 self.offset = offset;
                 self.wrapper_control = wrapper_control;
+                self.ewctl = ewctl;
             }
             SOFTRESET => {}
             RXBUFFEROFFSET => self.rx_buffer_offset = value & 0xffff,
@@ -889,8 +891,7 @@ impl Emac {
 
     /// SPRU975E §3.2 Table 12: EWCTL gates the MDIO sources as well as the MAC's.
     pub fn combined_interrupt_pending(&self, mdio_pending: bool) -> bool {
-        self.interrupt_pending()
-            || ((!self.wrapper_control || self.ewctl & 1 != 0) && mdio_pending)
+        self.interrupt_pending() || ((!self.wrapper_control || self.ewctl & 1 != 0) && mdio_pending)
     }
 
     fn process_tx(&mut self, memory: &mut impl DmaMemory, channel: usize) {

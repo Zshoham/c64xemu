@@ -1751,8 +1751,20 @@ cold-boot cases are unchanged.
 
 **[x] Module identity and reset.** *Done.* TXIDVER/RXIDVER report the C645x RTL/major/minor
 values, RXMAXLEN and FIFOCONTROL use their hardware resets, and SOFTRESET atomically clears
-queues, masks, filters, timers, counters and control state.
+queues, masks, filters, timers, counters and EMAC-module control state.
 `emac:identification-defaults-and-reset` checks the register-visible contract.
+
+**[x] EMAC software reset versus separate control modules.** *Fixed defect; C6472 coverage.*
+SPRU975E §2.14.1, p.53 says, "Unlike the EMAC module, the MDIO and EMAC control modules cannot
+be placed in reset from a register inside their memory map." EMAC reset defaults and EWCTL
+programming were pinned separately, but SOFTRESET also cleared the separate EWCTL state.
+`c6455_emac_softreset_preserves_the_separate_control_module` now pins EMAC reset defaults,
+preserved EWCTL/MDIO configuration and a subsequent MAC event without rewriting EWCTL.
+EWCTL is the only modelled control-module register stored in `Emac`; EWINTTCNT is unmodelled.
+SPRUEF8F §2.15.1, p.64 likewise excludes "the MDIO, EMIC modules, and CPPI buffer managers".
+`c6472_emac_softreset_preserves_emic_mdio_and_descriptor_ram` passes unchanged code for both
+MACs, all per-core interrupt enables and pacing configurations, MDIO and descriptor RAM;
+those blocks already live outside the reset MAC.
 
 **[x] MDIO completion versus the C6455 interrupt gate.** *Fixed defect.* SPRU975E §3.2,
 Table 12, p.61 says, "Any time the INTEN bit in the EWCTL register is 0, the EMAC_MDIO_INT

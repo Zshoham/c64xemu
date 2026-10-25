@@ -18,6 +18,11 @@ C6455's only MAC at `0x02C8_0000` and a C6472's EMAC0 and EMAC1 at `0x02C8_0000`
 EMAC control module, or the C6472's EMIC, which owns that same address and is a separate slave
 port.
 
+SOFTRESET resets only EMAC-module state, preserving the C6455's EWCTL even though it is stored
+in `Emac` (SPRU975E §2.14.1). EWINTTCNT is not modelled. On the C6472 the separately stored
+EMIC configuration, shared MDIO and CPPI descriptor RAM likewise survive either MAC's
+SOFTRESET (SPRUEF8F §2.15.1).
+
 Both are ordinary slave ports (`SlavePort for Emac`, `SlavePort for Mdio`), so the CPU, the EDMA3
 and the HPI all reach them through the router. The MAC is also a DMA master: `Emac::tick` takes
 `&mut impl DmaMemory`, and the fabric lends the MAC out for its cycle

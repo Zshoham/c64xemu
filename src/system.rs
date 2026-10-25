@@ -4033,6 +4033,63 @@ mod tests {
     }
 
     #[test]
+    fn c6472_emac_softreset_preserves_emic_mdio_and_descriptor_ram() {
+        // SPRUEF8F §2.15.1, p.64: unlike EMAC, "the MDIO, EMIC modules,
+        // and CPPI buffer managers cannot be placed in reset" by a register.
+        let mut fabric = Fabric::new(&crate::device::C6472);
+        fabric.write32(0, 0x02c8_1828, 1);
+        for base in [0x02c8_0000, 0x02cc_0000] {
+            fabric.write32(0, base + 0x1004, 17);
+            for core in 0..6 {
+                fabric.write32(0, base + 0x1020 + 4 * core, 0x00ff_ff1e);
+            }
+            for channel in 0..8 {
+                for offset in [0x1100, 0x1140] {
+                    fabric.write32(0, base + offset + 4 * channel, 0x0005_030c);
+                }
+            }
+            fabric.write32(0, base + 0x2000, 0x1234_5678);
+            fabric.write32(0, base + 0x10c, 64);
+            fabric.write32(0, base + 0x174, 1);
+            assert_eq!(fabric.read32(0, base + 0x10c), 1518);
+            assert_eq!(fabric.read32(0, base + 0x1004), 17);
+            for core in 0..6 {
+                assert_eq!(fabric.read32(0, base + 0x1020 + 4 * core), 0x00ff_ff1e);
+            }
+            for channel in 0..8 {
+                for offset in [0x1100, 0x1140] {
+                    assert_eq!(fabric.read32(0, base + offset + 4 * channel), 0x0005_0300);
+                }
+            }
+            assert_eq!(fabric.read32(0, base + 0x2000), 0x1234_5678);
+            assert_eq!(fabric.read32(0, 0x02c8_1828), 1);
+        }
+    }
+
+    #[test]
+    fn c6455_emac_softreset_preserves_the_separate_control_module() {
+        // SPRU975E §2.14.1, p.53: "the MDIO and EMAC control modules cannot be
+        // placed in reset from a register inside their memory map"; §3.1 Table 11
+        // places EWCTL in that separate control module.
+        let mut fabric = Fabric::new(&crate::device::C6455);
+        fabric.write32(0, 0x02c8_1004, 1);
+        fabric.write32(0, 0x02c8_1804, 1 << 30);
+        fabric.write32(0, 0x02c8_1828, 1);
+        fabric.write32(0, 0x02c8_010c, 64);
+        fabric.write32(0, 0x02c8_0174, 1);
+        assert_eq!(fabric.read32(0, 0x02c8_010c), 1518);
+        assert_eq!(fabric.read32(0, 0x02c8_0174), 0);
+        assert_eq!(fabric.read32(0, 0x02c8_1004), 1);
+        assert_eq!(fabric.read32(0, 0x02c8_1804) & (1 << 30), 1 << 30);
+        assert_eq!(fabric.read32(0, 0x02c8_1828), 1);
+        // The surviving gate must still deliver a newly enabled MAC source.
+        fabric.write32(0, 0x02c8_0200, 0x8000_0000);
+        fabric.write32(0, 0x02c8_00b8, 1);
+        fabric.tick_once();
+        assert_ne!(fabric.read32(0, 0x0180_0000) & (1 << 17), 0);
+    }
+
+    #[test]
     fn c6455_ewctl_gates_mdio_completion_before_the_cpu_event() {
         // SPRU975E §3.2 Table 12, p.61: with INTEN=0, EMAC_MDIO_INT is
         // "kept de-asserted", including USERINT from §2.16.2.2.
