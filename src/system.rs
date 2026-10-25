@@ -5227,6 +5227,61 @@ mod tests {
         }
 
         #[test]
+        fn a_refused_edma_write_does_not_snoop_a_dirty_l1d_destination() {
+            // SPRU871K §4.6.1 p.112: "L2 (or EMC) performs protection checks before
+            // issuing snoop-write commands to L1D for addresses held in L1D cache."
+            // The granted control proves the same EDMA write really reaches the snoop path.
+            for allow_user_write in [false, true] {
+                let mut fabric = Fabric::new(&crate::device::C6455);
+                fabric.load_bytes(0, SOURCE, &DATA);
+                fabric.write32(0, crate::memory::L1DCFG, 4);
+                assert_eq!(fabric.read32(0, DESTINATION), 0);
+                fabric.write32(0, DESTINATION, 0x1234_5678);
+                assert_eq!(
+                    fabric
+                        .shared
+                        .backing
+                        .read_bytes(Requester::Dma, DESTINATION, 4),
+                    [0; 4]
+                );
+                let attributes =
+                    aid(0) | LOCAL | SR | SW | UR | if allow_user_write { UW } else { 0 };
+                fabric.write32(0, L2MPPA0, attributes);
+                let set = [0, SOURCE, 0x10004, DESTINATION, 0, 0xffff, 0, 1];
+                for (index, word) in set.into_iter().enumerate() {
+                    store(&mut fabric, 0, true, PARAM + index as u32 * 4, word);
+                }
+                store(&mut fabric, 0, true, ESR, 1);
+                for _ in 0..16 {
+                    fabric.tick_once();
+                }
+                assert_eq!(
+                    fabric.read32(0, DESTINATION),
+                    if allow_user_write {
+                        u32::from_le_bytes(DATA)
+                    } else {
+                        0x1234_5678
+                    }
+                );
+                assert_eq!(
+                    fabric
+                        .shared
+                        .backing
+                        .read_bytes(Requester::Dma, DESTINATION, 4),
+                    if allow_user_write { DATA } else { [0; 4] }
+                );
+                assert_eq!(
+                    fabric.read32(0, L2MPFAR),
+                    if allow_user_write { 0 } else { DESTINATION }
+                );
+                assert_eq!(
+                    fabric.read32(0, L2MPFSR),
+                    if allow_user_write { 0 } else { UW }
+                );
+            }
+        }
+
+        #[test]
         fn a_supervisor_mode_submitter_completes_the_same_transfer() {
             let attributes = aid(0) | LOCAL | SR | SW | UR;
             let (destination, _, status) =

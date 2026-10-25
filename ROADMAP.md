@@ -661,6 +661,14 @@ is admitted by its own AID or by AIDX for an id above 5, with a refusal naming i
 A link update copies the linked set's OPT with the rest of it, so the set keeps the linked set's
 stamp; the manual was not found to say otherwise, and no case pins it.
 
+**[x] Refused EDMA3 writes leave resident L1D data untouched.** *Coverage gap closed.*
+SPRU871K section 4.6.1, p.112: "L2 (or EMC) performs protection checks before issuing
+snoop-write commands to L1D for addresses held in L1D cache." EDMA3 privilege refusals and
+DMA snoop-writes were pinned separately; the fabric already checked protection first.
+`edma_privilege::a_refused_edma_write_does_not_snoop_a_dirty_l1d_destination` keeps a dirty
+destination resident, denies the user write, and checks both the unchanged cached value and
+backing bytes alongside MPFAR/MPFSR. Granting UW in the control updates both copies.
+
 **[x] Which fault a protection block keeps.** *Fixed defect, and the method's sixth find.* Each
 unit's fault registers hold one fault, and both halves of the model latched one - the CPU path on
 every refused access, the DMA path only into empty registers - with nothing asking what the pair
