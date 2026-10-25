@@ -1794,7 +1794,7 @@ impl Fabric {
             let mut note = |event: usize| shared_events[event / 32] |= 1 << (event % 32);
             for index in 0..self.shared.emac.len() {
                 let emac = self.shared.emac[index].as_ref().unwrap();
-                if emac.interrupt_pending() || self.shared.mdio.interrupt_pending() {
+                if emac.combined_interrupt_pending(self.shared.mdio.interrupt_pending()) {
                     note(self.profile.events.emac[index].common);
                 }
             }
@@ -1873,8 +1873,10 @@ impl Fabric {
     fn latch_emac_interrupts(&mut self) -> bool {
         if self.shared.emic.is_empty() {
             // One MAC, one event, gated inside the MAC itself.
-            let pending = self.shared.emac[0].as_ref().unwrap().interrupt_pending()
-                || self.shared.mdio.interrupt_pending();
+            let pending = self.shared.emac[0]
+                .as_ref()
+                .unwrap()
+                .combined_interrupt_pending(self.shared.mdio.interrupt_pending());
             if pending {
                 self.raise(Destination::All, self.profile.events.emac[0].common);
             }
@@ -1882,22 +1884,9 @@ impl Fabric {
         }
         let mdio_link = self.shared.mdio.link_interrupt_pending();
         let mdio_user = self.shared.mdio.user_interrupt_pending();
-        let mdio = mdio_link || mdio_user;
         let mut asserted = false;
         for index in 0..self.shared.emacs {
             let events = self.profile.events.emac[index];
-            if self.shared.emic.is_empty() {
-                let pending = self.shared.emac[index]
-                    .as_ref()
-                    .unwrap()
-                    .interrupt_pending()
-                    || mdio;
-                if pending {
-                    self.raise(Destination::All, events.common);
-                    asserted = true;
-                }
-                continue;
-            }
             let (rx, tx, stat, host) = self.shared.emac[index].as_ref().unwrap().masked_sources();
             let sources = EmacSources {
                 rx,
@@ -4041,6 +4030,38 @@ mod tests {
         }
         // The window stops after the sixth: a seventh core's address belongs to nobody.
         assert_eq!(fabric.owner_of(0x02c2_0000 + 0x4000 * 6), None);
+    }
+
+    #[test]
+    fn c6455_ewctl_gates_mdio_completion_before_the_cpu_event() {
+        // SPRU975E §3.2 Table 12, p.61: with INTEN=0, EMAC_MDIO_INT is
+        // "kept de-asserted", including USERINT from §2.16.2.2.
+        const EWCTL: u32 = 0x02c8_1004;
+        const EVTFLAG0: u32 = 0x0180_0000;
+        const EVTCLR0: u32 = 0x0180_0040;
+        const MACINT: u32 = 1 << 17;
+        let mut fabric = Fabric::new(&crate::device::C6455);
+        fabric.write32(0, 0x02c8_1804, 1 << 30);
+        fabric.write32(0, 0x02c8_1828, 1);
+        fabric.write32(0, 0x02c8_1880, (1 << 31) | (1 << 16));
+        for _ in 0..32 {
+            fabric.tick_once();
+        }
+        assert_eq!(fabric.read32(0, 0x02c8_1824), 1);
+        assert_ne!(fabric.read32(0, 0x02c8_0090) & (1 << 31), 0);
+        assert_eq!(fabric.read32(0, EVTFLAG0) & MACINT, 0);
+        fabric.write32(0, EWCTL, 1);
+        fabric.tick_once();
+        assert_eq!(fabric.read32(0, EVTFLAG0) & MACINT, MACINT);
+        fabric.write32(0, EWCTL, 0);
+        fabric.write32(0, EVTCLR0, MACINT);
+        for _ in 0..32 {
+            fabric.tick_once();
+        }
+        assert_eq!(fabric.read32(0, EVTFLAG0) & MACINT, 0);
+        fabric.write32(0, EWCTL, 1);
+        fabric.tick_once();
+        assert_eq!(fabric.read32(0, EVTFLAG0) & MACINT, MACINT);
     }
 
     /// MACINVECTOR is the one shared register the router answers itself, because it reports the

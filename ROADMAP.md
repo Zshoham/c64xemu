@@ -1754,6 +1754,15 @@ values, RXMAXLEN and FIFOCONTROL use their hardware resets, and SOFTRESET atomic
 queues, masks, filters, timers, counters and control state.
 `emac:identification-defaults-and-reset` checks the register-visible contract.
 
+**[x] MDIO completion versus the C6455 interrupt gate.** *Fixed defect.* SPRU975E §3.2,
+Table 12, p.61 says, "Any time the INTEN bit in the EWCTL register is 0, the EMAC_MDIO_INT
+signal to the CPU is kept de-asserted." MDIO USERINT completion and EWCTL gating of MAC
+completions were each pinned, but their combination ORed MDIO outside the gate. Both the
+normal and dormant event paths now gate the combined sources.
+`c6455_ewctl_gates_mdio_completion_before_the_cpu_event` observes USERINTMASKED and
+MACINVECTOR pending while EVTFLAG0 event 17 stays clear, then enables, disables and reenables
+EWCTL around that pending source. C6472 MACINVECTOR and EMIC routing stay unchanged.
+
 **[x] Flow control and pause frames.** *Done for buffer and transmit flow.* Per-channel free-buffer
 counts and thresholds drive RXFLOWACT and full-duplex maximum/zero pause frames with the
 programmed source address; RXPAUSE tracks refresh. Valid incoming pause frames load TXPAUSE and

@@ -304,6 +304,11 @@ unacknowledged. On the C6455 that single line is system event 17 for every core
 `latch_emac_interrupts` and replays it through the idle level-event set so a dormant device does
 not lose it. [Interrupts and exceptions](interrupts.md) has the megamodule side.
 
+The fabric combines the MDIO's pending sources with the MAC line through
+`combined_interrupt_pending`: on the C6455 EWCTL gates both, including in the dormant replay
+path (SPRU975E §3.2 Table 12). MACINVECTOR still reports masked pending sources with EWCTL off;
+the gate affects delivery to the CPU, not the input vector.
+
 The two MACINT sources are STATPEND (bit 0) and HOSTPEND (bit 1). STATPEND stands while any
 statistics register has its most significant bit set — the half-full level, not an edge — and
 HOSTPEND while a host error is latched.

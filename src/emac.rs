@@ -887,6 +887,12 @@ impl Emac {
         self.interrupt_line
     }
 
+    /// SPRU975E §3.2 Table 12: EWCTL gates the MDIO sources as well as the MAC's.
+    pub fn combined_interrupt_pending(&self, mdio_pending: bool) -> bool {
+        self.interrupt_pending()
+            || ((!self.wrapper_control || self.ewctl & 1 != 0) && mdio_pending)
+    }
+
     fn process_tx(&mut self, memory: &mut impl DmaMemory, channel: usize) {
         if self.tx_control == 0 || self.host_error() {
             return;
