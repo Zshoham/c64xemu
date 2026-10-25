@@ -3,7 +3,7 @@
 The two suites, what each kind of case proves, how to select cases, and how to add one.
 
 The emulator is written to be checkable, and the suites are the point rather than an afterthought:
-`cargo nextest` runs 806 native tests, `pytest` collects 1965 cases that build target firmware and
+`cargo nextest` runs 807 native tests, `pytest` collects 1992 cases that build target firmware and
 drive it through the same `c64xemu run` command anyone else uses.
 
 ## Running them

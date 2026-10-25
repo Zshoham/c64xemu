@@ -806,6 +806,20 @@ still be the victim; writes still update data and dirty state. L1P is direct-map
 freeze description (section 2.4.4) gives no LRU rule. L2's Table 4-6 also forbids LRU updates
 while frozen, but L2 freeze control remains unmodelled.
 
+**[x] User privilege meets the cache configuration port.** *Fixed defect.* CPU User/Supervisor
+page permissions and cache/MAR register writes were separately pinned, but unrestricted SRAM
+made the CPU permission seam accept every configuration write. SPRU871K section 4.4.6,
+Table 4-23, p.106 gives L2CFG, L2INV and MARxx Supervisor "R/W", User "R", while L2WB,
+L2WBINV and block controls remain User "R/W". Tables 2-12 (p.34) and 3-16 (p.66) likewise
+protect L1PCFG, L1DCFG and L1DINV while permitting User freeze and other coherence commands.
+The CPU seam now discards only those forbidden writes, without leaking CPU mode to DMA,
+EMAC or HPI. Section 2.9.1.2, p.37 explicitly says L1P "will signal a CPU-triggered memory
+exception in response to disallowed writes"; that case records L1PMPFAR/MPFSR and its event.
+No L1D/L2 register-fault subtype is invented. The register-permission unit matrix checks all
+implemented table entries and all MARs. The `privilege` firmware enters User mode, attempts
+the forbidden writes, returns to Supervisor for readback, and checks permitted freeze and
+block writeback through a dirty DDR line that must survive the refused global invalidates.
+
 **[~] The victim buffer.** *Half done, and honestly so.* SPRU862B Table 3-2 says a victim buffer
 flush on a read miss "disrupts miss pipelining plus maximum 11 stalls" - a mechanism and a bound,
 not a number. The disruption needs no number and is modelled: a fill that evicts a dirty line

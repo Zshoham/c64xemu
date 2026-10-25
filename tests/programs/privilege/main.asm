@@ -35,6 +35,23 @@ FOLD    .macro  src
         XOR     .L1X    A4,src,A4
         .endm
 
+* SPRU871K Tables 2-12, 3-16, 4-23: cache register permissions are per register,
+* not a blanket ban on User cache maintenance. Scratch registers do not affect FOLD.
+WRREG   .macro  address,value
+        MVKL    .S1     address,A8
+        MVKH    .S1     address,A8
+        MVKL    .S1     value,A9
+        MVKH    .S1     value,A9
+        STW     .D1     A9,*A8
+        NOP     5
+        .endm
+RDREG   .macro  address,dst
+        MVKL    .S1     address,A8
+        MVKH    .S1     address,A8
+        LDW     .D1     *A8,dst
+        NOP     4
+        .endm
+
 main:
         MV      .L2     B3,B10                  ; caller's return address
 
@@ -55,6 +72,20 @@ main:
         MVK     .L1     0,A4                    ; checksum
         MVK     .L1     0,A5                    ; resumptions in User mode
 
+* Supervisor writes work. User must leave these values unchanged.
+        WRREG   0x01848380,1                 ; MAR224
+        RDREG   0x01848380,A16               ; Supervisor control: 1
+        WRREG   0x01848380,0
+        WRREG   0x01840000,1                 ; L2CFG: 32 KB
+        RDREG   0x01840000,A17               ; Supervisor control: 1
+        WRREG   0x01840020,1                 ; L1PCFG: 4 KB
+        WRREG   0x01840040,1                 ; L1DCFG: 4 KB
+* A second MAR holds a dirty line for the permitted User block-writeback control.
+        WRREG   0x01848384,1                 ; MAR225
+        WRREG   0xe1000000,0
+        RDREG   0xe1000000,A8                ; allocate in L1D
+        WRREG   0xe1000000,0x55              ; dirty only in L1D
+
 * Build the context that returns into User mode: GEE stays on, CXM says User.
         MVK     .S2     0x44,B4
         MVC     .S2     B4,NTSR
@@ -66,6 +97,23 @@ main:
         NOP     5
 
 user_start:
+* User writes to read-only cache registers have no effect. L1PCFG additionally
+* records a local UW fault (SPRU871K 2.9.1.2, p.37); EXPMASK leaves it masked.
+        WRREG   0x01848380,1
+        WRREG   0x01840000,2
+        WRREG   0x01840040,2
+        WRREG   0x01840020,2
+        WRREG   0x01845048,1                 ; L1DINV: Supervisor only
+        WRREG   0x01845008,1                 ; L2INV: Supervisor only
+* Freeze controls and block writeback remain writable by User.
+        WRREG   0x01840044,1
+        RDREG   0x01840044,A24
+        WRREG   0x01840024,1
+        RDREG   0x01840024,A25
+        WRREG   0x01840044,0
+        WRREG   0x01840024,0
+        WRREG   0x01844000,0xe1000000         ; L2WBAR
+        WRREG   0x01844004,1                  ; L2WWC: write dirty data to DDR
 * A fully restricted control register, read then written.
         MVC     .S2     IER,B4
         ADDK    .S1     1,A5
@@ -90,6 +138,17 @@ user_start:
         NOP     5
 
 supervisor_done:
+        RDREG   0x01848380,A18
+        RDREG   0x01840000,A19
+        RDREG   0x01840040,A20
+        RDREG   0x01840020,A21
+        RDREG   0x0184a400,A22               ; L1PMPFAR
+        RDREG   0x0184a404,A23               ; L1PMPFSR: LOCAL | UW
+* Discard copies without writing them back, then observe what the User block
+* operation delivered to DDR. A refused block writeback would leave zero there.
+        WRREG   0x01845048,1
+        WRREG   0x01845008,1
+        RDREG   0xe1000000,A26
         MVC     .S2     EFR,B4
         MVC     .S2     IERR,B5
         MVC     .S2     TSR,B6
@@ -98,6 +157,29 @@ supervisor_done:
         FOLD    B5
         FOLD    B6
         MV      .L2X    A5,B4
+        FOLD    B4
+* Include every cache observation in the program's externally asserted result.
+        MV      .L2X    A16,B4
+        FOLD    B4
+        MV      .L2X    A17,B4
+        FOLD    B4
+        MV      .L2X    A18,B4
+        FOLD    B4
+        MV      .L2X    A19,B4
+        FOLD    B4
+        MV      .L2X    A20,B4
+        FOLD    B4
+        MV      .L2X    A21,B4
+        FOLD    B4
+        MV      .L2X    A22,B4
+        FOLD    B4
+        MV      .L2X    A23,B4
+        FOLD    B4
+        MV      .L2X    A24,B4
+        FOLD    B4
+        MV      .L2X    A25,B4
+        FOLD    B4
+        MV      .L2X    A26,B4
         FOLD    B4
         B       .S2     B10
         NOP     5
