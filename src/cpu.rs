@@ -5875,7 +5875,12 @@ mod tests {
         cpu.set_register("A8", 0x0080_0000).unwrap();
         cpu.set_register("B9", 0x0080_0008).unwrap();
         let cycles = cycles_to_reach(&mut cpu, 4 * words.len() as u32, 8_000);
-        assert_eq!(cpu.bus_mut().cache_views()[1].stats.line_fills, 128);
+        assert_eq!(
+            cpu.fabric_ref().megamodule(0).cache_views()[1]
+                .stats
+                .line_fills,
+            128
+        );
         assert_eq!(cpu.stats().stall_memory, 1600);
         // 512 load packets issue one cycle each, and every stall cycle is an L1D stall.
         assert_eq!(cycles, 512 + 1600);
@@ -5917,7 +5922,12 @@ mod tests {
             }
             let cycles = cycles_to_reach(&mut cpu, 4 * words.len() as u32, 8_000);
             // in[] is read and allocated; out[] is written and never allocated.
-            assert_eq!(cpu.bus_mut().cache_views()[1].stats.line_fills, 64);
+            assert_eq!(
+                cpu.fabric_ref().megamodule(0).cache_views()[1]
+                    .stats
+                    .line_fills,
+                64
+            );
             (cycles, cpu.stats().stall_memory)
         };
 

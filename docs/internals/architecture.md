@@ -33,7 +33,8 @@ resolution, the SPLOOP buffer - belongs to [Execution and timing](execution.md).
 | Layer | Type | File | Seam it presents |
 |---|---|---|---|
 | machine | `Machine`, `MachineArgs` | `src/machine.rs` | `load`, `arm_halt`, `run`/`resume(&mut [StopCondition])`, `snapshot`, `state_json` |
-| device | `Device`, `DeviceProfile` | `src/device.rs` | `run_cycles`, `step_cycle`, `halted_core`, `focus`/`set_focus`, `with_core`, `fabric` |
+| device | `Device`, `DeviceProfile` | `src/device.rs` | `on_board`, `run_cycles`, `step_cycle`, `halted_core`, `focus`/`set_focus`, `with_core`, `boot`, focused-megamodule views, loading, `fabric` |
+| board | `Board`, `Boot`, `BootSource` | `src/board.rs` | `from_args`, `start`; `Boot::holds_core_zero`, `tick`, progress, `report` |
 | fabric | `Fabric`, `Megamodule`, `Shared` | `src/system.rs` | `read32`/`write32` per requesting core, `tick(cycle)`, `raise(destination, event)` |
 | core bus | `CoreBus<'a>` | `src/system.rs` | everything one core may ask of the device, with its core index already bound |
 | memory hierarchy | `MemoryHierarchy`, `BoundHierarchy` | `src/memory.rs` | `read_u32`, `fetch_packet`, `snoop_read`, `host_snoop_read`, `access_timing` |
@@ -77,9 +78,27 @@ the core index is the only thing the CPU adds to the seam. `Device::with_core` l
 to a named core for one closure and gives it back; `Device::fabric()` reaches the device-level
 operations no single core owns.
 
-The focused core is what every front end drives: `Machine::pc`, `snapshot`, `read_memory`,
-`set_register` and `cache_views` all go through `Device::cpu`/`cpu_mut`, and `set_focus` moves
-the fabric so the newly focused core is inspected and driven exactly like the old one.
+The focused core is what every front end drives: `Machine::pc`, `snapshot`, `read_memory` and
+`set_register` go through `Device::cpu`/`cpu_mut`, and the inspection views - `cache_views`,
+`cache_line_data`, `interrupt_selectors`, `event_flag_registers`, `mar_registers` - are the
+device's own operations on the focused megamodule, so the machine never reaches through a core's
+bus to read them. `set_focus` moves the fabric so the newly focused core is inspected and driven
+exactly like the old one. Loading goes through the device as well (`load_image`,
+`load_boot_table`, `apply_boot_configuration`, `configure_caches`); the machine reaches
+`Device::fabric()` only to hand it to a host connection - the Ethernet backend, the HPI host
+side and the UTOPIA ATM master - which attach to the fabric rather than to any core.
+
+### The board and its boot
+
+`Board` (`src/board.rs`) is what the board around the device straps, fuses and supplies: the
+BOOTMODE pins resolved once into a boot source, the EEPROM on the I2C bus, the configuration
+pins, the UTOPIA PHY address, the fused MAC ID. `Board::from_args` is where a command line is
+refused for a boot it does not supply, or for an input nothing it straps reads.
+`Device::on_board` builds the device from it and starts the `Boot` it straps; from then on the
+device ticks that boot every device cycle, defers a boot-controller release of core 0 to it
+during a ROM boot, and tells it which cores the host released, and the machine asks
+`Device::boot()` whether it holds core 0 (which picks the run clock) and for its state-report
+members. Which boot is running is known nowhere else.
 
 ## How a device cycle advances
 
@@ -427,6 +446,7 @@ Every file in `src/`.
 
 | File | Responsibility |
 |---|---|
+| `board.rs` | The board: the boot source the strap resolves to, checked against what the command line supplies, and the `Boot` it starts - the ROM boot running in place of core 0 or the HPI boot holding the cores - with its progress and state-report members |
 | `boot.rs` | Boot tables the ROM bootloader processes, and the `BootMemory` trait `CoreBus` implements |
 | `bootctl.rs` | The C6472 boot controller: boot mode pins, per-core boot addresses, `BOOT_COMPLETE_STAT` release |
 | `cache.rs` | One set-associative cache with its replacement clock and statistics, plus the `CacheView` a front end draws |

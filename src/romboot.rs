@@ -653,6 +653,7 @@ mod tests {
     /// boot controller - and core 0 ends up at the entry point with the released core running.
     #[test]
     fn an_ethernet_boot_places_both_cores_images_and_starts_them() {
+        use crate::board::Board;
         use crate::device::{Device, C6472};
 
         const DSP_BOOT_ADDR1: u32 = 0x02ab_0224;
@@ -664,9 +665,11 @@ mod tests {
         const ENTRY: u32 = 0x0080_0000;
         let mac = [0x02, 0x00, 0x00, 0x00, 0x64, 0x72];
 
-        let mut device = Device::with_boot_mode(&C6472, ENTRY, Endian::Little, 9);
-        device.fabric().fuse_mac_id(mac);
-        device.begin_ethernet_boot(0x02c8_0000, BootParameters::default());
+        let mut device = Device::on_board(
+            &Board::pins(&C6472, 9).with_mac_id(mac),
+            ENTRY,
+            Endian::Little,
+        );
         for core in 0..6 {
             assert!(
                 device.fabric().held_in_reset(core),
@@ -711,13 +714,19 @@ mod tests {
         }
         for _ in 0..256 {
             device.step_cycle();
-            if device.ethernet_boot().and_then(|boot| boot.entry).is_some() {
+            if device
+                .boot()
+                .ethernet()
+                .and_then(|boot| boot.entry)
+                .is_some()
+            {
                 break;
             }
         }
 
         let boot = device
-            .ethernet_boot()
+            .boot()
+            .ethernet()
             .expect("the device is booting over Ethernet");
         assert_eq!(boot.entry, Some(ENTRY));
         assert_eq!(boot.accepted, table.len().div_ceil(20) as u64);

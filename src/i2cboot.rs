@@ -651,6 +651,7 @@ impl WordOrder {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::board::Board;
     use crate::device::{Device, C6455, C6472};
 
     /// One block, laid out as SPRUEC6G Table 5 says: a 16-bit size that counts the header, a
@@ -757,7 +758,8 @@ pub(crate) mod tests {
         for _ in 0..cycles {
             device.step_cycle();
             if device
-                .i2c_boot()
+                .boot()
+                .i2c()
                 .is_some_and(|boot| boot.entry.is_some() || boot.error.is_some())
             {
                 return;
@@ -789,15 +791,18 @@ pub(crate) mod tests {
         );
         table.extend(words(&[0]));
 
-        let mut device = Device::with_boot_mode(&C6455, 0, Endian::Little, BOOTMODE_I2C_EEPROM);
-        device.begin_i2c_boot(BOOTMODE_I2C_EEPROM, 0, eeprom(&table));
+        let mut device = Device::on_board(
+            &Board::pins(&C6455, BOOTMODE_I2C_EEPROM).with_i2c_eeprom(0, eeprom(&table)),
+            0,
+            Endian::Little,
+        );
         assert!(
             device.held_in_reset(0),
             "core 0 runs the ROM, so it is held"
         );
         run(&mut device, 200_000);
 
-        let boot = device.i2c_boot().expect("the device is booting over I2C");
+        let boot = device.boot().i2c().expect("the device is booting over I2C");
         assert_eq!(boot.error, None);
         assert_eq!(boot.entry, Some(ENTRY));
         assert_eq!(boot.parameter_blocks, 1);
@@ -831,11 +836,14 @@ pub(crate) mod tests {
         );
         // Corrupt one payload byte, leaving the checksum field as it was.
         image[8] ^= 0xff;
-        let mut device = Device::with_boot_mode(&C6455, 0, Endian::Little, BOOTMODE_I2C_EEPROM);
-        device.begin_i2c_boot(BOOTMODE_I2C_EEPROM, 0, image);
+        let mut device = Device::on_board(
+            &Board::pins(&C6455, BOOTMODE_I2C_EEPROM).with_i2c_eeprom(0, image),
+            0,
+            Endian::Little,
+        );
         run(&mut device, 200_000);
 
-        let boot = device.i2c_boot().expect("the device is booting over I2C");
+        let boot = device.boot().i2c().expect("the device is booting over I2C");
         assert_eq!(boot.entry, None);
         assert_eq!(boot.parameter_blocks, 0, "a bad block is never acted on");
         assert_eq!(boot.checksum_failures, 2, "read once, re-read once");
@@ -862,11 +870,14 @@ pub(crate) mod tests {
         // A table that is nothing but its entry point and the terminator.
         let table = words(&[0x0080_0800, 0]);
         image.extend_from_slice(&block(&table));
-        let mut device = Device::with_boot_mode(&C6455, 0, Endian::Little, BOOTMODE_I2C_EEPROM);
-        device.begin_i2c_boot(BOOTMODE_I2C_EEPROM, 0, image);
+        let mut device = Device::on_board(
+            &Board::pins(&C6455, BOOTMODE_I2C_EEPROM).with_i2c_eeprom(0, image),
+            0,
+            Endian::Little,
+        );
         run(&mut device, 200_000);
 
-        let boot = device.i2c_boot().expect("the device is booting over I2C");
+        let boot = device.boot().i2c().expect("the device is booting over I2C");
         assert_eq!(boot.error, None);
         assert_eq!(boot.entry, Some(0x0080_0800));
     }
@@ -886,11 +897,14 @@ pub(crate) mod tests {
         ));
         let table = words(&[0x0080_0c00, 0]);
         image.extend_from_slice(&block(&table));
-        let mut device = Device::with_boot_mode(&C6455, 0, Endian::Little, BOOTMODE_I2C_EEPROM);
-        device.begin_i2c_boot(BOOTMODE_I2C_EEPROM, 1, image);
+        let mut device = Device::on_board(
+            &Board::pins(&C6455, BOOTMODE_I2C_EEPROM).with_i2c_eeprom(1, image),
+            0,
+            Endian::Little,
+        );
         run(&mut device, 200_000);
 
-        let boot = device.i2c_boot().expect("the device is booting over I2C");
+        let boot = device.boot().i2c().expect("the device is booting over I2C");
         assert_eq!(boot.error, None);
         assert_eq!(boot.entry, Some(0x0080_0c00));
     }
@@ -943,14 +957,17 @@ pub(crate) mod tests {
                 table.push(0);
                 image.extend(blocks(&words(&table)));
 
-                let mut device = Device::with_boot_mode(&C6472, 0, endian, mode);
-                device.begin_i2c_boot(mode, cfggp, image);
+                let mut device = Device::on_board(
+                    &Board::pins(&C6472, mode).with_i2c_eeprom(cfggp, image),
+                    0,
+                    endian,
+                );
                 for core in 0..6 {
                     assert!(device.held_in_reset(core), "{label}: core {core}");
                 }
                 run(&mut device, 400_000);
 
-                let boot = device.i2c_boot().expect("the device is booting over I2C");
+                let boot = device.boot().i2c().expect("the device is booting over I2C");
                 assert_eq!(boot.error, None, "{label}");
                 assert_eq!(boot.entry, Some(CODE), "{label}");
                 assert_eq!(boot.parameter_blocks, 1, "{label}");
@@ -1029,7 +1046,11 @@ pub(crate) mod tests {
             });
             image.extend(blocks(&words(&[0x0080_0c00, 0])));
             let (profile, mode) = if c6472 { (&C6472, 2) } else { (&C6455, 5) };
-            let mut device = Device::with_boot_mode(profile, 0, endian, mode);
+            let mut device = Device::on_board(
+                &Board::pins(profile, mode).with_i2c_eeprom(0, image),
+                0,
+                endian,
+            );
             device.with_core(0, |cpu| {
                 let mut bus = cpu.bus_mut();
                 for index in 0..12 {
@@ -1037,11 +1058,10 @@ pub(crate) mod tests {
                 }
                 bus.write32(TARGET + 0x40, 0x0ff0_0ff0);
             });
-            device.begin_i2c_boot(mode, 0, image);
             run(&mut device, 400_000);
 
             let label = format!("C6472 {c6472} big-endian {}", endian == Endian::Big);
-            let boot = device.i2c_boot().unwrap();
+            let boot = device.boot().i2c().unwrap();
             assert_eq!(boot.error, None, "{label}");
             assert_eq!(boot.parameter_blocks, 2, "{label}");
             assert_eq!(boot.config_blocks, 2, "{label}");
@@ -1076,14 +1096,17 @@ pub(crate) mod tests {
             (mac, "extended boot mode"),
             (utopia, "bus width"),
         ] {
-            let mut device = Device::with_boot_mode(&C6472, 0, Endian::Little, 2);
-            device.begin_i2c_boot(2, 0, image);
+            let mut device = Device::on_board(
+                &Board::pins(&C6472, 2).with_i2c_eeprom(0, image),
+                0,
+                Endian::Little,
+            );
             run(&mut device, 400_000);
-            let boot = device.i2c_boot().unwrap();
+            let boot = device.boot().i2c().unwrap();
             let reported = boot.error.expect(error);
             assert!(reported.contains(error), "{reported}");
             assert!(device.held_in_reset(0), "{error}");
-            assert_eq!(device.utopia_boot(), None, "{error}");
+            assert_eq!(device.boot().utopia(), None, "{error}");
         }
     }
 
@@ -1124,10 +1147,13 @@ pub(crate) mod tests {
         ));
         image.extend(cut(&words(&table), 122));
 
-        let mut device = Device::with_boot_mode(&C6472, 0, Endian::Little, 2);
-        device.begin_i2c_boot(2, 0, image);
+        let mut device = Device::on_board(
+            &Board::pins(&C6472, 2).with_i2c_eeprom(0, image),
+            0,
+            Endian::Little,
+        );
         run(&mut device, 600_000);
-        let boot = device.i2c_boot().unwrap();
+        let boot = device.boot().i2c().unwrap();
         assert_eq!(boot.error, None);
         assert_eq!(boot.checksum_failures, 0);
         assert_eq!(boot.entry, Some(CODE));

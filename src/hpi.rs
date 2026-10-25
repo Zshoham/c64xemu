@@ -84,9 +84,6 @@ pub struct Hpi {
     /// The CPU's software reset. While it is set the FIFOs are held clear and every host access
     /// is held off by HRDY (SPRU969B section 8.3).
     hpirst: bool,
-    /// How the device was strapped. Strapped at all, HPIRST comes up clear so the host can
-    /// reach memory before any code has run (SPRUEG1B Figure 22).
-    strap: HpiBoot,
     /// A `DspintRelease` boot whose held CPU the host's first DSPINT has not yet released.
     boot_pending: bool,
     /// Host-configured HPIC bits.
@@ -118,7 +115,6 @@ impl Hpi {
     pub fn new(strap: HpiBoot) -> Self {
         Self {
             hpirst: strap == HpiBoot::Off,
-            strap,
             boot_pending: strap == HpiBoot::DspintRelease,
             ..Self::default()
         }
@@ -136,11 +132,6 @@ impl Hpi {
     /// Whether the device is strapped to an HPI boot the host has not finished with DSPINT.
     pub(crate) fn boot_pending(&self) -> bool {
         self.boot_pending
-    }
-
-    /// Whether the device was strapped to an HPI boot at all.
-    pub(crate) fn strapped(&self) -> bool {
-        self.strap != HpiBoot::Off
     }
 }
 

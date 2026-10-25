@@ -7,7 +7,7 @@
 //! same in every subcommand. Drivers update their breakpoint addresses when the list changes,
 //! then run or resume with stop conditions and read the snapshot; halt lifecycle stays here.
 
-use crate::boot::BootSource;
+use crate::board::{Board, BootSource};
 use crate::cache::CacheView;
 use crate::cio;
 #[cfg(test)]
@@ -16,7 +16,6 @@ use crate::cpu::{CpuSnapshot, StatsCounters};
 use crate::device::{Device, DeviceProfile};
 use crate::elf::{Image, Segment};
 use crate::netio::{hex, Ethernet, EthernetFiles, HostLink};
-use crate::romboot::BootParameters;
 use crate::system::{Endian, Fabric};
 use crate::trace::Trace;
 use crate::utopia::{CELL_BYTES, MAX_CELL_BYTES, NULL_PHY};
@@ -230,7 +229,6 @@ pub struct Machine {
     ethernet: Ethernet,
     host_link: Option<HostLink>,
     utopia_link: Option<HostLink>,
-    utopia_phy: u8,
     trace_exceptions: bool,
     profiling: bool,
     trace: Option<(PathBuf, bool, Option<usize>, u64)>,
@@ -240,18 +238,9 @@ pub struct Machine {
     breakpoints: Vec<u32>,
     /// Breakpoints named on the command line, resolved once.
     initial_breakpoints: Vec<u32>,
-    /// Which device this is, so a reload rebuilds the same one.
-    profile: &'static DeviceProfile,
-    boot_mode: u8,
-    boot_source: BootSource,
-    /// The address fused into the MAC ID words, and the UDP port an Ethernet boot listens on.
-    mac_id: [u8; 6],
-    boot_udp_port: u16,
-    /// The serial EEPROM a board would have put on the I2C bus, and the configuration pins the
-    /// I2C boot reads its parameter block index (and on the C6472, its PLL) from. Held so a
-    /// reload straps the same board.
-    i2c_eeprom: Option<Vec<u8>>,
-    i2c_cfggp: u8,
+    /// The board the device sits on: what it straps, fuses and supplies, and so which boot
+    /// runs. Held so a reload builds the same board again.
+    board: Board,
 }
 
 /// One member of the stop-condition set `resume` evaluates on every cycle. The machine-native
@@ -324,99 +313,16 @@ impl Machine {
         };
         let profile = DeviceProfile::named(&args.device)
             .ok_or_else(|| format!("unknown device {}", args.device))?;
-        // The strap is an Ethernet boot the device does not have: nothing else about the
-        // command line matters until that is fixed.
-        let boot_source = BootSource::resolve(profile, args.boot_mode)?;
-        let i2c_boot = boot_source == BootSource::I2c;
-        if boot_source == BootSource::Utopia {
-            if args.utopia_unix.is_none() {
-                return Err("C6472 UTOPIA boot requires an ATM master on --utopia-unix".into());
-            }
-            if args.i2c_eeprom.is_some() || args.boot_config.is_some() {
-                return Err(
-                    "UTOPIA boot receives its image from the ATM master; --i2c-eeprom and \
-                     --boot-config cannot be combined with it"
-                        .into(),
-                );
-            }
-        } else if args.utopia_phy.is_some() {
-            return Err(
-                "--utopia-phy straps the PHY address a C6472 UTOPIA boot reads (--device c6472 \
-                 --boot-mode 5-8); nothing else reads it"
-                    .into(),
-            );
-        }
-        if boot_source == BootSource::Hpi {
-            if args.hpi_unix.is_none() {
-                return Err(format!(
-                    "boot mode {} is the {}'s HPI host boot; give it the host with --hpi-unix",
-                    args.boot_mode, profile.name
-                ));
-            }
-            if args.i2c_eeprom.is_some() {
-                return Err("--i2c-eeprom and HPI host boot are two boot sources; use one".into());
-            }
-            if args.boot_config.is_some() {
-                return Err(
-                    "--boot-config cannot be used with HPI host boot; the host loads memory directly"
-                        .into(),
-                );
-            }
-        }
-        let i2c_eeprom = match &args.i2c_eeprom {
-            Some(path) => {
-                Some(std::fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?)
-            }
-            None => None,
-        };
-        if i2c_boot && i2c_eeprom.is_none() {
-            return Err(format!(
-                "boot mode {} is the {}'s master I2C boot; give it the EEPROM with --i2c-eeprom",
-                args.boot_mode, profile.name
-            ));
-        }
-        if !i2c_boot && i2c_eeprom.is_some() {
-            return Err(format!(
-                "--i2c-eeprom is read by the master I2C boot, which is {} on the {}",
-                if profile.has_boot_controller {
-                    "--boot-mode 2 (EEPROM at 0x50) or 3 (0x51)"
-                } else {
-                    "--boot-mode 5"
-                },
-                profile.name
-            ));
-        }
-        // The configuration pins: CFGGP[2:0] are the C6455's index, CFG[3:0] the C6472's and
-        // CFG[4] its PLL select (SPRUEC6G section 2.3.4.2 and Table 22).
-        let index_limit = if profile.has_boot_controller { 16 } else { 8 };
-        if args.boot_param_index >= index_limit {
-            return Err(format!(
-                "--boot-param-index {} is beyond the {} parameter blocks the {}'s pins select",
-                args.boot_param_index, index_limit, profile.name
-            ));
-        }
-        if args.i2c_pll_x19 && !(i2c_boot && profile.has_boot_controller) {
-            return Err(
-                "--i2c-pll-x19 straps CFG[4] for a C6472 I2C boot (--device c6472 \
-                        --boot-mode 2 or 3); nothing else reads it"
-                    .into(),
-            );
-        }
-        let i2c_cfggp = args.boot_param_index as u8 | (u8::from(args.i2c_pll_x19) << 4);
+        let board = Board::from_args(profile, args)?;
         // A boot builds the memory image from the host, wire or bus, so the ELF supplies only
         // symbols (SPRS276M section 2.4, SPRUEC6G sections 2.3.4 and 4.3.5).
-        let load = if boot_source != BootSource::Image {
+        let load = if board.source() != BootSource::Image {
             Load::Wire
         } else {
             Load::Segments(image.segments)
         };
-        // One wire, and it is attached to one of the device's MACs: MAC 0 unless the command
-        // line says otherwise, or the MAC an Ethernet boot was strapped to, because that is the
-        // port the board would have cabled.
-        let net_port = args.net_port.unwrap_or(match boot_source {
-            BootSource::Ethernet { port, .. } => port,
-            _ => 0,
-        });
+        // One wire, and it is attached to one of the device's MACs.
+        let net_port = args.net_port.unwrap_or(board.default_net_port());
         if net_port >= profile.emac_bases.len() {
             return Err(format!(
                 "the {} has no Ethernet MAC {net_port}",
@@ -424,10 +330,7 @@ impl Machine {
             ));
         }
         let mut machine = Self {
-            device: Device::with_boot_mode(profile, image.entry, image.endian, args.boot_mode),
-            profile,
-            boot_mode: args.boot_mode,
-            boot_source,
+            device: Device::on_board(&board, image.entry, image.endian),
             entry: image.entry,
             load,
             boot_config,
@@ -457,7 +360,6 @@ impl Machine {
                 Some(path) => Some(HostLink::bind(path, None, args.utopia_poll)?),
                 None => None,
             },
-            utopia_phy: args.utopia_phy.unwrap_or(0),
             trace_exceptions: args.trace_exceptions,
             profiling: args.profile,
             trace: args.trace.as_ref().map(|path| {
@@ -471,35 +373,13 @@ impl Machine {
             stop: None,
             breakpoints: Vec::new(),
             initial_breakpoints: Vec::new(),
-            mac_id: args.mac_id,
-            boot_udp_port: args.boot_udp_port,
-            i2c_eeprom,
-            i2c_cfggp,
+            board,
         };
-        if matches!(machine.load, Load::Wire) {
-            // Two boot sources are one too many.
-            if boot_table.is_some() {
-                return Err("--boot-table and a ROM boot are two boot sources; use one".into());
-            }
-            // A capture file cannot be the Ethernet boot's source: the boot code resets the MAC
-            // before it configures it, so frames handed over before the announcement are gone.
-            if matches!(machine.boot_source, BootSource::Ethernet { .. })
-                && machine.ethernet.has_preload()
-            {
-                return Err(
-                    "--pcap-in frames arrive before an Ethernet boot has configured the \
-                            MAC and are lost with its reset; drive the boot through --net-unix"
-                        .into(),
-                );
-            }
-        }
         // A boot table replaces the ELF's memory image entirely: the ELF is only there for the
         // symbols a debugger and the CIO handshake need (SPRUEC6G section 6.2.2).
         if let Some((table, address)) = boot_table {
             machine.install()?;
-            machine.device.cpu_mut().write_bytes(address, &table);
-            let entry =
-                crate::boot::load_boot_table(&mut machine.device.cpu_mut().bus_mut(), address)?;
+            let entry = machine.device.load_boot_table(address, &table)?;
             machine.load = Load::BootTable(table, address, entry);
             machine.entry = entry;
         }
@@ -531,15 +411,7 @@ impl Machine {
     /// an image makes cacheable is still the image's own business, and the caches come up cold:
     /// a program run this way answers the same but takes more cycles to do it.
     fn enable_caches(&mut self) {
-        let focused = self.focus();
-        for core in 0..self.cores() {
-            self.set_focus(core);
-            let mut bus = self.device.cpu_mut().bus_mut();
-            bus.write32(crate::memory::L1PCFG, 4);
-            bus.write32(crate::memory::L1DCFG, 4);
-            bus.write32(crate::memory::L2CFG, 4);
-        }
-        self.set_focus(focused);
+        self.device.configure_caches(4, 4, 4);
     }
 
     /// A machine with no image behind it, used by native tests that write instructions directly
@@ -548,9 +420,6 @@ impl Machine {
     pub fn bare(cpu: Cpu) -> Self {
         Self {
             device: Device::from_cpu(cpu),
-            profile: &crate::device::C6455,
-            boot_mode: 0,
-            boot_source: BootSource::Image,
             entry: 0,
             load: Load::Segments(Vec::new()),
             boot_config: None,
@@ -561,17 +430,13 @@ impl Machine {
             ethernet: Ethernet::offline(),
             host_link: None,
             utopia_link: None,
-            utopia_phy: 0,
             trace_exceptions: false,
             profiling: false,
             trace: None,
             stop: None,
             breakpoints: Vec::new(),
             initial_breakpoints: Vec::new(),
-            mac_id: [0; 6],
-            boot_udp_port: 9,
-            i2c_eeprom: None,
-            i2c_cfggp: 0,
+            board: Board::pins(&crate::device::C6455, 0),
         }
     }
 
@@ -588,8 +453,8 @@ impl Machine {
         self.device.set_focus(core);
     }
 
-    pub fn core_held_in_reset(&mut self, core: usize) -> bool {
-        self.device.fabric().held_in_reset(core)
+    pub fn core_held_in_reset(&self, core: usize) -> bool {
+        self.device.held_in_reset(core)
     }
 
     /// Puts the machine back in its reset state: a fresh CPU, memory loaded the way the command
@@ -613,9 +478,9 @@ impl Machine {
 
     fn install(&mut self) -> Result<(), String> {
         let endian = self.device.cpu().endian();
-        // A reload straps the device the way the command line did: same profile, same
-        // BOOTMODE pins, so the same cores come out of reset.
-        self.device = Device::with_boot_mode(self.profile, self.entry, endian, self.boot_mode);
+        // A reload builds the same board again: same profile, same BOOTMODE pins and the same
+        // boot started, so the same cores come out of reset.
+        self.device = Device::on_board(&self.board, self.entry, endian);
         let profiling = self.profiling;
         self.device.cpu_mut().set_profiling(profiling);
         self.ethernet.reset_poll();
@@ -625,38 +490,10 @@ impl Machine {
         {
             link.reset_poll();
         }
-        // The board's fused Ethernet address: what the ROM's Ethernet boot names itself by, and
-        // what any firmware reads out of the MAC ID words (SPRS612G Table 3-2).
-        self.device.fabric().fuse_mac_id(self.mac_id);
-        match self.boot_source {
-            BootSource::Ethernet { base, .. } => self.device.begin_ethernet_boot(
-                base,
-                BootParameters {
-                    udp_destination_port: self.boot_udp_port,
-                    ..BootParameters::default()
-                },
-            ),
-            BootSource::Utopia => self
-                .device
-                .begin_utopia_boot(self.boot_mode, self.utopia_phy),
-            BootSource::I2c => {
-                if let Some(contents) = &self.i2c_eeprom {
-                    self.device
-                        .begin_i2c_boot(self.boot_mode, self.i2c_cfggp, contents.clone());
-                }
-            }
-            BootSource::Image | BootSource::Hpi => {}
-        }
         if let Some((table, address)) = &self.boot_config {
             // The configuration table runs before the boot table, which is the order the ROM
             // uses when a boot parameter block asks for one (SPRUEC6G sections 2.3.4, 6.2.3).
-            let table = table.clone();
-            let address = *address;
-            self.device.cpu_mut().write_bytes(address, &table);
-            let calls = crate::boot::apply_boot_configuration(
-                &mut self.device.cpu_mut().bus_mut(),
-                address,
-            )?;
+            let calls = self.device.apply_boot_configuration(*address, table)?;
             if let Some(target) = calls.first() {
                 return Err(format!(
                     "boot configuration entry calls the function at 0x{target:08x}; this path \
@@ -664,28 +501,19 @@ impl Machine {
                 ));
             }
         }
-        // The load description is owned by the machine and the write borrows the device, so
-        // the segments are taken out for the duration and put back.
-        let load = std::mem::replace(&mut self.load, Load::Segments(Vec::new()));
-        match &load {
+        match &self.load {
             Load::Segments(segments) => {
                 for segment in segments {
-                    self.device
-                        .fabric()
-                        .load_image_bytes(segment.address, &segment.data);
+                    self.device.load_image(segment.address, &segment.data);
                 }
             }
             Load::BootTable(table, address, entry) => {
-                let address = *address;
-                let entry = *entry;
-                self.device.cpu_mut().write_bytes(address, table);
-                crate::boot::load_boot_table(&mut self.device.cpu_mut().bus_mut(), address)?;
-                self.device.cpu_mut().set_pc(entry);
+                self.device.load_boot_table(*address, table)?;
+                self.device.cpu_mut().set_pc(*entry);
             }
             // Nothing to preload: the host, bus or network supplies the image during boot.
             Load::Wire => {}
         }
-        self.load = load;
         self.with_ethernet(Ethernet::preload);
         if let Some((path, json, ring, start)) = self.trace.clone() {
             self.open_trace(&path, json, ring, start)
@@ -716,7 +544,7 @@ impl Machine {
     /// device cycles waiting for the host, bus or wire while the core retires nothing. Keep
     /// that clock after release too, so a budget never switches between two counters.
     fn run_clock(&self) -> u64 {
-        if self.device.boot_holds_core_zero() {
+        if self.device.boot().holds_core_zero() {
             self.device.cycle()
         } else {
             self.device.cpu().cycles()
@@ -745,14 +573,16 @@ impl Machine {
             let Some(port) = host_port(port) else {
                 continue;
             };
-            let mut bus = self.device.cpu_mut().bus_mut();
+            // The host port is the device's, not any core's: the host link attaches to the
+            // fabric like the Ethernet backend and the ATM master.
+            let fabric = self.device.fabric();
             if direction == b'r' {
-                match bus.hpi_host_read(port) {
+                match fabric.hpi_host_read(port) {
                     Some(value) => link.reply(&value.to_le_bytes()),
                     None => link.reply(&[]),
                 }
             } else {
-                bus.hpi_host_write(port, value);
+                fabric.hpi_host_write(port, value);
             }
         }
     }
@@ -1065,7 +895,7 @@ impl Machine {
                 pc: self.device.core(core).pc(),
                 cycles: self.device.core(core).cycles(),
                 halted: self.device.core(core).halted(),
-                held_in_reset: self.device.fabric().held_in_reset(core),
+                held_in_reset: self.device.held_in_reset(core),
                 fault: self.device.core(core).fault().map(str::to_owned),
                 focused: core == focus,
             })
@@ -1086,7 +916,7 @@ impl Machine {
             last_issue: cpu.last_issue().to_vec(),
             sploop: cpu.sploop_dump(),
             exit_code: cpu.register('A', 4) as u8,
-            device: self.profile.name,
+            device: self.board.profile().name,
             cores,
         }
     }
@@ -1150,31 +980,29 @@ impl Machine {
     }
 
     /// The focused megamodule's cache state, for a front end that draws it.
-    pub fn cache_views(&mut self) -> [CacheView; 3] {
-        self.device.cpu_mut().bus_mut().cache_views()
+    pub fn cache_views(&self) -> [CacheView; 3] {
+        self.device.cache_views()
     }
 
     /// One resident line, or nothing if that level does not hold the address. Passive: reading
     /// it moves no replacement clock.
-    pub fn cache_line_data(&mut self, level: usize, address: u32) -> Option<Vec<u8>> {
+    pub fn cache_line_data(&self, level: usize, address: u32) -> Option<Vec<u8>> {
         self.device
-            .cpu_mut()
-            .bus_mut()
             .cache_line_data(level, address)
             .map(<[u8]>::to_vec)
     }
 
     /// The focused megamodule's interrupt selectors, event flags and cacheability registers.
-    pub fn interrupt_selectors(&mut self) -> [u32; 3] {
-        self.device.cpu_mut().bus_mut().interrupt_selectors()
+    pub fn interrupt_selectors(&self) -> [u32; 3] {
+        self.device.interrupt_selectors()
     }
 
-    pub fn event_flag_registers(&mut self) -> [u32; 4] {
-        self.device.cpu_mut().bus_mut().event_flag_registers()
+    pub fn event_flag_registers(&self) -> [u32; 4] {
+        self.device.event_flag_registers()
     }
 
-    pub fn mar_registers(&mut self) -> [u32; 256] {
-        self.device.cpu_mut().bus_mut().mar_registers()
+    pub fn mar_registers(&self) -> [u32; 256] {
+        self.device.mar_registers()
     }
 
     /// Keep the per-address packet histogram the hotspot views read.
@@ -1316,45 +1144,10 @@ impl Machine {
             "cores": snapshot.cores,
             "stats": snapshot.stats,
         });
-        if let Some(boot) = self.device.ethernet_boot() {
-            // What the ROM's Ethernet boot made of the wire, which is the only way to tell a
-            // boot that completed from one still waiting for its next frame.
-            state["ethernet_boot"] = json!({
-                "frames_accepted": boot.accepted,
-                "frames_discarded": boot.discarded,
-                "table_bytes": boot.table_bytes,
-                "entry": boot.entry,
-            });
-        }
-        if let Some(boot) = self.device.i2c_boot() {
-            // What the ROM's I2C boot made of the EEPROM, which is how a case tells a boot that
-            // read its table from one that stopped on a bad block.
-            state["i2c_boot"] = json!({
-                "parameter_blocks": boot.parameter_blocks,
-                "config_blocks": boot.config_blocks,
-                "table_blocks": boot.table_blocks,
-                "table_bytes": boot.table_bytes,
-                "checksum_failures": boot.checksum_failures,
-                "entry": boot.entry,
-                "error": boot.error,
-            });
-        }
-        if let Some(boot) = self.device.utopia_boot() {
-            state["utopia_boot"] = json!({
-                "cells_accepted": boot.accepted,
-                "cells_discarded": boot.discarded,
-                "table_bytes": boot.table_bytes,
-                "entry": boot.entry,
-                "error": boot.error,
-            });
-        }
-        if matches!(self.boot_source, BootSource::Hpi) {
-            state["hpi_boot"] = json!({
-                "entry": self.device.hpi_boot_entry(0),
-                "entries": (0..self.cores())
-                    .map(|core| self.device.hpi_boot_entry(core))
-                    .collect::<Vec<_>>(),
-            });
+        // What the boot the board strapped has done: how a case tells a boot that completed
+        // from one still waiting for its next frame, cell or EEPROM block.
+        for (member, report) in self.device.boot().report(self.cores()) {
+            state[member] = report;
         }
         if profile {
             state["profile"] = json!(self
@@ -1366,24 +1159,18 @@ impl Machine {
                     "packets": count,
                 }))
                 .collect::<Vec<_>>());
-            state["cache_stats"] =
-                json!(self
-                    .device
-                    .cpu_mut()
-                    .bus_mut()
-                    .cache_views()
-                    .map(|cache| json!({
-                        "name": cache.name,
-                        "enabled": cache.enabled,
-                        "frozen": cache.frozen,
-                        "capacity_bytes": cache.capacity_lines * cache.line_size as usize,
-                        "resident_lines": cache.lines.len(),
-                        "dirty_lines": cache.lines.iter().filter(|line| line.dirty).count(),
-                        "line_size": cache.line_size,
-                        "ways": cache.ways,
-                        "sets": cache.capacity_lines / cache.ways,
-                        "stats": cache.stats,
-                    })));
+            state["cache_stats"] = json!(self.device.cache_views().map(|cache| json!({
+                "name": cache.name,
+                "enabled": cache.enabled,
+                "frozen": cache.frozen,
+                "capacity_bytes": cache.capacity_lines * cache.line_size as usize,
+                "resident_lines": cache.lines.len(),
+                "dirty_lines": cache.lines.iter().filter(|line| line.dirty).count(),
+                "line_size": cache.line_size,
+                "ways": cache.ways,
+                "sets": cache.capacity_lines / cache.ways,
+                "stats": cache.stats,
+            })));
         }
         state
     }
@@ -1508,7 +1295,7 @@ impl Machine {
             stats.saturations
         );
         let _ = writeln!(out, "  {:>14} faults", stats.faults);
-        for cache in self.device.cpu_mut().bus_mut().cache_views() {
+        for cache in self.device.cache_views() {
             let reads = cache.stats.read_hits + cache.stats.read_misses;
             let writes = cache.stats.write_hits + cache.stats.write_misses;
             let read_rate = if reads == 0 {

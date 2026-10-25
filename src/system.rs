@@ -1205,9 +1205,19 @@ impl Fabric {
         }
     }
 
-    #[cfg(test)]
+    /// One megamodule, for inspecting what it holds without disturbing it.
     pub(crate) fn megamodule(&self, core: usize) -> &Megamodule {
         &self.mm[core]
+    }
+
+    /// Program every core's caches through its L1PCFG, L1DCFG and L2CFG, the registers
+    /// firmware uses, so the change takes effect the way a write from the core would.
+    pub(crate) fn configure_caches(&mut self, l1p: u32, l1d: u32, l2: u32) {
+        for core in 0..self.cores {
+            self.write32(core, crate::memory::L1PCFG, l1p);
+            self.write32(core, crate::memory::L1DCFG, l1d);
+            self.write32(core, crate::memory::L2CFG, l2);
+        }
     }
 
     /// A view of the fabric from one core, which is what the CPU holds while it runs.
@@ -1222,10 +1232,6 @@ impl Fabric {
 
     pub(crate) fn endian(&self) -> Endian {
         self.shared.backing.endian()
-    }
-
-    pub(crate) fn profile(&self) -> &'static DeviceProfile {
-        self.profile
     }
 
     /// Which cores the boot controller is holding in reset, as a bitmask. A held core does not
@@ -3116,40 +3122,10 @@ impl<'a> CoreBus<'a> {
         self.fabric.mm[self.core].record_dropped_interrupt(interrupt);
     }
 
-    pub(crate) fn cache_views(&self) -> [CacheView; 3] {
-        self.fabric.mm[self.core].cache_views()
-    }
-
-    pub(crate) fn cache_line_data(&self, level: usize, address: u32) -> Option<&[u8]> {
-        self.fabric.mm[self.core].cache_line_data(level, address)
-    }
-
-    pub(crate) fn event_flag_registers(&self) -> [u32; 4] {
-        self.fabric.mm[self.core].event_flag_registers()
-    }
-
-    pub(crate) fn interrupt_selectors(&self) -> [u32; 3] {
-        self.fabric.mm[self.core].interrupt_selectors()
-    }
-
-    /// The host port belongs to the device, not this core, but a front end reaches it through
-    /// whichever core it is driving.
-    pub(crate) fn hpi_host_read(&mut self, port: HostPort) -> Option<u32> {
-        self.fabric.hpi_host_read(port)
-    }
-
-    pub(crate) fn hpi_host_write(&mut self, port: HostPort, value: u32) {
-        self.fabric.hpi_host_write(port, value);
-    }
-
     /// Drive one conformance-vector operation at the device through this core.
     #[cfg(test)]
     pub(crate) fn apply(&mut self, operation: &Value) -> Result<Option<Value>, String> {
         self.fabric.apply(operation)
-    }
-
-    pub(crate) fn mar_registers(&self) -> [u32; 256] {
-        self.fabric.mm[self.core].mar_registers()
     }
 }
 
@@ -3299,13 +3275,6 @@ impl Fabric {
     /// Whether the device is strapped to an HPI boot the host has not yet ended with DSPINT.
     pub(crate) fn hpi_boot_pending(&self) -> bool {
         self.shared.hpi.boot_pending()
-    }
-
-    /// Whether the device was strapped to HPI boot, which holds for the device's lifetime: the
-    /// C6455's DSPINT ends the hold on its core and the C6472's host ends each core's own, but
-    /// neither makes the device any less one that booted this way.
-    pub(crate) fn hpi_boot_strapped(&self) -> bool {
-        self.shared.hpi.strapped()
     }
 
     /// The shared L2 ROM image, which is where the boot controller starts core 0 for every ROM

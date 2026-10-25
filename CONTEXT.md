@@ -93,6 +93,21 @@ its registers and lets the boot ROM read them; every host-side decision - which 
 boot needs, whether the image is loaded, which boot starts - reads the boot source instead.
 _Avoid_: boot mode (for the resolved value; the boot mode is the pins)
 
+**board**:
+What surrounds the device and what it supplies: the BOOTMODE and configuration pins, the serial
+EEPROM on the I2C bus, the UTOPIA PHY address, the fused MAC ID. It resolves the boot source and
+refuses a command line that straps a boot it does not supply, or supplies something nothing it
+straps reads. The device is built on a board, and a reload builds the same board again.
+`Board` in `board.rs`.
+_Avoid_: board config, strap options
+
+**boot**:
+The boot a board straps, as the device runs it and after it has: the boot ROM running in place
+of core 0, the HPI boot holding the cores for the host, or nothing. The device ticks it and
+defers core 0's release to it; the machine asks it whether it holds core 0 and what it reports.
+No other module knows which boot is running. `Boot` in `board.rs`.
+_Avoid_: ROM boot (for the whole; that is one kind), boot state
+
 **machine**:
 The module every front end drives: a loaded image, the CPU, and the host connections the
 device needs — the CIO handshake, the Ethernet backend, the HPI host side, the UTOPIA's ATM
@@ -152,3 +167,11 @@ or an exception. The source decides only the return address, which register pair
 interrupted context, and what becomes of a software-pipelined loop; everything else - no branch
 surviving, Supervisor mode, annulled NOPs, the pipeline refill - is the same for every source.
 _Avoid_: take, vectoring, exception entry (for the whole)
+
+**cycle boundary**:
+The one place a CPU cycle ends, told only how it ended: frozen by a stall, committed, or committed
+with a SPLOOP stage to complete. A frozen cycle ticks the device and counts a stall, nothing
+else; a committed one lands the write-back queue's due effects, completes the loop stage if any,
+ticks the device, samples the interrupt lines for interrupt entry and advances the cycle - in
+that order, whichever exit of `Cpu::step` it came from. `cycle_boundary` in `cpu.rs`.
+_Avoid_: finish cycle, end of step

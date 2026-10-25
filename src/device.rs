@@ -8,16 +8,14 @@
 //! and 7.15). Everything that differs between them is a field of a `DeviceProfile`, so the
 //! fabric, the memory hierarchy and the front ends have one device model rather than two.
 
+use crate::board::{Board, Boot};
+use crate::cache::CacheView;
 use crate::cpu::Cpu;
 use crate::events::{EventMap, C6455_EVENTS, C6472_EVENTS};
 use crate::hpi::HPI_BOOT_ENTRY;
-use crate::i2cboot::{I2cBoot, Progress as I2cProgress, Rom as I2cRom};
-use crate::memory::{L1DCFG, L1PCFG, L2CFG};
-use crate::romboot::{BootParameters, EmacBoot, Progress};
 use crate::space::{AddressMap, C6455_MAP, C6472_MAP};
 use crate::system::{Endian, Fabric};
 use crate::utopia::{UtopiaProfile, C6455_UTOPIA, C6472_UTOPIA};
-use crate::utopiaboot::{Progress as UtopiaProgress, UtopiaBoot};
 use std::ops::Range;
 
 /// One memory protection region: the local window a unit protects, the size of a page, and the
@@ -243,25 +241,6 @@ impl DeviceProfile {
     }
 }
 
-/// Which of the ROM's boot modes is running in place of core 0. The two are separate state
-/// machines because they share nothing but the boot table they end in and the core they hold.
-enum RomBoot {
-    Emac(EmacBoot),
-    I2c(I2cBoot),
-    Utopia(UtopiaBoot),
-}
-
-impl RomBoot {
-    /// One cycle of whichever boot this is, answering the entry point when it ends.
-    fn tick(&mut self, fabric: &mut Fabric) -> Option<u32> {
-        match self {
-            Self::Emac(boot) => boot.tick(fabric),
-            Self::I2c(boot) => boot.tick(fabric),
-            Self::Utopia(boot) => boot.tick(fabric),
-        }
-    }
-}
-
 /// The device as a whole: its cores and the fabric they share.
 ///
 /// The fabric is lent to exactly one core at a time. At rest it stays with the **focused**
@@ -274,16 +253,9 @@ pub struct Device {
     cpus: Vec<Cpu>,
     focus: usize,
     cycle: u64,
-    /// The ROM bootloader's boot, once a front end has strapped the device to one. It outlives
-    /// the boot it performed: what it did is what a front end reports afterwards.
-    rom_boot: Option<RomBoot>,
-    /// Strapped to HPI boot, which is hardware rather than ROM: the cores are held in reset for
-    /// the host. The C6455's one core starts at the base of L2 on the host's DSPINT (SPRS276M
-    /// section 2.4); each C6472 core starts at its DSP_BOOT_ADDR when the host sets its BC bit
-    /// in BOOT_COMPLETE_STAT (SPRUEC6G section 4.3.2).
-    hpi_boot: bool,
-    /// Where the host's release started each core of an HPI boot, `None` while it is held.
-    hpi_entries: [Option<u32>; crate::bootctl::MAX_CORES],
+    /// The boot the board strapped, which outlives what it performed: what it did is what a
+    /// front end reports afterwards.
+    boot: Boot,
 }
 
 /// The two boundaries a batch of device cycles ends at, kept as bit masks over the cores and
@@ -353,18 +325,25 @@ impl Device {
         Self::with_boot_mode(profile, entry, endian, 0)
     }
 
-    /// A device strapped to a boot mode: mode 0 releases every core, HPI boot holds every
-    /// core for the host, and C6472 ROM modes run core 0 while the others wait. The C6455's
-    /// HPI entry is fixed at L2 base; C6472 cores start at their programmed boot addresses.
+    /// A device on a board that straps `boot_mode` and supplies nothing else.
+    #[cfg(test)]
     pub fn with_boot_mode(
         profile: &'static DeviceProfile,
         entry: u32,
         endian: Endian,
         boot_mode: u8,
     ) -> Self {
-        let mut fabric = Box::new(Fabric::with_boot_mode(profile, boot_mode));
+        Self::on_board(&Board::pins(profile, boot_mode), entry, endian)
+    }
+
+    /// The device a board carries, strapped and fused as the board has it and with the boot
+    /// it straps started: mode 0 releases every core, HPI boot holds every core for the host,
+    /// and a ROM boot runs in place of core 0 while the others wait. The C6455's HPI entry is
+    /// fixed at L2 base; C6472 cores start at their programmed boot addresses.
+    pub(crate) fn on_board(board: &Board, entry: u32, endian: Endian) -> Self {
+        let profile = board.profile();
+        let mut fabric = Box::new(Fabric::with_boot_mode(profile, board.mode()));
         fabric.apply_reset_holds();
-        let hpi_boot = fabric.hpi_boot_strapped();
         // A DSPINT-released core starts at the base of L2 wherever `entry` says. A C6472 core's
         // start address is not set until the host releases it, from its DSP_BOOT_ADDR.
         let entry = if fabric.hpi_boot_pending() {
@@ -383,107 +362,18 @@ impl Device {
         }
         cpus.reverse();
         cpus[profile.reset_core].attach(fabric);
-        if hpi_boot {
-            // SPRUEC6G Table 2 and Table 21: an HPI boot leaves 32 KB of each L1 cache and all
-            // of L2 as SRAM, in every core there is. Written through the registers, like every
-            // other cache configuration.
-            let fabric = cpus[profile.reset_core].fabric_mut();
-            for core in 0..profile.cores() {
-                fabric.write32(core, L1PCFG, 4);
-                fabric.write32(core, L1DCFG, 4);
-                fabric.write32(core, L2CFG, 0);
-            }
-        }
+        let boot = board.start(cpus[profile.reset_core].fabric_mut());
         Self {
             cpus,
             focus: profile.reset_core,
             cycle: 0,
-            rom_boot: None,
-            hpi_boot,
-            hpi_entries: [None; crate::bootctl::MAX_CORES],
+            boot,
         }
     }
 
-    /// Strap the device to the ROM bootloader's Ethernet boot on the MAC port at `base`
-    /// (SPRUEC6G section 4.3.5). Core 0 is held while the boot code runs in its place, and the
-    /// other cores stay held until the boot table releases them.
-    pub fn begin_ethernet_boot(&mut self, base: u32, parameters: BootParameters) {
-        let endian = self.fabric().endian();
-        self.fabric().set_held_in_reset(0, true);
-        self.rom_boot = Some(RomBoot::Emac(EmacBoot::new(base, endian, parameters)));
-    }
-
-    /// Strap the device to the ROM bootloader's I2C EEPROM boot (SPRUEC6G sections 2.3.4 and
-    /// 4.3.3) on BOOTMODE `mode`, with `cfggp` on the configuration pins and the EEPROM image on
-    /// the bus at the address the mode requires. The C6455 reads its parameter block index from
-    /// CFGGP[2:0]; the C6472 from CFG[3:0], with CFG[4] choosing PLL1's x9 or x19 (Table 22).
-    /// Core 0 is held while the boot code runs in its place.
-    pub fn begin_i2c_boot(&mut self, mode: u8, cfggp: u8, contents: Vec<u8>) {
-        let endian = self.fabric().endian();
-        let c6472 = self.fabric().profile().has_boot_controller;
-        let slave = crate::i2cboot::eeprom_address(c6472, mode)
-            .expect("the boot mode is the device's master I2C boot");
-        let (rom, index) = if c6472 {
-            let pll_multiplier = if cfggp & 0x10 != 0 { 19 } else { 9 };
-            self.fabric().strap_cfggp(cfggp);
-            (I2cRom::C6472 { pll_multiplier }, cfggp & 0xf)
-        } else {
-            (I2cRom::C6455, cfggp & 0x7)
-        };
-        self.fabric().attach_i2c_eeprom(slave, contents);
-        self.fabric().set_held_in_reset(0, true);
-        self.rom_boot = Some(RomBoot::I2c(I2cBoot::new(
-            rom,
-            slave,
-            u32::from(index),
-            endian,
-        )));
-    }
-
-    /// Strap the device to the ROM bootloader's UTOPIA boot, BOOTMODE 5-8 (SPRUEC6G section
-    /// 4.3.4), with `phy` on CFGGP[4:0] as the PHY ID the port answers to. The mode picks the
-    /// port width and PLL multiplier; the ATM master that sends the cells reaches the receive
-    /// queue through `Fabric::utopia_master_poll_receive` and `utopia_master_send_cell`. Core 0
-    /// is held while the boot code runs in its place, and the other cores stay held until the
-    /// boot table releases them.
-    pub fn begin_utopia_boot(&mut self, mode: u8, phy: u8) {
-        let endian = self.fabric().endian();
-        let boot = UtopiaBoot::cold(mode, phy, endian);
-        self.fabric().strap_utopia(phy, boot.is_wide());
-        self.fabric().set_held_in_reset(0, true);
-        self.rom_boot = Some(RomBoot::Utopia(boot));
-    }
-
-    /// What the UTOPIA boot has done, when the device was strapped to one or an I2C boot's
-    /// parameter block handed over to one.
-    pub fn utopia_boot(&self) -> Option<UtopiaProgress> {
-        match self.rom_boot.as_ref()? {
-            RomBoot::Utopia(boot) => Some(boot.progress()),
-            RomBoot::I2c(boot) => boot.utopia(),
-            RomBoot::Emac(_) => None,
-        }
-    }
-
-    /// Where the host's release started a core of an HPI boot, once it has: the base of L2 for
-    /// the C6455's core 0, the core's DSP_BOOT_ADDR as the host left it for the C6472's. `None`
-    /// while the core is still held, and for a core that no HPI boot released.
-    pub fn hpi_boot_entry(&self, core: usize) -> Option<u32> {
-        self.hpi_entries.get(core).copied().flatten()
-    }
-
-    /// What the I2C boot has done, when the device was strapped to one.
-    pub fn i2c_boot(&self) -> Option<I2cProgress> {
-        match self.rom_boot.as_ref()? {
-            RomBoot::I2c(boot) => Some(boot.progress()),
-            _ => None,
-        }
-    }
-
-    /// Whether the device was strapped to a boot that holds core 0 - the ROM bootloader running
-    /// in its place, or the HPI boot holding it in reset for the host. A run loop has to
-    /// advance the device rather than the core while it is, because the core is held.
-    pub fn boot_holds_core_zero(&self) -> bool {
-        self.rom_boot.is_some() || self.hpi_boot
+    /// The boot the board strapped: whether it holds core 0, and what it has done.
+    pub(crate) fn boot(&self) -> &Boot {
+        &self.boot
     }
 
     /// Whether a core is held in reset, without borrowing the fabric mutably: the halt rule
@@ -498,12 +388,63 @@ impl Device {
         (0..self.cpus.len()).find(|&core| !self.held_in_reset(core) && self.cpus[core].halted())
     }
 
-    /// What the Ethernet boot has done, when the device was strapped to one.
-    pub fn ethernet_boot(&self) -> Option<Progress> {
-        match self.rom_boot.as_ref()? {
-            RomBoot::Emac(boot) => Some(boot.progress()),
-            _ => None,
-        }
+    /// Program every core's caches through the configuration registers firmware uses (SPRU871K
+    /// L1PCFG, L1DCFG and L2CFG), rather than by reaching into the model.
+    pub(crate) fn configure_caches(&mut self, l1p: u32, l1d: u32, l2: u32) {
+        self.fabric().configure_caches(l1p, l1d, l2);
+    }
+
+    /// Place image bytes in memory the way the ELF loader does: behind the caches, once.
+    pub(crate) fn load_image(&mut self, address: u32, bytes: &[u8]) {
+        self.fabric().load_image_bytes(address, bytes);
+    }
+
+    /// Place a ROM boot table at `address` and process it as the bootloader would on the
+    /// focused core, answering the entry point it names (SPRUEC6G section 6.2.2).
+    pub(crate) fn load_boot_table(&mut self, address: u32, table: &[u8]) -> Result<u32, String> {
+        let cpu = self.cpu_mut();
+        cpu.write_bytes(address, table);
+        crate::boot::load_boot_table(&mut cpu.bus_mut(), address)
+    }
+
+    /// Place a boot configuration table at `address` and apply it as the bootloader would on
+    /// the focused core, answering the functions it asks to call (SPRUEC6G section 6.2.3).
+    pub(crate) fn apply_boot_configuration(
+        &mut self,
+        address: u32,
+        table: &[u8],
+    ) -> Result<Vec<u32>, String> {
+        let cpu = self.cpu_mut();
+        cpu.write_bytes(address, table);
+        crate::boot::apply_boot_configuration(&mut cpu.bus_mut(), address)
+    }
+
+    /// The focused megamodule's cache state, for a front end that draws it.
+    pub(crate) fn cache_views(&self) -> [CacheView; 3] {
+        self.focused_megamodule().cache_views()
+    }
+
+    /// One resident line of the focused megamodule's caches, or nothing if that level does not
+    /// hold the address. Passive: reading it moves no replacement clock.
+    pub(crate) fn cache_line_data(&self, level: usize, address: u32) -> Option<&[u8]> {
+        self.focused_megamodule().cache_line_data(level, address)
+    }
+
+    /// The focused megamodule's interrupt selectors, event flags and cacheability registers.
+    pub(crate) fn interrupt_selectors(&self) -> [u32; 3] {
+        self.focused_megamodule().interrupt_selectors()
+    }
+
+    pub(crate) fn event_flag_registers(&self) -> [u32; 4] {
+        self.focused_megamodule().event_flag_registers()
+    }
+
+    pub(crate) fn mar_registers(&self) -> [u32; 256] {
+        self.focused_megamodule().mar_registers()
+    }
+
+    fn focused_megamodule(&self) -> &crate::system::Megamodule {
+        self.cpus[self.focus].fabric_ref().megamodule(self.focus)
     }
 
     pub fn cores(&self) -> usize {
@@ -593,7 +534,7 @@ impl Device {
         cio: Option<u32>,
         ignore_cio_once: bool,
     ) -> u64 {
-        if self.cpus.len() == 1 && !self.boot_holds_core_zero() {
+        if self.cpus.len() == 1 && !self.boot.holds_core_zero() {
             return self.cpus[0].run_cycles(cycles, cio, ignore_cio_once);
         }
         // The device keeps the fabric for the whole batch and gives it back to the focused
@@ -644,16 +585,14 @@ impl Device {
         // device through the HPI while the cores wait (SPRUEC6G section 4.3.2).
         fabric.tick(self.cycle);
         self.cycle += 1;
-        if let Some(boot) = self.rom_boot.as_mut() {
-            if let Some(entry) = boot.tick(fabric) {
-                // The boot table has ended: the ROM branches core 0 to the entry point it named,
-                // and the cores the table released are already starting from their own boot
-                // addresses (SPRUEC6G section 4.3.5).
-                self.cpus[0].set_pc(entry);
-                fabric.set_held_in_reset(0, false);
-                if let Some(boundaries) = boundaries.as_deref_mut() {
-                    boundaries.observe(0, &self.cpus[0]);
-                }
+        if let Some(entry) = self.boot.tick(fabric) {
+            // The boot table has ended: the ROM branches core 0 to the entry point it named,
+            // and the cores the table released are already starting from their own boot
+            // addresses (SPRUEC6G section 4.3.5).
+            self.cpus[0].set_pc(entry);
+            fabric.set_held_in_reset(0, false);
+            if let Some(boundaries) = boundaries.as_deref_mut() {
+                boundaries.observe(0, &self.cpus[0]);
             }
         }
         self.apply_device_requests(fabric, boundaries);
@@ -671,11 +610,7 @@ impl Device {
             if released & (1 << core) == 0 {
                 continue;
             }
-            // BC0 never starts core 0 during a ROM boot. Core 0 is the core that runs the boot
-            // code, so it is out of reset from power-up and its bit only signals that the boot
-            // finished (SPRUEC6G section 4.1); where core 0 goes is the boot table's entry
-            // point, which the boot itself applies.
-            if core == 0 && self.rom_boot.is_some() {
+            if self.boot.owns_release(core) {
                 continue;
             }
             let held = fabric.held_in_reset(core);
@@ -686,11 +621,7 @@ impl Device {
                     boundaries.observe(core, &self.cpus[core]);
                 }
             }
-            if self.hpi_boot && held {
-                // A C6455 has no boot controller, and its core is already waiting at the base
-                // of L2.
-                self.hpi_entries[core] = Some(address.unwrap_or(HPI_BOOT_ENTRY));
-            }
+            self.boot.released(core, held, address);
             fabric.set_held_in_reset(core, false);
         }
         // Driving the NMI pin latches an edge and moves nothing a boundary reads.
@@ -711,9 +642,7 @@ impl Device {
             cpus: vec![cpu],
             focus: 0,
             cycle: 0,
-            rom_boot: None,
-            hpi_boot: false,
-            hpi_entries: [None; crate::bootctl::MAX_CORES],
+            boot: Boot::none(),
         }
     }
 }
@@ -721,6 +650,7 @@ impl Device {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::{L1DCFG, L1PCFG, L2CFG};
     use crate::system::Endian;
 
     /// Boot controller registers (SPRS612G section 3.9) and the chip-level inter-processor
@@ -765,7 +695,7 @@ mod tests {
             assert_eq!(bus.read32(L1DCFG) & 7, 4);
             assert_eq!(bus.read32(L2CFG) & 7, 0);
             assert!(device.held_in_reset(0));
-            assert_eq!(device.hpi_boot_entry(0), None);
+            assert_eq!(device.boot().hpi_entry(0), None);
 
             // Three posted words cannot complete a four-word DMA burst. The host must flush
             // its final short burst; the boot ending does not do it.
@@ -802,7 +732,7 @@ mod tests {
                 0,
                 "release does not execute a packet"
             );
-            assert_eq!(device.hpi_boot_entry(0), Some(0x0080_0000));
+            assert_eq!(device.boot().hpi_entry(0), Some(0x0080_0000));
             // The CPU leaves reset with interrupts disabled, and DSPINT stays set until the
             // application clears it.
             assert_eq!(device.core(0).read_control(CSR) & 1, 0, "GIE");
@@ -1101,7 +1031,7 @@ mod tests {
             );
             for core in 0..6 {
                 assert!(device.held_in_reset(core), "core {core}");
-                assert_eq!(device.hpi_boot_entry(core), None);
+                assert_eq!(device.boot().hpi_entry(core), None);
                 device.with_core(core, |cpu| {
                     let mut bus = cpu.bus_mut();
                     assert_eq!(bus.read32(L1PCFG) & 7, 4, "core {core}");
@@ -1154,7 +1084,7 @@ mod tests {
             );
             for core in 0..6 {
                 assert!(device.held_in_reset(core), "DSPINT released core {core}");
-                assert_eq!(device.hpi_boot_entry(core), None);
+                assert_eq!(device.boot().hpi_entry(core), None);
                 assert_eq!(device.core(core).cycles(), 0);
             }
             // Nor an EDMA3 event: channel 0 is GPINT0 here, and no channel is the HPI's.
@@ -1175,11 +1105,11 @@ mod tests {
                 assert!(!device.held_in_reset(core), "core {core}");
                 assert_eq!(device.core(core).pc(), entry(core), "core {core}");
                 assert_eq!(device.core(core).cycles(), 0);
-                assert_eq!(device.hpi_boot_entry(core), Some(entry(core)));
+                assert_eq!(device.boot().hpi_entry(core), Some(entry(core)));
             }
             for core in [1, 2, 4, 5] {
                 assert!(device.held_in_reset(core), "core {core}");
-                assert_eq!(device.hpi_boot_entry(core), None);
+                assert_eq!(device.boot().hpi_entry(core), None);
             }
             run(&mut device, 300);
             for core in [0, 3] {
@@ -1206,8 +1136,8 @@ mod tests {
             device.step_cycle();
             assert!(device.core(0).pc() >= progress[0], "core 0 restarted");
             assert!(device.core(3).pc() >= progress[1], "core 3 restarted");
-            assert_eq!(device.hpi_boot_entry(0), Some(entry(0)));
-            assert_eq!(device.hpi_boot_entry(3), Some(entry(3)));
+            assert_eq!(device.boot().hpi_entry(0), Some(entry(0)));
+            assert_eq!(device.boot().hpi_entry(3), Some(entry(3)));
             assert_eq!(host_get(&mut device, BOOT_COMPLETE_STAT), 0b001001);
 
             // The rest go at the default start, and only the edges release anything.
@@ -1217,7 +1147,7 @@ mod tests {
             for core in [1, 2, 4, 5] {
                 assert!(!device.held_in_reset(core), "core {core}");
                 assert_eq!(device.core(core).pc(), 0x0080_0000, "core {core}");
-                assert_eq!(device.hpi_boot_entry(core), Some(0x0080_0000));
+                assert_eq!(device.boot().hpi_entry(core), Some(0x0080_0000));
             }
             assert!(device.core(0).pc() >= progress[0], "core 0 restarted");
             assert!(device.core(3).pc() >= progress[1], "core 3 restarted");
@@ -1230,7 +1160,7 @@ mod tests {
                 );
             }
             // The clock stays the device's for as long as the device booted this way.
-            assert!(device.boot_holds_core_zero());
+            assert!(device.boot().holds_core_zero());
         }
     }
 
@@ -1616,9 +1546,11 @@ mod tests {
         }
 
         fn boot_device(endian: Endian, mode: u8) -> Device {
-            let mut device = Device::with_boot_mode(&C6472, 0x0080_0000, endian, mode);
-            device.begin_utopia_boot(mode, PHY);
-            device
+            Device::on_board(
+                &Board::pins(&C6472, mode).with_utopia_phy(PHY),
+                0x0080_0000,
+                endian,
+            )
         }
 
         /// Table words as the hex conversion utility's `-order M` writes them, most significant
@@ -1701,14 +1633,15 @@ mod tests {
         fn boot_until_done(device: &mut Device) -> UtopiaProgress {
             for _ in 0..600_000 {
                 if let Some(progress) = device
-                    .utopia_boot()
+                    .boot()
+                    .utopia()
                     .filter(|progress| progress.entry.is_some() || progress.error.is_some())
                 {
                     return progress;
                 }
                 device.step_cycle();
             }
-            panic!("the boot never ended: {:?}", device.utopia_boot());
+            panic!("the boot never ended: {:?}", device.boot().utopia());
         }
 
         fn read(device: &mut Device, address: u32) -> u32 {
@@ -1984,9 +1917,11 @@ mod tests {
             /// A C6472 strapped to I2C boot from 0x50 with CFG[4] high, so PLL1 is x19, booting
             /// the EEPROM `image`.
             fn i2c_device(endian: Endian, image: Vec<u8>) -> Device {
-                let mut device = Device::with_boot_mode(&C6472, 0x0080_0000, endian, 2);
-                device.begin_i2c_boot(2, 0x10, image);
-                device
+                Device::on_board(
+                    &Board::pins(&C6472, 2).with_i2c_eeprom(0x10, image),
+                    0x0080_0000,
+                    endian,
+                )
             }
 
             fn until_listening(device: &mut Device, phy: u8) {
@@ -1998,7 +1933,7 @@ mod tests {
                 }
                 panic!(
                     "the port never listened at PHY {phy}: {:?}",
-                    device.utopia_boot()
+                    device.boot().utopia()
                 );
             }
 
@@ -2034,7 +1969,7 @@ mod tests {
                         let mut device = i2c_device(endian, image);
                         until_listening(&mut device, slave);
 
-                        let i2c = device.i2c_boot().unwrap();
+                        let i2c = device.boot().i2c().unwrap();
                         assert_eq!(i2c.error, None, "{label}");
                         assert_eq!(i2c.parameter_blocks, 2, "{label}");
                         assert_eq!(i2c.entry, None, "{label}: UTOPIA's boot, not I2C's");
@@ -2116,7 +2051,7 @@ mod tests {
                     let progress = boot_until_done(&mut device);
                     assert_eq!(progress.error, None, "{label}");
                     assert_eq!(progress.entry, Some(CODE), "{label}");
-                    let i2c = device.i2c_boot().unwrap();
+                    let i2c = device.boot().i2c().unwrap();
                     assert_eq!(i2c.config_blocks, 1, "{label}");
                     assert_eq!(i2c.parameter_blocks, 2, "{label}");
                     // UCR is still the table's: the handover wrote neither SLID nor anything else.
@@ -2134,7 +2069,7 @@ mod tests {
                 for _ in 0..300_000 {
                     device.step_cycle();
                 }
-                let progress = device.utopia_boot().expect("handed over to UTOPIA");
+                let progress = device.boot().utopia().expect("handed over to UTOPIA");
                 assert!(channel_enabled(&mut device, 0), "PDMA channel 8");
                 assert_eq!(read(&mut device, TIMER0 + 0x18) + 1, 8333);
                 // SPRUEG2E Figure 9: the reserved one, MPHY and U16M, with UREN clear.

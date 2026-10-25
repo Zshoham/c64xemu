@@ -291,6 +291,7 @@ expectation in each is TI's code's rather than this project's.
 | `src/edma.rs`, `src/edma_tc.rs`, `src/idma.rs` | the EDMA3 channel and transfer controllers, IDMA |
 | `src/timer.rs`, `src/gpio.rs`, `src/i2c.rs`, `src/hpi.rs`, `src/utopia.rs`, `src/mcbsp.rs`, `src/pll.rs` | the timers, GPIO, I2C, HPI, UTOPIA, the two McBSPs and the PLL controllers |
 | `src/ddr2.rs`, `src/emifa.rs`, `src/devcfg.rs`, `src/boot.rs`, `src/romboot.rs` | the external-memory controllers, device configuration, boot tables, and the ROM bootloader's Ethernet boot |
+| `src/board.rs` | the board around the device: the boot source its strap resolves to, and the boot it starts |
 | `src/elf.rs`, `src/cio.rs` | image loading and the host I/O handshake |
 | `src/machine.rs` | the loaded machine and the options that build it: what `run` and `debug` share |
 | `src/runner.rs` | the batch runner: the loop and the state report |

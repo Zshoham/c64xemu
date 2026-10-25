@@ -117,10 +117,6 @@ impl Ethernet {
         })
     }
 
-    pub(crate) fn has_preload(&self) -> bool {
-        self.pcap_in.is_some()
-    }
-
     /// Reinstalling the device resets polling, but retains host backlog and the full TX archive.
     pub(crate) fn reset_poll(&mut self) {
         self.poll.reset();
