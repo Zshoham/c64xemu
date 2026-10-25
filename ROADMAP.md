@@ -604,6 +604,16 @@ and vector through ISTP+0x20; exception mode additionally sets `EFR.NXF`. The tw
 `cpu:nmi-*context` cases check the distinct TSR contexts and flags against SPRUFE8B 5.4.5-5.4.7
 and SPRU732J 6.1.1.
 
+**[x] Interrupt entry versus remaining multicycle NOPs.** *Fixed defect.*
+SPRU732J §5.6.2 p.557 and §6.4.2 p.572 say, “the address of the next execute packet
+in the pipeline is saved in NRP or IRP” when later multicycle NOP cycles are annulled
+(NRP alone for exceptions). NOP timing and nine-cycle entry were independently pinned,
+but remaining NOP cycles incorrectly delayed the handler. Entry now annuls generated
+NOP cycles and ends IDLE, without cancelling real memory stalls or outstanding writes.
+`interrupt_and_exception_annul_multicycle_nop_tails` pins maskable and NMI exception
+entry from NOP, IDLE and ADDKPC; `nmi_exception_annuls_generated_nops_without_cancelling_loads`
+also covers BNOP, CALLP and PROT's four generated NOPs, with the load still completing.
+
 **[x] Privilege.** *Done for the CPU.* `TSR.CXM` is tracked, User mode is entered the only way the
 architecture allows - returning from a context whose CXM is set - and the restored mode takes
 effect at the branch target rather than in the delay slots, so a restricted instruction in a

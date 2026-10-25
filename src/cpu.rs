@@ -4498,6 +4498,13 @@ impl Cpu {
                 self.interrupt_ready_since.get_or_insert(self.cycle);
             }
         }
+        if self.interrupt_stall != 0 {
+            // SPRU732J §5.6.2 / §6.4.2: entry annuls remaining multicycle NOPs,
+            // including IDLE and generated NOPs (BNOP/ADDKPC/CALLP and PROT loads).
+            // Actual memory stalls live in pending_stalls and still delay processing.
+            self.stall_cycles = 0;
+            self.idling = false;
+        }
     }
 
     /// The cycle boundary itself: the branch that comes due, the mode change that lands, and
@@ -5487,6 +5494,77 @@ mod tests {
         let quiet = run(false);
         assert_eq!(quiet, 16);
         assert_eq!(run(true) - quiet, 15);
+    }
+
+    #[test]
+    fn interrupt_and_exception_annul_multicycle_nop_tails() {
+        // SPRU732J §5.6.2 p.557 and §6.4.2 p.572: annulled later cycles of a
+        // multicycle NOP save the next packet in IRP/NRP, not the NOP itself.
+        for exception in [false, true] {
+            for instruction in [0x0001_0000, 0x0001_e000, 0x0188_a162] {
+                let mut cpu = Cpu::new(0);
+                // NOP 9, IDLE, ADDKPC.S2 +32,B3,5 (all multicycle NOP generators).
+                cpu.write_words(0, &[instruction, 0]);
+                let vector = 0x400 + if exception { 32 } else { 5 * 32 };
+                cpu.write_words(vector, &[0x0210_2058]); // ADD .L1 1,A4,A4
+                cpu.control.write(0x05, 0x400);
+                cpu.control.write(0x04, (1 << 5) | 2);
+                cpu.control.write(0x01, 1);
+                if exception {
+                    cpu.control.write(0x1a, 4); // TSR.GEE
+                }
+                cpu.run(2);
+                if exception {
+                    cpu.set_nmi_line(true);
+                } else {
+                    cpu.control.write(0x02, 1 << 5);
+                }
+                cpu.run(1);
+                assert_eq!(cpu.pc(), vector);
+                assert_eq!(cpu.control.read(if exception { 0x07 } else { 0x06 }, 0), 4);
+                cpu.run(9);
+                assert_eq!(cpu.register('A', 4), 0);
+                cpu.run(1);
+                assert_eq!(cpu.register('A', 4), 1, "exception={exception}");
+                assert_eq!(cpu.fault(), None);
+            }
+        }
+    }
+
+    #[test]
+    fn nmi_exception_annuls_generated_nops_without_cancelling_loads() {
+        // SPRU732J §3.9.2.2 p.82: PROT adds four NOP cycles, not a memory stall.
+        // §3.11 BNOP p.147 and CALLP p.153 likewise generate multicycle NOPs.
+        // §6.4.2 p.572 annuls their remaining cycles on exception entry.
+        for kind in 0..3 {
+            let mut cpu = Cpu::new(0);
+            let words = match kind {
+                0 => compact_packet(0x0d3c, 1 << 20).to_vec(), // protected LDW
+                1 => vec![0x0000_a120],                        // BNOP.S1 0,5
+                _ => vec![0x1000_0010],                        // CALLP.S1 0,A3
+            };
+            cpu.write_words(0, &words);
+            cpu.set_register("A6", 0x1000).unwrap();
+            cpu.write_bytes(0x1000, &10u32.to_le_bytes());
+            cpu.write_words(0x420, &[0x0210_2058]); // ADD .L1 1,A4,A4
+            cpu.control.write(0x05, 0x400);
+            cpu.control.write(0x04, 2);
+            cpu.control.write(0x1a, 4);
+            cpu.run(1);
+            let next = cpu.pc();
+            cpu.set_nmi_line(true);
+            cpu.run(1);
+            assert_eq!(cpu.pc(), 0x420);
+            assert_eq!(cpu.control.read(0x07, 0), next);
+            cpu.run(9);
+            assert_eq!(cpu.register('A', 4), 0);
+            cpu.run(1);
+            assert_eq!(cpu.register('A', 4), 1, "kind={kind}");
+            if kind == 0 {
+                assert_eq!(cpu.register('A', 3), 10);
+            }
+            assert_eq!(cpu.fault(), None);
+        }
     }
 
     #[test]
