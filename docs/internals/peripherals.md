@@ -42,6 +42,11 @@ request per synchronisation event, and the channel controller updates the set be
 The model performs one transfer request per tick, which is what makes a driver's "wait for the
 completion interrupt" loop behave the way it does on hardware rather than completing
 instantaneously.
+Null and dummy sets move no bytes but still reload their link when STATIC is clear, regardless
+of their count values (SPRU966C section 2.3.7). A null set additionally records a missed event
+and retains its secondary-event bit; a dummy set does neither (section 2.3.3 and Table 2-4).
+Both use the channel controller's internal completion path to raise enabled completion
+interrupts or chained events without submitting a transfer-controller request (section 2.5.3).
 
 The shadow regions are at `SHADOW_STRIDE` `0x200` apart with a `SHADOW_LIMIT` of `0x98`, which is
 the register window a region may reach; the access enables decide which channels a region owns.

@@ -661,6 +661,14 @@ is admitted by its own AID or by AIDX for an id above 5, with a refusal naming i
 A link update copies the linked set's OPT with the rest of it, so the set keeps the linked set's
 stamp; the manual was not found to say otherwise, and no case pins it.
 
+**[x] Refused EDMA3 writes leave resident L1D data untouched.** *Coverage gap closed.*
+SPRU871K section 4.6.1, p.112: "L2 (or EMC) performs protection checks before issuing
+snoop-write commands to L1D for addresses held in L1D cache." EDMA3 privilege refusals and
+DMA snoop-writes were pinned separately; the fabric already checked protection first.
+`edma_privilege::a_refused_edma_write_does_not_snoop_a_dirty_l1d_destination` keeps a dirty
+destination resident, denies the user write, and checks both the unchanged cached value and
+backing bytes alongside MPFAR/MPFSR. Granting UW in the control updates both copies.
+
 **[x] Which fault a protection block keeps.** *Fixed defect, and the method's sixth find.* Each
 unit's fault registers hold one fault, and both halves of the model latched one - the CPU path on
 every refused access, the DMA path only into empty registers - with nothing asking what the pair
@@ -989,6 +997,24 @@ it maps channel 1 onto a PaRAM set, arms timer 0 in continuous mode and waits fo
 bit its OPT names, so the checksum it returns can only come from the timer event reaching the
 channel controller, and `edma_interrupt` takes the same completion as a real CPU interrupt routed
 through INTMUX1 to INT5, counting the entries into its service routine.
+
+**[x] Null and dummy EDMA3 sets still link.** *Fixed defect.* SPRU966C section 2.3.7,
+p.37: "A link update occurs for null and dummy transfers depending on the state of the STATIC
+bit in OPT and the LINK field." Null-set missed-event reporting and ordinary exhausted-set
+linking were pinned separately; the null early return skipped linking, while dummy counts
+could incorrectly defer it. `null_and_dummy_sets_link_without_losing_their_event_status` checks
+all eight reloaded words, FFFFh null links, STATIC suppression, DMA and QDMA, the link's QDMA
+trigger, and the unchanged EMR/SER or QEMR/QSER distinction.
+
+**[x] Null EDMA3 sets can interrupt and chain.** *Fixed defect.* SPRU966C section 2.5.3,
+p.46: a dummy/null set programmed to return a completion code "will set the appropriate bits
+in the interrupt pending registers (IPR/IPRH) or chained event register (CER/CERH)." Null-set
+error reporting and ordinary completion were pinned separately, but the null early return
+discarded completion. `null_and_dummy_completion_interrupts_and_chains_without_moving_data`
+enables both intermediate and final completion, checks IPR/CER and the chained copy, and
+contrasts disabled completion and the already-working dummy path. It assumes no separate
+intermediate-versus-final classification for an all-zero null set. Neither empty set submits
+a request to the transfer controller, and null missed/secondary bits remain intact.
 
 **[x] The transfer controllers' debug windows.** *Done.* SPRU966C §2.12.4 says the source-active and
 destination-FIFO register sets exist "to derive a brief history of TRs serviced through the
