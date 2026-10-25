@@ -392,6 +392,12 @@ impl Control {
         }
     }
 
+    /// Capture the CPU's branch-blocking state before saving exception context
+    /// (SPRU732J Table 6-2). GIE is saved separately and does not define IB.
+    pub fn set_interrupts_blocked(&mut self, blocked: bool) {
+        self.tsr = (self.tsr & !(1 << 15)) | if blocked { 1 << 15 } else { 0 };
+    }
+
     /// Take an exception: save TSR into NTSR and the address of the first annulled execute
     /// packet into NRP, then enter the exception context (SPRU732J Table 6-3 - GIE, SGIE,
     /// XEN, INT and SPLX clear, EXC set, CXM back to Supervisor, GEE untouched).  `hardware`

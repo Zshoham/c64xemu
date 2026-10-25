@@ -4356,6 +4356,11 @@ impl Cpu {
             | PendingException::Nmi
             | PendingException::External => self.pc,
         };
+        // SPRU732J Table 6-2: exceptions may interrupt a branch shadow, but that
+        // context is not resumable and must be marked with NTSR.IB.
+        self.control.set_interrupts_blocked(
+            !self.branches.is_empty() || self.cycle < self.branch_block_until,
+        );
         // An exception leaves the loop buffer idle without running an epilog, and records in
         // NTSR.SPLX that a loop was destroyed so the handler knows it cannot resume.
         let in_sploop = self.sploop.abandon();
@@ -4379,6 +4384,7 @@ impl Cpu {
             }
         };
         self.branches.clear();
+        self.branch_block_until = self.cycle;
         // The vector runs in Supervisor and any restore the interrupted code had queued is
         // cancelled with the branch that would have applied it.
         self.user_mode = false;
@@ -5528,6 +5534,34 @@ mod tests {
                 assert_eq!(cpu.register('A', 4), 1, "exception={exception}");
                 assert_eq!(cpu.fault(), None);
             }
+        }
+    }
+
+    #[test]
+    fn nmi_exception_saves_branch_blocking_in_ntsr_ib() {
+        // SPRU732J §6.1.1.2 p.564 permits NMI in branch delay slots;
+        // Table 6-2 p.568: IB means "Exception occurred while interrupts were blocked."
+        // §5.5.2 p.549 blocks interrupts in a branch's delay slots.
+        for branch in [0, 0x0000_2010] {
+            let mut cpu = Cpu::new(0);
+            cpu.write_words(0, &[branch, 0, 0, 0, 0, 0]);
+            cpu.write_words(0x420, &[0x0210_2058]);
+            cpu.control.write(0x05, 0x400);
+            cpu.control.write(0x04, 2);
+            cpu.control.write(0x1a, 4);
+            cpu.run(1);
+            cpu.set_nmi_line(true);
+            cpu.run(1);
+            assert_eq!(cpu.pc(), 0x420);
+            assert_eq!(cpu.control.read(0x07, 0), 8);
+            assert_eq!(
+                cpu.control.read(0x1c, 0) & (1 << 15),
+                if branch == 0 { 0 } else { 1 << 15 }
+            );
+            cpu.run(10);
+            assert_eq!(cpu.register('A', 4), 1);
+            assert_eq!(cpu.pc(), 0x424); // the pending branch was discarded
+            assert_eq!(cpu.fault(), None);
         }
     }
 

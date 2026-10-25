@@ -614,6 +614,15 @@ NOP cycles and ends IDLE, without cancelling real memory stalls or outstanding w
 entry from NOP, IDLE and ADDKPC; `nmi_exception_annuls_generated_nops_without_cancelling_loads`
 also covers BNOP, CALLP and PROT's four generated NOPs, with the load still completing.
 
+**[x] NMI exception versus a pending branch shadow.** *Fixed defect.*
+SPRU732J §6.1.1.2 p.564 says “branch delay slots will not prevent the recognition
+of NMI”; Table 6-2 p.568 defines saved IB as “Exception occurred while interrupts
+were blocked.” Branch delay slots (§5.5.2 p.549) and NMI exception entry were
+independently pinned, but their meeting saved a clear IB. Exception entry now captures
+the branch-blocking state before discarding the pending branch and its shadow.
+`nmi_exception_saves_branch_blocking_in_ntsr_ib` checks NTSR.IB, NRP, vector and
+handler execution both inside and outside a taken branch's shadow.
+
 **[x] Privilege.** *Done for the CPU.* `TSR.CXM` is tracked, User mode is entered the only way the
 architecture allows - returning from a context whose CXM is set - and the restored mode takes
 effect at the branch target rather than in the delay slots, so a restricted instruction in a
