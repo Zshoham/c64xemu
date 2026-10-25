@@ -870,6 +870,9 @@ impl Edma {
     ) -> bool {
         let mut set = ParamSet::load(&self.param[base..base + 8]);
         if set.is_null() {
+            if set.opt & OPT_STATIC == 0 {
+                self.link(base, set.link);
+            }
             return true;
         }
         let ab_synchronised = set.opt & OPT_SYNCDIM != 0;
@@ -890,7 +893,9 @@ impl Edma {
             self.transfer(memory, &set, arrays);
             self.serviced = Some((controller, self.serviced_request(&set, arrays, priority)));
         }
-        let final_request = if ab_synchronised {
+        let final_request = if set.is_dummy() {
+            true
+        } else if ab_synchronised {
             set.ccnt <= 1
         } else {
             set.bcnt <= 1 && set.ccnt <= 1
@@ -1328,6 +1333,73 @@ mod tests {
         edma.write(SECR, 1 << 7, TEST_CONTEXT);
         assert_eq!(edma.read(EMR, TEST_CONTEXT), Some(0));
         assert_eq!(edma.read(SER, TEST_CONTEXT), Some(0));
+    }
+
+    #[test]
+    fn null_and_dummy_sets_link_without_losing_their_event_status() {
+        // SPRU966C §2.3.7 p.37: "A link update occurs for null and dummy transfers"
+        // when STATIC is clear, including a null LINK. The copy triggers QDMA; §2.3.3
+        // and Table 2-4 still require missed/secondary bits only for the null set.
+        for counts in [(0, 0), (0, 3), (3 << 16, 2)] {
+            for static_bit in [0, OPT_STATIC] {
+                for link in [32, NULL_LINK] {
+                    for qdma in [false, true] {
+                        let mut memory = Memory(BTreeMap::new());
+                        let mut edma = Edma::default();
+                        let original = [static_bit, 0x1000, counts.0, 0x2000, 4, link, 8, counts.1];
+                        let replacement = [OPT_STATIC, 0x3000, 0x10004, 0x4000, 4, NULL_LINK, 8, 1];
+                        program(&mut edma, 0, original);
+                        program(&mut edma, 1, replacement);
+                        if qdma {
+                            for channel in 1..QDMA_CHANNELS {
+                                edma.write(
+                                    QCHMAP_BASE + channel as u32 * 4,
+                                    (channel as u32 + 1) << 5,
+                                    TEST_CONTEXT,
+                                );
+                            }
+                            edma.write(QEESR, 1, TEST_CONTEXT);
+                            // QCHMAP's reset trigger word is OPT in set 0.
+                            edma.write(PARAM_BASE, static_bit, TEST_CONTEXT);
+                        } else {
+                            edma.write(ESR, 1, TEST_CONTEXT);
+                        }
+                        edma.tick(&mut memory);
+                        let expected = if static_bit != 0 {
+                            original
+                        } else if link == NULL_LINK {
+                            [0, 0, 0, 0, 0, NULL_LINK, 0, 0]
+                        } else {
+                            replacement
+                        };
+                        for (word, mut expected) in expected.into_iter().enumerate() {
+                            // CPU programming stamps supervisor PRIV into OPT; a null link
+                            // instead writes literal zeros (SPRU966C §2.10.2 and §2.3.7).
+                            if word == 0 && (static_bit != 0 || link != NULL_LINK) {
+                                expected |= 1 << 31;
+                            }
+                            assert_eq!(edma.read(PARAM_BASE + word as u32 * 4, TEST_CONTEXT), Some(expected),
+                                "counts {counts:?}, STATIC {static_bit}, LINK {link}, QDMA {qdma}, word {word}");
+                        }
+                        let null = u32::from(counts == (0, 0));
+                        let (missed, secondary) = if qdma { (QEMR, QSER) } else { (EMR, SER) };
+                        assert_eq!(
+                            edma.read(missed, TEST_CONTEXT),
+                            Some(null),
+                            "counts {counts:?}, STATIC {static_bit}, LINK {link}, QDMA {qdma}"
+                        );
+                        assert_eq!(edma.read(secondary, TEST_CONTEXT), Some(null));
+                        if qdma {
+                            assert_eq!(
+                                edma.read(QER, TEST_CONTEXT),
+                                Some(u32::from(static_bit == 0))
+                            );
+                        }
+                        assert!(memory.0.is_empty(), "zero-byte sets never move data");
+                    }
+                }
+            }
+        }
     }
 
     #[test]

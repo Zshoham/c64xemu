@@ -990,6 +990,14 @@ bit its OPT names, so the checksum it returns can only come from the timer event
 channel controller, and `edma_interrupt` takes the same completion as a real CPU interrupt routed
 through INTMUX1 to INT5, counting the entries into its service routine.
 
+**[x] Null and dummy EDMA3 sets still link.** *Fixed defect.* SPRU966C section 2.3.7,
+p.37: "A link update occurs for null and dummy transfers depending on the state of the STATIC
+bit in OPT and the LINK field." Null-set missed-event reporting and ordinary exhausted-set
+linking were pinned separately; the null early return skipped linking, while dummy counts
+could incorrectly defer it. `null_and_dummy_sets_link_without_losing_their_event_status` checks
+all eight reloaded words, FFFFh null links, STATIC suppression, DMA and QDMA, the link's QDMA
+trigger, and the unchanged EMR/SER or QEMR/QSER distinction.
+
 **[x] The transfer controllers' debug windows.** *Done.* SPRU966C §2.12.4 says the source-active and
 destination-FIFO register sets exist "to derive a brief history of TRs serviced through the
 transfer controller", and that is what they now report. A serviced request leaves its parameters
