@@ -2,12 +2,24 @@
   "domain": "memory",
   "expected": {
     "observations": [
-      393216,
+      0,
       536870913,
       {
         "$bits": {
           "clear": 262144,
           "set": 131072
+        }
+      },
+      {
+        "$bits": {
+          "clear": 393216,
+          "set": 0
+        }
+      },
+      {
+        "$bits": {
+          "clear": 2,
+          "set": 393216
         }
       },
       {
@@ -18,8 +30,8 @@
       },
       {
         "$bits": {
-          "clear": 0,
-          "set": 262146
+          "clear": 262144,
+          "set": 2
         }
       },
       48879,
@@ -65,9 +77,18 @@
         "value": 536870913
       },
       {
+        "address": 42729508,
+        "op": "write32",
+        "value": 2560
+      },
+      {
         "address": 42729480,
         "op": "write32",
         "value": 12681217
+      },
+      {
+        "address": 42729480,
+        "op": "read32"
       },
       {
         "address": 42729476,
@@ -79,7 +100,7 @@
         "op": "read32"
       },
       {
-        "cycles": 30,
+        "cycles": 12,
         "op": "tick"
       },
       {
@@ -87,7 +108,15 @@
         "op": "read32"
       },
       {
-        "cycles": 2,
+        "cycles": 191,
+        "op": "tick"
+      },
+      {
+        "address": 42729480,
+        "op": "read32"
+      },
+      {
+        "cycles": 1,
         "op": "tick"
       },
       {

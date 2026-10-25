@@ -16,6 +16,13 @@
           "clear": 6,
           "set": 0
         }
+      },
+      34,
+      {
+        "$bits": {
+          "clear": 2,
+          "set": 0
+        }
       }
     ]
   },
@@ -39,6 +46,11 @@
         "value": 536870912
       },
       {
+        "address": 42729508,
+        "op": "write32",
+        "value": 2560
+      },
+      {
         "address": 42729480,
         "op": "write32",
         "value": 12689409
@@ -49,7 +61,7 @@
         "value": 240
       },
       {
-        "cycles": 8,
+        "cycles": 54,
         "op": "tick"
       },
       {
@@ -67,7 +79,7 @@
         "value": 85
       },
       {
-        "cycles": 8,
+        "cycles": 54,
         "op": "tick"
       },
       {
@@ -85,7 +97,7 @@
         "value": 17
       },
       {
-        "cycles": 8,
+        "cycles": 6,
         "op": "tick"
       },
       {
@@ -94,7 +106,16 @@
         "value": 34
       },
       {
-        "cycles": 8,
+        "cycles": 60,
+        "op": "tick"
+      },
+      {
+        "address": 42729476,
+        "op": "write32",
+        "value": 51
+      },
+      {
+        "cycles": 84,
         "op": "tick"
       },
       {
@@ -104,6 +125,22 @@
       {
         "address": 42729472,
         "op": "read32"
+      },
+      {
+        "address": 42729480,
+        "op": "read32"
+      },
+      {
+        "cycles": 6,
+        "op": "tick"
+      },
+      {
+        "address": 42729472,
+        "op": "read32"
+      },
+      {
+        "cycles": 60,
+        "op": "tick"
       },
       {
         "address": 42729480,

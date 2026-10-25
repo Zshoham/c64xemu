@@ -69,6 +69,7 @@ TI documents cross-reference each other only by literature number, so both names
 | `c645x_gpio_users_guide.pdf` | SPRU724 | GPIO — also an external interrupt source. |
 | `c645x_pll_controller_users_guide.pdf` | SPRUE56 | PLL controller — clock config, affects timers. |
 | `c645x_utopia2_users_guide.pdf` | SPRUE48 | UTOPIA2 (low priority for this project). |
+| `c6000_mcbsp_reference_guide.pdf` | SPRU580G | McBSP — serialiser, frame sync generation, companding, multichannel selection, SPI mode, register layouts. |
 | `c645x_c647x_bootloader_users_guide.pdf` | SPRUEC6G | **Bootloader** — boot modes, what state the core is in at entry. Covers C645x *and* C647x. |
 
 ## Device / SoC — TMS320C6472 & TCI6486 (C647x)

@@ -1085,24 +1085,34 @@ only stopped when a non-repeat counter ran out. Now the word on the bus complete
 follows, or goes out at once on an idle bus; `stp_ends_a_repeat_mode_read_after_the_byte_on_the_
 bus` pins it with an EEPROM read done the IBL driver's way.
 
-**[~] McBSP.** *Both ports done, in digital loopback.* The register file and its bit layouts come
-from the CSL register appendix (SPRU401J Tables B-210 to B-224) and the addresses from SPRS276M
-Tables 7-57 and 7-58, so each port answers on its configuration bus and DRR and DXR answer again
-on the EDMA data bus - which the DMA path now reaches, as it does the UTOPIA queues, because those
-windows sit outside the configuration space and were previously served as plain memory. What moves
-data is digital loopback, the one path a port can run with nothing on its pins: the transmit
-serialiser feeds the receive serialiser, paced by the sample rate generator's CLKG, which is the
-CPU clock divided by CLKGDV + 1 while GRST is out of reset. The double buffering is the documented
-pair - DXR hands its word to XSR when the shifter is free, which clears XRDY and sets it again, and
-RSR hands its word to DRR, setting RRDY or RFULL when the previous word was never read - and RJUST
-justifies a short word three ways. XEVT and REVT are EDMA3 events 12 to 15 and XINT/RINT system
-events 40 to 43, the ready flags driving them in interrupt mode 0. Four cases pin a sixteen-bit
-word taking one serial clock per bit, the word lengths with justification and the overrun, the
-ready flags reaching the CPU with a generator in reset moving nothing, and TI's own driver pattern:
-the EDMA servicing the port over the data bus, one word per event, after a single manual kick.
-Multichannel selection through MCR and the channel-enable file, mu-law and A-law companding and the
-frame-sync generator's period and width are stored and decide nothing, because each needs a framing
-device on the pins: that is the entry in *What is still not modelled*.
+**[~] McBSP.** *Both ports done, to SPRU580G, with nothing on the pins.* The model follows the
+McBSP reference guide itself (SPRU580G, now checked in). The earlier model cited SPRU401J, whose
+Appendix B section B.11 is the McASP's and has no McBSP registers, and two of its choices were
+wrong: SPCR came up with XRDY and XEMPTY set, and XEMPTY's polarity was inverted. Figure 54
+resets every SPCR field to zero, XEMPTY = 0 means XSR is empty, and XRDY rises when XRST does,
+which is the XEVT TI's initialisation (section 7.1 step 6a) starts the EDMA before, so the
+data-bus case no longer kicks the channel by hand. The serial clock was also six times too fast:
+the C6455's sample rate generator divides CPU/6 (section 4.3, SPRS276M Table 2-1), not the CPU
+clock, so CLKG now counts SYSCLK3 edges.
+
+What the port does is one CLKG step at a time: the frame-sync generator (FPER, FWID, FRST, a
+rise being the sync), FSX from every DXR-to-XSR copy with FSGM clear, one- and two-phase frames
+with their own element counts and lengths, the 0-2 bit data delays, unexpected syncs with and
+without FIG, the RSR/RBR/DRR triple buffer that loses the third word to RFULL and then waits for
+a frame sync after DRR is read, transmit underflow resending the last word with XEMPTY low, G.711
+mu-law and A-law on the copies, LSB-first 8-bit and WDREVRS 32-bit order, the companding
+hardware's four-cycle DXR-to-DRR path with both sections in reset, normal and enhanced
+multichannel selection in all four XMCM modes - with XMCM = 01b/11b only selected elements
+emptying XSR, so DXR preloads and refills as Figure 44 draws it and is never taken with nothing
+selected - and RCBLK and XCBLK moving on at the boundary the subframe interrupt reports, all
+four interrupt modes - the frame-sync one gated on the section being out of reset,
+as C6455 usage note 2.1.8 says - SPI master clock-stop mode, and the general-purpose pin view of
+PCR. Pins are where the model stops: an external clock or frame sync never arrives, so a section
+waiting for one waits, and DR and every general-purpose input read low. [INFERENCE] A DX left in
+high impedance reads low on the loopback path too, and the companding path in reset is taken
+only when one side compands. Twenty-five unit cases in `src/mcbsp.rs` and four component vectors
+pin the timing, buffering, framing, companding, multichannel and interrupt behaviour; what is
+left is the device on the pins, in *What is still not modelled*.
 
 **[~] HPI.** *Both sides done.* The CPU's view is unchanged - HPIRST set out of reset, a write of one
 to HINT raising the interrupt to the host, a write of one to DSPINT acknowledging the host's, and
@@ -2161,14 +2171,14 @@ says what the device would have to do, and - the part that decides whether it is
 all - where an expectation independent of this emulator would come from. A section item that names
 one of these entries carries `[~]` rather than `[-]`, because its modelled half is real.
 
-**[-] McBSP's multichannel selection and companding.** Both ports are modelled - see the peripheral
-section - but three of their features are stored without deciding anything, because each needs a
-framing device on the pins to be observable: multichannel selection through MCR and the 128-bit
-channel-enable file, mu-law and A-law companding, and the frame-sync generator's period and width.
-Modelling those needs a codec on the other end of the port, which is a second device model rather
-than a missing rule. Worth recording how the entry that said "no register file, no serialiser, no
-frame-sync logic, and SPRU580 is not checked in" was closed anyway: the CSL register appendix
-carries every McBSP bit layout, and the device data manual carries the addresses.
+**[-] A device on the McBSP pins.** Both ports are modelled to SPRU580G - see the peripheral
+section - with nothing attached: CLKS, CLKX and CLKR as inputs never clock, FSX and FSR as inputs
+never sync, DR reads low. A codec, framer or SPI master on the other end would make external
+clocking, GSYNC resynchronisation, CLKSP, the slave half of clock-stop mode and receive data from
+outside observable, and with them two C6455 statements this model cannot test yet: section 3.1's
+"after reset in C645x devices, McBSP will disregard the first frame sync", which does not say
+which reset or which sync source, and advisory 3.1.29's corrupted first frame with XDATDLY = 0
+and an external CLKX/FSX. That is a second device model rather than a missing rule.
 
 **[-] VCP2 and TCP2.** The Viterbi and Turbo coprocessors. Both are large, both are specified in
 detail (SPRU533D, SPRU534C) and both have reference implementations in TI's own libraries, which

@@ -117,17 +117,17 @@
         "value": 536870913
       },
       {
+        "address": 42729508,
+        "op": "write32",
+        "value": 2560
+      },
+      {
         "address": 42729480,
         "op": "write32",
         "value": 12681217
       },
       {
-        "address": 44044304,
-        "op": "write32",
-        "value": 4096
-      },
-      {
-        "cycles": 400,
+        "cycles": 800,
         "op": "tick"
       },
       {

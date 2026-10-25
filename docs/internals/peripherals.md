@@ -211,17 +211,33 @@ exposed.
 
 ## McBSP
 
-`src/mcbsp.rs`, C6455 only (`has_mcbsp`). The register file and bit layouts come from the CSL
-register appendix ([SPRU401J](../reference/spru401j.pdf) Tables B-210 to B-224) and the addresses
-from SPRS276M Tables 7-57 and 7-58; each port answers on its configuration bus, and DRR and DXR
-answer again on the EDMA data bus.
+`src/mcbsp.rs`, C6455 only (`has_mcbsp`). The behaviour is the McBSP reference guide,
+[SPRU580G](../reference/spru580g.pdf), and the addresses are SPRS276M Tables 7-57 and 7-58; each
+port answers on its configuration bus, and DRR and DXR answer again on the EDMA data bus.
 
-Digital loopback is again the path that runs without a device on the pins: with SPCR.DLB set the
-transmit serialiser feeds the receive serialiser, so a word written to DXR arrives in DRR a
-word's worth of serial clocks later. The clock is the sample rate generator's CLKG, dividing the
-CPU clock by CLKGDV + 1 with SRGR.CLKSM set, and SPCR.GRST holds the generator in reset until
-software releases it. The double buffering is the documented DXR→XSR and RSR→DRR pair, with
-XRDY, RRDY and RFULL following from it. The C6472 has three TSIPs instead, which are not modelled.
+The serialiser takes one step per CLKG cycle. CLKG divides the sample rate generator's input by
+CLKGDV + 1, and with SRGR.CLKSM set that input is CPU/6 on the C6455 (SPRU580G section 4.3,
+SPRS276M Table 2-1), so the ports count SYSCLK3 edges. Within a step the transmitter runs first
+and the receiver samples what it drove, which is how digital loopback (SPCR.DLB) and SPI master
+clock-stop mode work. Frame syncs come from the frame-sync generator (FPER, FWID, released by
+FRST) or from each DXR-to-XSR copy (FSXM = 1, FSGM = 0); a sync arriving more than the data delay
+before the frame in progress ends is ignored with FIG set and is a synchronisation error without
+it.
+
+| Path | Modelled behaviour |
+|---|---|
+| Frame | One or two phases, each with its own element count and 8-32-bit element length; 0-2 bit data delay; an element keeps the length it started with if RCR/XCR change under it |
+| Transmit | DXR→XSR copy on the first bit clock XSR is free (XRDY rises, XEVT; FSX too with FSGM = 0); with XMCM = 01b/11b only selected elements empty XSR and nothing is copied while none is selected (SPRU580G Figure 44); underflow resends the last word with XEMPTY low |
+| Receive | RSR→RBR→DRR on the clock after an element's last bit; a third word finding RBR full is lost, sets RFULL and stops the receiver until a frame sync after DRR is read |
+| Companding | G.711 mu-law/A-law on 8-bit elements, compressing on the copy to XSR and expanding to a left-justified 16-bit sample before RJUST; with both sections in reset DXR reaches DRR through the compander four CPU cycles later |
+| Bit order | COMPAND = 01b sends 8-bit elements, or 32-bit ones with WDREVRS, LSB first |
+| Multichannel | XMCM 0-3 and RMCM, in the 32-channel partition mode (PABLK/PBBLK) or the 128-channel enhanced mode; RCBLK and XCBLK report the subframe in progress, moving on at the boundary the subframe interrupt reports |
+| Interrupts | XINT/RINT on the ready flag, the end of a multichannel subframe, a frame sync (only out of reset, C6455 usage note 2.1.8) or a standing sync error; XEVT/REVT on XRDY/RRDY rising |
+
+Nothing is attached to the pins: an external clock or frame sync never arrives, so a section
+waiting for one waits, and DR and every general-purpose input in PCR read low. **[INFERENCE]** A DX
+left in high impedance reads low on the loopback path too, and the compander path in reset is
+taken only when one side compands. The C6472 has three TSIPs instead, which are not modelled.
 
 ## PLL controllers
 

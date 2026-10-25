@@ -1651,7 +1651,7 @@ impl Fabric {
         }
         if previous & ACTIVE_MCBSP != 0 {
             if self.shared.mcbsp.iter().any(Mcbsp::active) {
-                self.tick_mcbsp();
+                self.tick_mcbsp(sysclk3);
                 moved = true;
             }
             let mcbsp_active = self.shared.mcbsp.iter().any(Mcbsp::active);
@@ -2040,9 +2040,11 @@ impl Fabric {
         self.latch_i2c_interrupt();
     }
 
-    fn tick_mcbsp(&mut self) {
+    /// One CPU cycle of both ports; their sample rate generators count SYSCLK3 edges, the
+    /// CPU/6 clock SPRU580G section 4.3 gives the C6455's McBSPs.
+    fn tick_mcbsp(&mut self, sysclk3: bool) {
         for index in 0..self.shared.mcbsp.len() {
-            let events = self.shared.mcbsp[index].tick();
+            let events = self.shared.mcbsp[index].tick(sysclk3);
             let Some([receive, transmit]) = self.profile.events.mcbsp(index) else {
                 continue;
             };
