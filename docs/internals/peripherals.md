@@ -120,6 +120,13 @@ what the manual specifies for it: data written to ICDXR arrives in ICDRR after
 (prescaler + 1) × 8 DSP cycles by an internal path. The same register file is what the ROM's I2C
 EEPROM boot drives — see [Booting an image](../guide/booting.md).
 
+A transfer ends the two ways SPRU974A Table 15 gives. In non-repeat mode (RM = 0) the internal
+counter loaded from ICCNT at the START counts each word, and reaching zero sends a STOP if STP is
+set or raises ARDY if not. In repeat mode (RM = 1) ICCNT plays no part: words go on until software
+writes STP without STT, and then the word already on the bus completes and the STOP follows it, or
+goes out at once if the bus is idle (`I2c::stop`). TI's IBL driver reads an EEPROM exactly that way.
+A STOP sets SCD, clears BB, and drops MST and STP.
+
 ## HPI
 
 `src/hpi.rs` at `0288 0000h`, [SPRU969B](../reference/spru969b.pdf). Both sides are modelled. The

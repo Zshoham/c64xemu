@@ -73,6 +73,9 @@ Useful options, all from `tests/tools/tcp_peer.py`: `--port` and `--payload` for
 `--dsp-ip`/`--peer-ip` for the addressing, `--net-poll` to pass a different poll interval
 through to the emulator, and `--max-cycles`, `--timeout` and `--grace` for the run's limits.
 
+`tests/tools/ibl_peer.py` is another scripted peer on this socket: the BOOTP, ARP and TFTP server
+TI's IBL boots a program from - see [TI's IBL](booting.md#tis-ibl).
+
 For a *real* host network instead of a scripted peer, `tests/tools/tap_bridge.py --tap dsp0
 --socket /tmp/c64xemu.sock` relays between a TAP interface and the same socket; the emulator is
 then started with `--net-unix /tmp/c64xemu.sock --net-peer /tmp/tap.sock`.

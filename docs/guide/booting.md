@@ -246,6 +246,11 @@ branches there, so the program it boots must be linked to start at the base of D
 `tests/test_ibl.py` shows the link and the conversion. The image passed as `--image` names the
 device's byte order and the symbols; nothing in it is loaded.
 
+The peer prints one JSON report and exits 0 only when the whole boot worked: the TFTP transfer
+completed without an error and the program then halted at its exit with no fault. A program that
+merely leaves the right value in A4 when the cycle limit runs out does not count. The program's
+own console output is in the state file's `cio_output`.
+
 ```console
 $ python3 tests/tools/ibl_build.py le
 $ python3 tests/tools/ibl_peer.py --emulator target/release/c64xemu --image APP.out \

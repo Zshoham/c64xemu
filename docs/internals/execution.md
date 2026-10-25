@@ -66,6 +66,13 @@ narrowing a control-register write, setting SSR - and the trace events for each.
   for ILC and RILC - found by a scan with `swap_remove`.
 - **Saturation flags** land from the cycle after the saturating result, as one SSR mask.
 
+A doubleword access - `LDDW`, `LDNDW`, `STDW`, `STNDW`, 32-bit or compact - is two word accesses
+four bytes apart, and `doubleword_halves` alone decides which register of the pair each word
+belongs to: on little endian the word at the lower address is the even register's, on big endian
+the odd register's (SPRU732J LDDW). A store queues the two words with `schedule_doubleword_store`.
+`a_doubleword_puts_its_first_memory_word_in_the_even_register_only_on_little_endian` pins it with
+the manual's Example 2.
+
 An occupancy mask summarises which slots and queues hold anything, so a cycle with nothing due
 costs one mask test inlined into each caller of `commit_writes`, and only a cycle with work
 enters the out-of-line drain.
@@ -177,7 +184,8 @@ handler knows the loop cannot be resumed. See [Interrupts and exceptions](interr
 `Control` holds AMR, CSR (split into `csr_misc`, the endianness bit and a separate `sat` flag,
 because CSR.SAT is set only by a saturating functional unit and cleared only by MVC), the
 interrupt and exception registers, TSC as a pair with a latched high half, ILC and RILC, REP,
-SSR, the Galois state (GPLYA, GPLYB, GFPGFR, which resets to `0x0700_001d`), and DNUM.
+SSR, the Galois state (GPLYA, GPLYB, GFPGFR, which resets to `0x0700_001d`), and DNUM. CSR.EN
+(bit 8) reads 0 on a big-endian device and 1 on a little-endian one (SPRU732J Table 2-9).
 
 Two encodings name one register on read and another on write: `0x02` reads IFR and writes ISR,
 `0x1d` reads EFR and writes ECR (SPRU732J Table 3-22). `register_name` and

@@ -544,7 +544,11 @@ data, control-register CSR.EN, IDMA and EMAC descriptors. Header-based fetch pac
 logical compact-slot order even though the two halfwords exchange physical byte addresses.
 `cpu:big-endian-load-and-fetch` checks raw data and CSR.EN; `big_endian` executes the same
 hand-derived sum at `-O0` and `-O2`, including compact branch-heavy code; `big_endian_rts`
-runs `_c_int00`, auto-initialisation and target-endian CIO `printf`.
+runs `_c_int00`, auto-initialisation and target-endian CIO `printf`. Booting TI's IBL later found
+two defects all three had passed: CSR.EN read with its polarity inverted (SPRU732J Table 2-9 has
+0 for big endian), which the vector had pinned, and doubleword accesses pairing their words the
+little-endian way, which pushes and pops cannot see because they round-trip either way. See
+*Boot TI's IBL on the C6472*.
 
 **[x] Control register file.** *Complete for C64x+.* DIER implements its WSEL-protected
 NMI/EXCEP/INT mask, TSCL write-enables the counter, a TSCL read latches the coherent high word
@@ -1075,6 +1079,12 @@ ends the transfer the same way in each. `memory:i2c-slave-acknowledges-a-master-
 pin the three outcomes, the last of them showing that an address no device answers still NACKs
 and clocks nothing in, in both directions, until ICSAR names the device that is there.
 
+Repeat mode (RM = 1) ends differently, and until TI's IBL drove the module it did not end at
+all: ICCNT plays no part, and SPRU974A Table 15 makes writing STP without STT a STOP. The model
+only stopped when a non-repeat counter ran out. Now the word on the bus completes and the STOP
+follows, or goes out at once on an idle bus; `stp_ends_a_repeat_mode_read_after_the_byte_on_the_
+bus` pins it with an EEPROM read done the IBL driver's way.
+
 **[~] McBSP.** *Both ports done, in digital loopback.* The register file and its bit layouts come
 from the CSL register appendix (SPRU401J Tables B-210 to B-224) and the addresses from SPRS276M
 Tables 7-57 and 7-58, so each port answers on its configuration bus and DRR and DXR answer again
@@ -1395,9 +1405,13 @@ consumed as fragments that split any record. Two deliberate departures, both for
 model: the ring and its buffers live at the top of core 0's L2 through its global alias rather than
 in local L1D, which SPRS612G Table 2-2 marks "DATA SPACE ON DMA" and no DMA master here can reach,
 and the station address comes from a fused MAC ID this emulator's `--mac-id` writes because no real
-fuse value is public. Sections reach registers because a boot table's copy is word-wide wherever
-it is aligned, so the table itself writes DSP_BOOT_ADDRn and BOOT_COMPLETE_STAT and thereby starts
-the other cores, exactly as section 4.3.3 says it may. `romboot::an_ethernet_boot_places_both_cores
+fuse value is public. How the six bytes split across MACID0 and MACID1 is not in SPRS612G; it
+follows TI's own reader in the IBL (`c6472.c::deviceLoadDefaultEthAddress`, bytes 4 and 5 in MACID1
+bits 31:16), and MACADDRHI/LO hold the address in SPRU975E Tables 71 and 72's order, first wire
+octet in MACADDRHI bits 7:0 - both corrected when the IBL booted. Sections reach registers
+because a boot table's copy is word-wide wherever it is aligned, so the table itself writes
+DSP_BOOT_ADDRn and BOOT_COMPLETE_STAT and thereby starts the other cores, exactly as section 4.3.3
+says it may. `romboot::an_ethernet_boot_places_both_cores
 _images_and_starts_them` drives the whole boot at the device level, and `tests/test_netboot.py`
 drives it from the command line through a Unix-socket Ethernet backend with `tests/tools/emac_boot
 .py` as the host: an ELF turned into a table addressed to each core's global alias, six cores
@@ -1549,14 +1563,15 @@ that stage drives the I2C module from firmware to read its map, its configuratio
 second stage; the second stage sets PLL1 to x28 and the DDR2 controller from TI's EVM values,
 broadcasts a BOOTP request from the fused MAC address, resolves the server by ARP and reads a
 binary blob into DDR2 by TFTP, then branches to 0xE0000000 - where a compiled `sum_loop`, or
-`big_endian` on the big-endian board, returns 55. `tests/tools/ibl_peer.py` is the network: a
-BOOTP, ARP and TFTP server with the EVM configuration's own addresses over the Unix-socket
-frame transport. `tests/test_ibl_peer.py` drives that server over Unix datagrams through TFTP's
+`big_endian` on the big-endian board, must halt at its exit with 55, not merely leave 55 in A4.
+`tests/tools/ibl_peer.py` is the network: a BOOTP, ARP and TFTP server with the EVM
+configuration's own addresses over the Unix-socket frame transport, whose exit status is the whole
+boot's. `tests/test_ibl_peer.py` drives that server over Unix datagrams through TFTP's
 16-bit block rollover: an empty final block zero, payload continuing through two wraps, stale
 ACK rejection and retransmission with a controlled clock. Each boot is about half a billion
-cycles and thirty seconds of wall time. The feasibility worry was the device model; PLL, DDR2,
-PSC, timer and EMAC needed nothing. What
-stood in the way, in order:
+cycles and thirty seconds of wall time. The feasibility worry was the device model; the PLL,
+DDR2, PSC and timer models needed nothing, and the EMAC only its address registers turned round.
+What stood in the way, in order:
 
 - *The I2C module never sent a repeat-mode STOP.* TI's driver reads in repeat mode (RM = 1)
   and ends the read by writing STP alone, which SPRU974A Table 15 makes a STOP. The model only

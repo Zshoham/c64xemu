@@ -39,7 +39,8 @@ Everything the build and the test suites need beyond the checked-in corpus is fe
 build on demand: `tests/conftest.py` provisions `tests/build/` with
 `tests/tools/fetch_deps.sh` (XDCtools, NDK, SYS/BIOS and the C6000 code generation tools, TI's
 DSPLIB for C64x+, the tic6x vectors from a binutils release, and TI's IBL source, whose boot
-EEPROM tools `tests/tools/ibl_tools.py` builds with `bison` and `flex`) and builds the firmware images
+EEPROM tools `tests/tools/ibl_tools.py` builds with `bison` and `flex` and which
+`tests/tools/ibl_build.py` builds into the IBL itself) and builds the firmware images
 (and the EABI NDK libraries) before the suites that need them run. A fresh checkout plus
 `python3 -m pytest` builds everything; nothing toolchain-sized or third-party is versioned.
 
@@ -207,7 +208,10 @@ by block into memory before core 0 is branched to the entry point, or a boot con
 applied before the next parameter block. A C6472 parameter block can instead name UTOPIA, and
 the boot hands over to the UTOPIA boot with that block's single-/multi-PHY, bus width,
 port-initialisation, cell size and core frequency fields. `tests/tools/i2c_eeprom.py` builds a
-C6472 EEPROM from an ELF.
+C6472 EEPROM from an ELF. The EEPROM can also be the one TI's C6472 EVM shipped with: TI's IBL,
+built from TI's source by `tests/tools/ibl_build.py`, whose first stage the ROM loads and which
+then reads the rest of itself through its own I2C driver, sets up PLL1 and DDR2, and boots a
+program over BOOTP and TFTP that `tests/tools/ibl_peer.py` serves.
 
 **Six cores on one device.** `--device c6472` is a TMS320C6472: six C64x+ megamodules, each with
 its own 32 KB L1P, 32 KB L1D and 608 KB L2 SRAM, its own interrupt controller, memory protection
@@ -354,7 +358,10 @@ The suite has six kinds of case:
   assert the bytes that came back and the lines the firmware printed rather than any cycle
   count; the bandwidth cases additionally require the whole exchange to complete at the
   configured rate, which is the emulator's wall-clock ceiling measured honestly - the rates
-  above 256 kbps fail until the model gets faster.
+  above 256 kbps fail until the model gets faster. One more boots TI's own IBL from its EEPROM
+  image in each byte order and serves it a program over BOOTP and TFTP, which must halt with the
+  expected value; running that firmware found four model defects, three of them ones the
+  suite's own fixtures had agreed with (see the roadmap).
 - **Programs** - 85 programs compiled with TI's toolchain at up to five optimisation
   levels, from `sum_loop` to the DSPLIB FFTs, five Ethernet firmwares and two that boot from a
   ROM table built by the toolchain's own hex conversion utility. Each is checked for building,
