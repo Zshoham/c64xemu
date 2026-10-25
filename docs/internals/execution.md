@@ -12,22 +12,27 @@ reached into, so each of them had to know what "loading and not yet reloading" m
 ## The shape of one cycle
 
 `Cpu::step` is the whole cycle, and it is a sequence of early exits before the ordinary path.
+Every exit that consumes a cycle, including SPLOOP replay, calls `Cpu::cycle_boundary` with a
+`CycleEnd`: `Frozen`, `Committed`, or `LoopStage(offset)`. The boundary alone orders write-back,
+optional SPLOOP stage completion, device tick, interrupt sampling and entry, and pipeline-cycle
+advancement. Stopped or faulted cores return without consuming a cycle.
 
 | Order | Condition | What the cycle does |
 |---|---|---|
 | 1 | `fault.is_some()` | nothing; the core is stopped |
-| 2 | `pending_stalls != 0` | consume one stall, count `stall_memory`, `freeze` |
-| 3 | `idling` | count `idle_cycles`, commit writes, run the cycle boundary; entering a service routine ends the idle |
-| 4 | `interrupt_stall != 0` | consume one, count `stall_interrupt`, commit writes — the pipeline drains *into* the interrupt, so writes already in flight complete before the handler runs |
+| 2 | `pending_stalls != 0` | consume one stall, count `stall_memory`, run the frozen cycle boundary |
+| 3 | `idling` | count `idle_cycles`, run the committed cycle boundary; entering a service routine ends the idle |
+| 4 | `interrupt_stall != 0` | consume one, count `stall_interrupt`, run the committed cycle boundary — the pipeline drains *into* the interrupt, so writes already in flight complete before the handler runs |
 | 5 | `stall_cycles != 0` | a multicycle NOP; inside an active loop it still replays the buffer, because a NOP only idles the program-memory side |
 | 6 | `stops_at(pc)` | halt cleanly at a fetch boundary so the caller observes `halted()` |
 | 7 | `sploop.replaying_alone()` | a reloaded nested loop replays while the outer loop keeps issuing |
-| 8 | otherwise | fetch, issue, execute, charge stalls, commit, finish |
+| 8 | otherwise | fetch, issue, execute, charge stalls, run the committed cycle boundary with a SPLOOP stage offset if applicable |
 
 Note the difference between `pending_stalls` and `stall_cycles`. A stall freezes the whole
-pipeline: `freeze` advances `stalls` rather than `cycle`, drops the record of the previous
-cycle's writes, and ticks the device so the peripherals still advance. A multicycle NOP does not
-freeze anything — write-backs scheduled by earlier packets still land.
+pipeline: the frozen cycle boundary advances `stalls` rather than `cycle`, drops the record of
+the previous cycle's writes, and ticks the device so the peripherals still advance. A
+cross-path stall uses the same frozen path. A multicycle NOP does not freeze anything —
+write-backs scheduled by earlier packets still land.
 
 `cycles()` is `cycle + stalls`, which is the wall-clock time base everything timing-related uses.
 
@@ -48,8 +53,9 @@ executor consults the same value the display and the packet validator do, so the
 ## Delay slots and the write-back queue
 
 Results are not written when an instruction executes. They are scheduled into the write-back
-queue (`WritebackQueue`, `src/writeback.rs`), and `commit_writes` performs the ones due this
-cycle. The queue owns every delayed effect and the order they come back in; the CPU keeps the
+queue (`WritebackQueue`, `src/writeback.rs`), and the committed cycle boundary performs the
+ones due this cycle through its private `commit_writes` helper. The queue owns every delayed
+effect and the order they come back in; the CPU keeps the
 architectural actions - writing the register, checking a store against memory protection,
 narrowing a control-register write, setting SSR - and the trace events for each.
 
@@ -74,28 +80,29 @@ the odd register's (SPRU732J LDDW). A store queues the two words with `schedule_
 the manual's Example 2.
 
 An occupancy mask summarises which slots and queues hold anything, so a cycle with nothing due
-costs one mask test inlined into each caller of `commit_writes`, and only a cycle with work
-enters the out-of-line drain.
+costs one mask test in the committed cycle boundary's `commit_writes` helper, and only a
+cycle with work enters the out-of-line drain.
 
 The commit order - register writes, then stores, then control writes, then saturations, and
 within each the order above - is observable in the trace and in same-address stores, and it is
 the order the CPU committed in when these were four vectors scanned with `swap_remove`.
 `the_queue_commits_in_exactly_the_order_of_the_original_scans` pins it against a model of those
-scans. Every cycle ends with a write-back, a packet rejected by validation included: the packet
-is annulled, but what earlier packets have in flight completes as the pipeline drains into the
-exception (SPRU732J 6.3), so nothing ever waits past its due cycle.
+scans. Every committed cycle ends with a write-back, a packet rejected by validation included:
+the packet is annulled, but what earlier packets have in flight completes as the pipeline drains
+into the exception (SPRU732J 6.3), so nothing ever waits past its due cycle.
 
 This is what makes delay slots observable in the right way: an instruction with a delay slot is
 one whose write is scheduled further out, and any read in an intervening cycle sees the *old*
 value because nothing has landed yet. Nothing has to model "in flight" separately.
 
 `previous_writes` is a two-element bitmask of the registers written in the previous cycle, per
-bank. It exists for the cross-path stall rule below, and `freeze` clears it because after a stall
-the hazard it describes is two cycles old.
+bank. It exists for the cross-path stall rule below, and the frozen cycle boundary clears it
+because after a stall the hazard it describes is two cycles old.
 
-Branches are held in `branches` as (due cycle, target) pairs and resolved in `end_cycle`, at the
-*end* of the cycle before they take effect — which is why `pc` between cycles always names the
-next packet to fetch. When a branch fires it also ends an active loop buffer, because a taken
+Branches are held in `branches` as (due cycle, target) pairs and resolved by the committed cycle
+boundary's private `end_cycle` helper, at the *end* of the cycle before they take effect — which
+is why `pc` between cycles always names the next packet to fetch. When a branch fires it also
+ends an active loop buffer, because a taken
 branch makes the buffer idle once its last delay slot has passed ([SPRU732J](../reference/spru732j.pdf)
 §7.9); a nested loop is exempt, since the branch closing an outer body only redirects the frozen
 fetch stream.

@@ -14,13 +14,16 @@ single-core TMS320C6455 and the six-core TMS320C6472.
 
 Cycle-stepped means the unit of progress is one CPU cycle, not one instruction and not one
 basic block. `Cpu::step` in `src/cpu.rs` is that unit: it fetches an execute packet, issues it,
-schedules the register writes into the write-back queue, and ends the cycle. A cycle the
-pipeline cannot use is still a cycle - `Cpu::step` returns early through `freeze` for a memory
-stall, or through `commit_writes` and `finish_cycle` for a multicycle NOP, an interrupt
-pipe-down or `IDLE`. Every one of those paths calls `Cpu::tick_device`, which is what keeps the
-peripherals on the same time base as the pipeline: exactly one device tick per step of the core,
-stalls included. `Cpu::cycles()` reports `cycle + stalls`, so it counts steps, and the
-`device_ticks` counter a core asks the fabric with counts the same steps.
+schedules the register writes into the write-back queue, and ends the cycle. Every elapsed
+cycle in `Cpu::step` and SPLOOP replay ends through `Cpu::cycle_boundary`, which owns the
+ordering: commit writes, complete the SPLOOP stage if any, then tick the device, sample
+interrupts, handle interrupt entry, and advance the pipeline cycle. A frozen memory or
+cross-path stall instead only counts a stall, clears the previous-write hazard record, and
+ticks the device; the pipeline must not advance. A multicycle NOP, interrupt pipe-down or
+`IDLE` uses the committed path. Both paths call `Cpu::tick_device` exactly once, keeping the
+peripherals on the same time base as the pipeline, stalls included. `Cpu::cycles()` reports
+`cycle + stalls`, so it counts steps, and the `device_ticks` counter a core asks the fabric
+with counts the same steps.
 
 What a cycle does *inside* itself - delay slots as the write-back queue, packet validity, branch
 resolution, the SPLOOP buffer - belongs to [Execution and timing](execution.md).
@@ -99,8 +102,8 @@ one, and let out of reset), and cores whose NMI pin the chip-level registers dro
 
 - The first ask of a cycle is the one that runs. A later ask with `cycle <= ticked_cycle`
   returns the answer the first ask produced.
-- Each core asks once per step of its own, from `Cpu::finish_cycle` or `Cpu::freeze`, with its
-  own `device_ticks` counter. A core that stalls therefore drifts behind the others and simply
+- Each core asks once per step of its own, through `Cpu::cycle_boundary`, with its own
+  `device_ticks` counter. A core that stalls therefore drifts behind the others and simply
   skips its ask until it catches up, so the peripherals advance at the rate of the fastest core
   rather than six times per cycle.
 - `SYSCLK3_DIVIDER` is 6: one tick in six is a SYSCLK3 edge, and every edge is a full tick.
@@ -112,9 +115,10 @@ one, and let out of reset), and cores whose NMI pin the chip-level registers dro
   can arm it.
 - A tick that is neither a SYSCLK3 edge nor dirty returns `true`, the *short* tick: nothing
   cycle-driven moved, and the asking core reads the interrupt lines the last full tick
-  selected rather than fresh ones. `Cpu::finish_cycle` passes that flag straight into
-  `CoreBus::take_interrupt_state`. A dormant device answers "nothing asserted" for millions of
-  cycles, which is what the short path exists for.
+  selected rather than fresh ones. The committed path of `Cpu::cycle_boundary` passes that
+  flag straight into `CoreBus::take_interrupt_state` through its private `finish_cycle`
+  helper. A dormant device answers "nothing asserted" for millions of cycles, which is what
+  the short path exists for.
 
 The SYSCLK3 schedule exists because on almost every edge those four blocks only count: a timer
 towards its period, a prescaler towards its match, a pulse towards its end, a clock-detect

@@ -176,6 +176,14 @@ enum BranchTarget {
     Address(u32),
 }
 
+/// How a cycle ended, which is all the cycle boundary needs to know to close it.
+#[derive(Clone, Copy)]
+enum CycleEnd {
+    Frozen,
+    Committed,
+    LoopStage(u32),
+}
+
 /// The execution counters without the histogram, so a snapshot can carry them by value.
 ///
 /// The per-address histogram behind `Stats::pc_histogram` grows with the program and is asked
@@ -878,20 +886,19 @@ impl Cpu {
                 self.trace
                     .emit(self.cycle, Event::Stall { reason: "memory" });
             }
-            self.freeze(bus);
+            self.cycle_boundary(bus, CycleEnd::Frozen);
             return;
         }
-        // IDLE holds the CPU here; `finish_cycle` takes any pending interrupt, and entering
-        // the service routine ends the idle.
+        // IDLE holds the CPU here; the cycle boundary takes any pending interrupt, and
+        // entering the service routine ends the idle.
         if self.idling {
             self.stats.idle_cycles += 1;
-            self.commit_writes(bus);
-            self.finish_cycle(bus);
+            self.cycle_boundary(bus, CycleEnd::Committed);
             // Entering a service routine ends the idle (`Cpu::enter`).
             return;
         }
-        // Pending branches are resolved at the end of the previous cycle (see
-        // `finish_cycle`), so `pc` between cycles always names the next packet to fetch.
+        // Pending branches are resolved at the previous cycle boundary, so `pc` between
+        // cycles always names the next packet to fetch.
         if self.interrupt_stall != 0 {
             self.interrupt_stall -= 1;
             self.stats.stall_interrupt += 1;
@@ -905,8 +912,7 @@ impl Cpu {
             }
             // The pipeline drains into the interrupt: every register write already in flight
             // completes before the service routine runs (SPRUFE8B 5.2.2 and 7.13.4 step 7).
-            self.commit_writes(bus);
-            self.finish_cycle(bus);
+            self.cycle_boundary(bus, CycleEnd::Committed);
             return;
         }
 
@@ -922,8 +928,7 @@ impl Cpu {
                 self.execute_sploop_replay(bus);
                 return;
             }
-            self.commit_writes(bus);
-            self.finish_cycle(bus);
+            self.cycle_boundary(bus, CycleEnd::Committed);
             return;
         }
         // Halt requested at this fetch boundary: leave the pipeline clean so a caller
@@ -981,7 +986,7 @@ impl Cpu {
         if !self.sploop.active() && self.cross_path_stall(&packet[..length]) {
             self.pc = packet_start;
             self.stats.stall_memory += 1;
-            self.freeze(bus);
+            self.cycle_boundary(bus, CycleEnd::Frozen);
             return;
         }
         // The packet is now certain to issue: a cross path stall re-fetches it next cycle and
@@ -1037,8 +1042,7 @@ impl Cpu {
                 // The packet is annulled, but what earlier packets have in flight completes as
                 // the pipeline drains into the exception (SPRU732J 6.3).
                 self.raise_fault(error, cause);
-                self.commit_writes(bus);
-                self.finish_cycle(bus);
+                self.cycle_boundary(bus, CycleEnd::Committed);
                 return;
             }
             if replay_packets.is_empty() {
@@ -1118,11 +1122,10 @@ impl Cpu {
         }
         self.pending_stalls += self.miss_stalls(bus);
         self.pending_stalls += program_fetch_stalls;
-        self.commit_writes(bus);
-        if let Some(offset) = loop_offset {
-            self.complete_loop_cycle(offset);
-        }
-        self.finish_cycle(bus);
+        self.cycle_boundary(
+            bus,
+            loop_offset.map_or(CycleEnd::Committed, CycleEnd::LoopStage),
+        );
     }
 
     /// The conditions in SPRUFE8B 7.13.1 for a loop to start draining because an interrupt is
@@ -1246,8 +1249,7 @@ impl Cpu {
         if let Err((error, cause)) = validate_packets(replay_packets.packets()) {
             // As for a program packet: the replay is annulled, the writes in flight land.
             self.raise_fault(error, cause);
-            self.commit_writes(bus);
-            self.finish_cycle(bus);
+            self.cycle_boundary(bus, CycleEnd::Committed);
             return;
         }
         if !replay_packets.is_empty() {
@@ -1275,9 +1277,7 @@ impl Cpu {
             self.execute_fetched(bus, replay);
         }
         self.return_replay_packets(replay_packets);
-        self.commit_writes(bus);
-        self.complete_loop_cycle(offset);
-        self.finish_cycle(bus);
+        self.cycle_boundary(bus, CycleEnd::LoopStage(offset));
     }
 
     /// Stage-boundary bookkeeping, evaluated before the cycle's packets execute so that the
@@ -4403,6 +4403,22 @@ impl Cpu {
         }
     }
 
+    /// End a committed cycle by committing writes, completing its SPLOOP stage if any, then
+    /// ticking the device, sampling interrupts, handling interrupt entry, and advancing the
+    /// pipeline cycle. A frozen stall only ticks the device and counts a stall: writes and
+    /// SPLOOP must not advance while the pipeline is frozen.
+    fn cycle_boundary(&mut self, bus: &mut CoreBus<'_>, end: CycleEnd) {
+        if matches!(end, CycleEnd::Frozen) {
+            self.freeze(bus);
+            return;
+        }
+        self.commit_writes(bus);
+        if let CycleEnd::LoopStage(offset) = end {
+            self.complete_loop_cycle(offset);
+        }
+        self.finish_cycle(bus);
+    }
+
     fn finish_cycle(&mut self, bus: &mut CoreBus<'_>) {
         let short_tick = self.tick_device(bus);
         // The interrupt lines and the exception combiner's output are one question about the
@@ -4489,8 +4505,8 @@ impl Cpu {
         }
     }
 
-    /// The cycle boundary itself: the branch that comes due, the mode change that lands, and
-    /// the loop buffer's own bookkeeping.
+    /// Advance the pipeline cycle, resolve branches and mode changes that come due, and
+    /// update the loop buffer's bookkeeping.
     fn end_cycle(&mut self) {
         self.cycle += 1;
         // A loop cycle reaches here with no branch in flight most of the time, and both the
