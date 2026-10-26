@@ -109,8 +109,10 @@ fetch stream.
 
 ## Stalls, and where each number comes from
 
-Every cost below is derived from a documented rule and pinned by a test in `src/cpu.rs` that
-names the rule. None was fitted to a measurement.
+Every cost below is derived from a documented rule and pinned by a test that names the rule: the
+L1D and L1P rows in `src/memory.rs`, where they are driven through the hierarchy with no
+instruction stream, and the cross-path, PROT and interrupt rows in `src/cpu.rs`. None was fitted
+to a measurement.
 
 | Stall | Cost | Rule |
 |---|---|---|
@@ -147,6 +149,16 @@ SPRU871K §3.5.3, including the two conditions that are about *which pair* of wr
 rather than the address: a write only merges into the immediately preceding entry, and an entry
 the L2 cache may hold never merges at all. A fifth write when four are busy stalls until the
 oldest completes.
+
+Those rows are the L1D's and the fetch path's, not the CPU's: the L1D bank conflict, the write
+buffer, the read-miss costs and the L1P fill occupancy are all `MemoryHierarchy`'s
+([Memory and caches](memory-and-caches.md#what-a-miss-costs)). The CPU tells it each load and
+store (`note_load`, `note_store`), asks `data_stalls` once a packet has executed and
+`fetch_stalls` once it is fetched, and adds what comes back to `pending_stalls`. It also passes
+the two clocks the rules need, because it owns them: the execute cycle, which stalls do not
+advance, and the wall clock, which they do, together with the stall cycles already queued (a
+bank conflict's cycle is absorbed by one of those). What stays in the CPU is what the pipeline
+and the register file own: the cross-path stall and the PROT NOP cycles.
 
 ## The SPLOOP buffer
 

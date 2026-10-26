@@ -237,11 +237,12 @@ same line it would have before the frozen hits. L2 has no freeze register in thi
 
 L1D is read-allocate: `write_data_bytes` never fills, and a store that misses a cacheable
 address goes into the write buffer instead. The buffer is four 128-bit entries between L1D and
-L2, held on the CPU in `src/cpu.rs` as `write_buffer`, because what it costs is cycles rather
-than bytes — the bytes have already been written through.
+L2, held by the megamodule's `MemoryHierarchy` (`L1dTiming::write_buffer` in `src/memory.rs`),
+because what it costs is cycles rather than bytes — the bytes have already been written through.
 
-`buffer_write` is the store side. An entry is the store's quad-word, `address & !15`; drained
-entries are swept first, then the merge rule, then the queue:
+`note_store` is the store side, and answers the stall cycles a full buffer costs on the spot. An
+entry is the store's quad-word, `address & !15`; drained entries are swept first, then the merge
+rule, then the queue:
 
 - Two writes merge only into the *immediately preceding* entry, and only when the line is L2 SRAM
   rather than an address the L2 cache may hold — two of the six conditions in SPRU871K section
@@ -252,11 +253,17 @@ entries are swept first, then the merge rule, then the queue:
   cache (`timing:write-buffer-drains-at-two-cycles-an-entry`,
   `timing:write-buffer-drains-at-six-cycles-an-entry-into-l2-cache`).
 
-`drain_write_buffer` is the read side: a read miss waits for the buffer to drain completely
+The read side is `data_stalls`: a read miss waits for the buffer to drain completely
 before its own line fill starts (`timing:read-miss-waits-for-the-write-buffer`). Two of section
 3.5.3's remaining conditions are deliberately unmodelled. "The first write has not yet been
 presented to the L2 controller" is the drained-entry sweep; "both writes have the same privilege
 level" is not distinguished, because this model carries no privilege level per buffered write.
+
+The rules are pinned at the hierarchy seam in `src/memory.rs` as well: merging only into the
+immediately preceding SRAM quad-word is not observable in a program (merging changes the queue's
+depth, and depth only changes a cycle count when the drain is slower than the fill, which is
+exactly when merging is forbidden), but a test that looks at how long a read miss then waits
+sees it.
 
 ## Coherence
 
@@ -390,12 +397,21 @@ access's cost changes with them.
 
 Every number here is SPRU862B's for **this device's** L2 — 2048 KB at 0080 0000h, 2-cycle
 latency, 4 × 128-bit banks (SPRS276M section 4), which is the tables' 1-wait-state column.
+The CPU owns none of this arithmetic. `MemoryHierarchy` holds the L1D's timing state beside the
+caches it times, and the CPU's whole part is to say what it accessed and when: `note_load` and
+`note_store` for each data access, `data_stalls` once the cycle's packets have executed, and
+`fetch_stalls` for the program fetch. The clocks are the CPU's and cross the seam as a
+`DataClock` — the execute cycle, which stall cycles do not advance and which "the cycle right
+after another miss" is counted in, and the wall clock, which they do and which the write buffer
+drains on — so the hierarchy never reaches back into the CPU. The stall cycles come back as
+numbers and the CPU adds them to `pending_stalls`.
+
 `MemoryHierarchy::access_timing` answers all three facts one data access tells the timing model
 at once — resident, read-miss, and whether the fill's line comes from the L2 cache — for the
 address the access issued, so the write buffer's merge rule and the miss cost cannot disagree
 about the same line. Only the SRAM the L1D configuration has left answers as resident in one
-cycle; the rest of the window is the cache itself. `Cpu::miss_stalls` collects the distinct
-64-byte lines this cycle missed on and charges, from SPRU862B Table 3-2:
+cycle; the rest of the window is the cache itself. `data_stalls` collects the distinct 64-byte
+lines this cycle missed on and charges, from SPRU862B Table 3-2:
 
 | | out of L2 SRAM | out of the L2 cache |
 |---|---|---|
@@ -405,32 +421,36 @@ cycle; the rest of the window is the cache itself. `Cpu::miss_stalls` collects t
 
 The half cycle is real: the access lands on one of the two phases of the CPU/2 L2 clock, only the
 average is documented, so it is spent as an alternation over successive full-price misses
-(`l1d_miss_phase`). Reading the phase off the issue cycle's parity instead ties it to a loop's
-period, and made SPRU862B §3.4.7's worked totals come out 64 and 32 cycles high. Table 3-2's
-fourth row is what makes the pipelined discount conditional — M consecutive *parallel* misses
+(`L1dTiming::miss_phase`). Reading the phase off the issue cycle's parity instead ties it to a
+loop's period, and made SPRU862B §3.4.7's worked totals come out 64 and 32 cycles high. Table
+3-2's fourth row is what makes the pipelined discount conditional — M consecutive *parallel* misses
 cost 12.5 + 4(M−1), four for every miss after the first rather than 3 plus 4 per cycle — so the
 discount holds only while misses arrive one per cycle. A victim buffer flush on the previous miss
-"disrupts miss pipelining" (Table 3-2), which `take_l1d_victim_flush` reports and `miss_stalls`
-honours by refusing the discount; the up-to-ten extra stalls the same row mentions are not
-modelled, because the disruption needs no number and they do. A line the L2 cache misses comes
-from external memory, whose latency neither table quantifies, and is charged as an L2 cache line
-rather than given an invented number.
+"disrupts miss pipelining" (Table 3-2), which `MemoryHierarchy` records when a fill evicts a
+dirty line and `data_stalls` honours by refusing the discount; the up-to-ten extra stalls the
+same row mentions are not modelled, because the disruption needs no number and they do. A line
+the L2 cache misses comes from external memory, whose latency neither table quantifies, and is
+charged as an L2 cache line rather than given an invented number.
 
-The costs are pinned as executed cycles: `timing:l1d-single-read-miss` is 13 or 14,
-`timing:l1d-single-read-miss-out-of-l2-cache` 15 or 16, `timing:l1d-consecutive-read-misses` 25
-or 26, `timing:l1d-parallel-read-misses` 17 or 18. Two of SPRU862B §3.4.7's worked examples are
-reproduced exactly: `cpu::tests::the_manuals_dotprod_read_miss_total` gets the manual's 1600
-stall cycles from 128 misses, and `the_manuals_vecaddc_read_miss_and_write_buffer_total` gets
-both 800 for the read misses alone and Table 3-4's "12.5 + ((12.5 + 1) × 63) = 863" with the
-write buffer in the picture. `AccessTiming::resident` also feeds the L1D bank conflict check,
-which belongs to [Execution and timing](execution.md).
+The costs are pinned two ways. At the seam, the tests in `src/memory.rs` drive `note_load`,
+`note_store` and `data_stalls` with no instruction stream and assert each number in the table,
+the alternation, pipelining across stall cycles, the dirty-eviction disruption, the write-buffer
+rules above and the bank conflict. As executed cycles: `timing:l1d-single-read-miss` is 13 or
+14, `timing:l1d-single-read-miss-out-of-l2-cache` 15 or 16, `timing:l1d-consecutive-read-misses`
+25 or 26, `timing:l1d-parallel-read-misses` 17 or 18. Two of SPRU862B §3.4.7's worked examples
+are reproduced exactly through the CPU: `cpu::tests::the_manuals_dotprod_read_miss_total` gets
+the manual's 1600 stall cycles from 128 misses, and
+`the_manuals_vecaddc_read_miss_and_write_buffer_total` gets both 800 for the read misses alone
+and Table 3-4's "12.5 + ((12.5 + 1) × 63) = 863" with the write buffer in the picture.
 
 ### The line-occupancy argument
 
-L1P is priced differently, because the fetch path pipelines. `drain_l1p_fills` reports the fills
-that happened rather than answering a residency question before the fetch — a C64x+ execute
-packet may span two fetch packets, so one packet's fetch can fill two lines — and
-`Cpu::program_fetch_stalls` charges each.
+L1P is priced differently, because the fetch path pipelines. The hierarchy records the fills that
+happened rather than answering a residency question before the fetch — a C64x+ execute packet
+may span two fetch packets, so one packet's fetch can fill two lines — and
+`MemoryHierarchy::fetch_stalls(now)` charges each exactly once, keeping the fetch path's
+occupancy (`FetchTiming`) alongside the caches. It is the same kind of megamodule hardware as
+the L1D rules above, so it lives in the same place; the CPU supplies only the clock.
 
 SPRU862B Table 1-3 gives the average stalls per execute packet for a straight-line miss stream at
 each packet width, over two L2 configurations: thirty-two numbers. One occupancy per line explains

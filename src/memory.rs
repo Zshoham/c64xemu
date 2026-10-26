@@ -123,32 +123,245 @@ fn sram_remaining(window: u32, cache: usize) -> u32 {
 
 /// What one data access tells the timing model.
 ///
-/// The three facts travel together because the CPU charges them together: whether L1D serves the
-/// access without a fill, whether a read of it would need one, and where the line the fill would
-/// bring in comes from. Asking them apart let two consumers probe the cache at two points in the
-/// cycle for the same line - the write buffer at the store, the miss cost at the end of the cycle
-/// - and a correction to what counts as L2-served had to be made in both places.
+/// The three facts travel together because the timing rules charge them together: whether L1D
+/// serves the access without a fill, whether a read of it would need one, and where the line the
+/// fill would bring in comes from. Asking them apart let two consumers probe the cache at two
+/// points in the cycle for the same line - the write buffer at the store, the miss cost at the
+/// end of the cycle - and a correction to what counts as L2-served had to be made in both places.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct AccessTiming {
+struct AccessTiming {
     /// Serviced by L1D without a line fill, which is what a bank conflict needs.
-    pub(crate) resident: bool,
+    resident: bool,
     /// A read of this address needs an L1D line fill. Writes never allocate: L1D is
     /// read-allocate and a write miss goes to the write buffer instead.
-    pub(crate) read_miss: bool,
+    read_miss: bool,
     /// When a fill is needed, whether its line comes out of the L2 cache rather than L2 SRAM,
     /// which SPRU862B Tables 1-3 and 3-2 both cost separately and which SPRU871K section 3.5.3
     /// also makes the write buffer's merge rule turn on. A line the L2 cache misses comes from
     /// external memory, whose latency neither table quantifies; it is charged as an L2 cache line
     /// rather than given an invented number. False when no fill is needed: an access that costs
     /// no line has no source, and both consumers only ask having seen `read_miss`.
-    pub(crate) from_l2_cache: bool,
+    from_l2_cache: bool,
 }
 
-/// One L1P line fill and where it came from, reported to the fetch path's stall accounting.
+/// One L1P line fill and where it came from, held until the fetch path's stall accounting
+/// charges it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct LineFill {
-    pub(crate) line: u32,
-    pub(crate) from_l2_cache: bool,
+struct LineFill {
+    line: u32,
+    from_l2_cache: bool,
+}
+
+/// The clocks a data access is timed against, which the CPU owns and tells the hierarchy
+/// because they are the pipeline's, not the memory system's.
+///
+/// There are two, and they differ by the stall cycles. `cycle` counts execute cycles: a stall
+/// freezes the pipeline, so a read miss in the execute cycle after another is still "the cycle
+/// right after" however many stall cycles sat between them. `elapsed` counts every cycle,
+/// stalls included, which is the clock the write buffer drains on - its entries empty while
+/// the CPU is stalled. `queued` is how many stall cycles this cycle's accesses have already
+/// been charged and not yet served; they delay whatever the access starts, so the write buffer
+/// runs on `elapsed + queued`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DataClock {
+    pub(crate) cycle: u64,
+    pub(crate) elapsed: u64,
+    pub(crate) queued: u32,
+}
+
+impl DataClock {
+    /// The wall clock an access that starts now is timed on.
+    fn wall(self) -> u64 {
+        self.elapsed + u64::from(self.queued)
+    }
+}
+
+/// One data access this cycle made, with what the hierarchy said about it. The hierarchy
+/// answers once, at the access; nothing re-probes the cache later in the cycle.
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct Access {
+    address: u32,
+    timing: AccessTiming,
+}
+
+/// The L1D's timing state: the cycle's data accesses, the write buffer and the read-miss
+/// pipeline. Everything here is the cache controller's behaviour (SPRU862B chapter 3, SPRU871K
+/// section 3.5), which is why it lives beside the caches it times rather than in the CPU: the
+/// CPU only says what it accessed and when.
+#[derive(Default)]
+struct L1dTiming {
+    /// Data addresses accessed this cycle, used to detect bank conflicts and to cost read misses.
+    accesses: Vec<Access>,
+    /// The L1D write buffer: four 128-bit entries between L1D and L2 that hold write misses.
+    /// Each entry drains in two cycles to L2 SRAM, entries drain in order, and a read miss is
+    /// not serviced until the buffer is empty (SPRU871 §3.5.3, SPRU862B Table 3-2). Each entry
+    /// is its quad-word address and the wall-clock cycle it finishes draining.
+    write_buffer: Vec<(u32, u64)>,
+    /// The last execute cycle that took an L1D read miss, for miss pipelining.
+    last_miss_cycle: Option<u64>,
+    last_miss_count: u32,
+    /// Which phase of the CPU/2 L2 clock the next full-price L1D read miss lands on. Table
+    /// 3-2's single-miss cost is a half cycle, so it is spent as an alternation over
+    /// successive misses rather than read off the cycle the miss issues in.
+    miss_phase: bool,
+}
+
+impl L1dTiming {
+    /// Two parallel accesses that both hit in L1D and fall in the same one of its eight
+    /// 32-bit banks cost one stall cycle (SPRU862B §3.2.1).
+    fn bank_conflict(&self) -> bool {
+        self.accesses.iter().enumerate().any(|(index, left)| {
+            self.accesses[index + 1..].iter().any(|right| {
+                left.timing.resident
+                    && right.timing.resident
+                    && (left.address >> 2) & 7 == (right.address >> 2) & 7
+            })
+        })
+    }
+
+    /// Queue a write miss in the write buffer, answering the stall cycles it costs when all four
+    /// entries are busy.
+    ///
+    /// Merging is not "same 128-bit entry" - SPRU871K section 3.5.3 lists six conditions, and
+    /// two of them are about which pair of writes is eligible rather than about the address:
+    /// "The new write miss resides within the same 128-bit quad-word as the *immediately
+    /// preceding* write miss" and "The two writes are to locations in L2 SRAM (not to locations
+    /// that may be held in L2 cache)". So a write cannot merge into an entry further back in the
+    /// queue, and an entry the L2 cache may hold never merges at all - which is where this meets
+    /// the L2 cacheability rule that decides that, and why the two of them together charge more
+    /// than either did alone.
+    ///
+    /// Only the L2 cacheability condition is observable in a program-level model, and
+    /// `timing:l2-cache-addresses-never-merge-in-the-write-buffer` is the case for it. The
+    /// immediately-preceding condition is obeyed here but a program cannot pin it, and the reason
+    /// is worth writing down: merging changes the queue's depth, and the depth only changes a
+    /// cycle count when the drain rate is slower than the fill rate - which is the six-cycle
+    /// L2 cache rate, exactly the case where merging is forbidden anyway. At the two-cycle L2
+    /// SRAM rate the buffer drains as fast as stores arrive, so one entry more or fewer costs
+    /// nothing and a case asserting it would pass whichever rule the model used. The buffer's
+    /// own tests do see it, because they can look at how long a read miss then waits.
+    ///
+    /// Of the remaining conditions, "the first write has not yet been presented to the L2
+    /// controller" is the drained-entry sweep below, and "both writes have the same privilege
+    /// level" is not distinguished: this model does not carry a privilege level per buffered
+    /// write, and a merge across a privilege change needs a mode switch between two stores to
+    /// the same quad-word.
+    ///
+    /// `from_l2_cache` is the answer the hierarchy gave for the store's own address, not a
+    /// second probe of the quad-word: the source is a property of the 16 MB MAR region, so the
+    /// two agree by construction rather than by both masking the address the same way.
+    fn buffer_write(&mut self, address: u32, from_l2_cache: bool, now: u64) -> u32 {
+        let entry = address & !15;
+        self.write_buffer.retain(|(_, done)| *done > now);
+        let mergeable = !from_l2_cache;
+        if mergeable
+            && self
+                .write_buffer
+                .last()
+                .is_some_and(|(held, _)| *held == entry)
+        {
+            return 0;
+        }
+        let mut stall = 0;
+        if self.write_buffer.len() >= 4 {
+            let freed = self.write_buffer[0].1;
+            stall = (freed - now) as u32;
+            self.write_buffer.remove(0);
+        }
+        let start = self.write_buffer.last().map_or(now, |(_, done)| *done);
+        // Table 3-2's write buffer drain rate: two cycles per entry into L2 SRAM, six into the
+        // L2 cache.
+        let rate = if mergeable { 2 } else { 6 };
+        self.write_buffer.push((entry, start + rate));
+        stall
+    }
+
+    /// A read miss waits for the write buffer to drain completely first.
+    fn drain_write_buffer(&mut self, now: u64) -> u32 {
+        self.write_buffer.retain(|(_, done)| *done > now);
+        let wait = self
+            .write_buffer
+            .last()
+            .map_or(0, |(_, done)| done.saturating_sub(now));
+        self.write_buffer.clear();
+        wait as u32
+    }
+
+    /// L1D read miss stalls for this cycle, from SPRU862B Table 3-2's 1-wait-state, 4 x 128-bit
+    /// column - the C6455's L2 (SPRS276M section 4). Out of L2 SRAM a single miss costs 12.5
+    /// cycles, 12 or 13 depending on how the access lines up with the CPU/2 L2 clock; a miss in
+    /// the cycle right after another pipelines behind it for 3; and each further miss in the same
+    /// cycle adds 4. Out of the L2 cache the same three numbers are 14.5, 7 and 8.
+    ///
+    /// The table's fourth row is what makes the pipelined number conditional: M consecutive
+    /// *parallel* misses cost 12.5 + 4(M-1) out of L2 SRAM, which is four for every miss after
+    /// the first rather than 3 + 4 per cycle. With four banks a paired miss costs the same as any
+    /// other, so the pipelining discount is only there while misses arrive one per cycle.
+    ///
+    /// `victim_flush` is whether a dirty line left the victim buffer since the last cycle that
+    /// was costed, which disrupts pipelining (Table 3-2's fifth row).
+    fn miss_stalls(&mut self, cycle: u64, now: u64, victim_flush: bool) -> u32 {
+        let mut lines = [0u32; 8];
+        let mut misses = 0usize;
+        // L2 serves one request at a time, so a cycle that misses on both sides pays the dearer
+        // line's price. The source is the one the hierarchy reported when the access was made,
+        // so the cost and the write buffer's merge rule cannot disagree about the same line.
+        let mut from_l2_cache = false;
+        for access in &self.accesses {
+            let line = access.address & !63;
+            if access.timing.read_miss && !lines[..misses].contains(&line) {
+                lines[misses] = line;
+                misses += 1;
+                from_l2_cache |= access.timing.from_l2_cache;
+            }
+        }
+        let miss_count = misses as u32;
+        if miss_count == 0 {
+            return 0;
+        }
+        let (single, pipelined_cost, parallel) = if from_l2_cache {
+            (14, 7, 8)
+        } else {
+            (12, 3, 4)
+        };
+        let drain = self.drain_write_buffer(now);
+        // A victim buffer flush on the previous miss disrupts miss pipelining (Table 3-2).
+        let pipelined = self.last_miss_cycle == Some(cycle.wrapping_sub(1)) && !victim_flush;
+        let paired = self.last_miss_count > 1;
+        self.last_miss_cycle = Some(cycle);
+        self.last_miss_count = miss_count;
+        let first = if pipelined {
+            if paired {
+                parallel
+            } else {
+                pipelined_cost
+            }
+        } else {
+            // The single-miss cost is a half cycle because the access lands on one of the two
+            // phases of the CPU/2 L2 clock. Only the average is documented, so it is spent as
+            // an alternation over successive full-price misses - the same way the L1P fill
+            // occupancy spends its third as a repeating 5, 5, 4 in `fetch_stalls`.
+            // Reading the phase off the issue cycle's parity instead ties it to the loop's
+            // period: a loop whose misses arrive an even number of cycles apart pays the dearer
+            // phase every time, which is how SPRU862B §3.4.7's worked totals came out 64 and 32
+            // cycles high. The pipelined and parallel costs are whole cycles and take no phase.
+            self.miss_phase = !self.miss_phase;
+            single + u32::from(self.miss_phase)
+        };
+        drain + first + parallel * (miss_count - 1)
+    }
+}
+
+/// The program-fetch path's occupancy. The fetch path holds one L1P line fill at a time and
+/// starts the next line as soon as it is free, so these three say where it has got to.
+struct FetchTiming {
+    /// The line currently supplying instructions, and the cycle the program-fetch path finishes
+    /// the fill it is working on. Together they give L1P miss pipelining: a fill for the
+    /// sequentially next line is already under way when the CPU reaches it.
+    line: u32,
+    ready: u64,
+    /// Which of the repeating 5, 5, 4 occupancies the next L2 SRAM fill takes.
+    phase: u32,
 }
 
 /// How much of one megamodule's L2, L1P and L1D windows is still addressable SRAM.
@@ -571,9 +784,12 @@ pub(crate) struct MemoryHierarchy {
     /// The L1P line fills since the fetch path last drained them, each with where the line came
     /// from, which is what the per-packet miss stalls charge on.
     l1p_fills: Vec<LineFill>,
-    /// A dirty line left the victim buffer since the last drain, which disrupts miss
+    l1p_fetch: FetchTiming,
+    /// A dirty line left the victim buffer since the last costed cycle, which disrupts miss
     /// pipelining (SPRU862B Table 3-2).
     l1d_victim_flush: bool,
+    /// The L1D's access record, write buffer and miss pipeline.
+    l1d_timing: L1dTiming,
     l1d: Cache,
     l2: Cache,
     /// The base addresses of the seven range cache operations.
@@ -613,7 +829,13 @@ impl MemoryHierarchy {
             // section 1.8, SPRS276M section 4).
             l1p: Cache::new(32, 1),
             l1p_fills: Vec::new(),
+            l1p_fetch: FetchTiming {
+                line: u32::MAX,
+                ready: 0,
+                phase: 0,
+            },
             l1d_victim_flush: false,
+            l1d_timing: L1dTiming::default(),
             l1d: Cache::new(64, 2),
             l2: Cache::new(128, 4),
             cache_bars: [0; 7],
@@ -645,12 +867,6 @@ impl MemoryHierarchy {
     pub(crate) fn mar_registers(&self) -> [u32; 256] {
         self.mar
     }
-    /// Whether the L1D fills since this was last drained flushed a dirty line out of the victim
-    /// buffer. SPRU862B Table 3-2 says such a flush "disrupts miss pipelining" and adds up to ten
-    /// stalls; the disruption is modelled because it needs no number, the extra stalls are not.
-    pub(crate) fn take_l1d_victim_flush(&mut self) -> bool {
-        std::mem::take(&mut self.l1d_victim_flush)
-    }
     /// Everything one data access tells the timing model, answered once for the address the
     /// access issued. Only the SRAM the L1D configuration has left answers in one cycle; the rest
     /// of the window is the cache itself.
@@ -663,7 +879,7 @@ impl MemoryHierarchy {
     /// one answer serve both. Resolving it only when a fill is needed keeps the cost where it
     /// already was: a hit paid nothing before and pays nothing now.
     #[inline]
-    pub(crate) fn access_timing(&self, address: u32) -> AccessTiming {
+    fn access_timing(&self, address: u32) -> AccessTiming {
         if let Placement::CoreL1D { offset, .. } = self.map.placement(self.requester(), address) {
             if offset < sram_remaining(self.map.l1d_bytes(), l1_capacity(self.l1d_cfg)) {
                 return AccessTiming {
@@ -680,6 +896,64 @@ impl MemoryHierarchy {
             read_miss,
             from_l2_cache: read_miss && self.l2_cacheable(address),
         }
+    }
+    /// Start a new cycle's record of data accesses. The CPU calls this at the head of every
+    /// execute cycle it will charge, so what `data_stalls` costs is that cycle's accesses and
+    /// nothing older.
+    #[inline]
+    pub(crate) fn begin_data_cycle(&mut self) {
+        self.l1d_timing.accesses.clear();
+    }
+    /// Record a data load this cycle made.
+    #[inline]
+    pub(crate) fn note_load(&mut self, address: u32) {
+        let timing = self.access_timing(address);
+        self.l1d_timing.accesses.push(Access { address, timing });
+    }
+    /// Record a data store this cycle made, answering the stall cycles it costs on the spot:
+    /// a store that misses L1D goes into the write buffer, which holds the CPU until its oldest
+    /// entry drains if all four are busy (SPRU871K section 3.5.3).
+    ///
+    /// A store never allocates, so what the cycle records is a resident-or-not access with no
+    /// fill of its own; the access's fill answer only decides whether it goes to the write
+    /// buffer, which is charged here rather than in the miss cost. `clock.queued` is the stalls
+    /// the cycle's earlier accesses were already charged, because the buffer is timed on the
+    /// wall clock the access really starts at.
+    #[inline]
+    pub(crate) fn note_store(&mut self, address: u32, clock: DataClock) -> u32 {
+        let timing = self.access_timing(address);
+        self.l1d_timing.accesses.push(Access {
+            address,
+            timing: AccessTiming {
+                resident: timing.resident,
+                read_miss: false,
+                from_l2_cache: false,
+            },
+        });
+        if !timing.resident && timing.read_miss {
+            return self
+                .l1d_timing
+                .buffer_write(address, timing.from_l2_cache, clock.wall());
+        }
+        0
+    }
+    /// The stall cycles this cycle's recorded accesses cost, to add to those the stores already
+    /// answered: a bank conflict (SPRU862B section 3.2.1) and the L1D read misses.
+    ///
+    /// The conflict's cycle is absorbed by a stall already queued for the cycle, so it costs one
+    /// only when `clock.queued` is zero; and the read miss then waits for the write buffer to
+    /// drain on a clock that includes that cycle.
+    ///
+    /// Asking is also what takes the victim buffer's flush report: whether a dirty line left
+    /// it since the last costed cycle. SPRU862B Table 3-2 says such a flush "disrupts miss
+    /// pipelining" and adds up to ten stalls; the disruption is modelled because it needs no
+    /// number, the extra stalls are not.
+    #[inline]
+    pub(crate) fn data_stalls(&mut self, clock: DataClock) -> u32 {
+        let conflict = u32::from(self.l1d_timing.bank_conflict() && clock.queued == 0);
+        let victim_flush = std::mem::take(&mut self.l1d_victim_flush);
+        let now = clock.wall() + u64::from(conflict);
+        conflict + self.l1d_timing.miss_stalls(clock.cycle, now, victim_flush)
     }
     pub(crate) fn fetch_reusable(&self, address: u32) -> bool {
         self.l1p.enabled() && self.l1p_cacheable(address)
@@ -720,13 +994,17 @@ impl MemoryHierarchy {
         // again there.
         mar >= 16 && self.mar[mar] & 1 != 0 && !self.own_l1(address)
     }
-    /// The L1P line fills the program-fetch path performed since this was last drained, each with
-    /// the memory that served it. SPRU862B Table 1-3 gives the average stalls per execute packet
-    /// for a straight-line miss stream at each packet width, over two L2 configurations, and one
-    /// occupancy per line explains all thirty-two numbers: with the fill of the next line
-    /// overlapped against execution of the current one, a width-n packet consumes a 32-byte line
-    /// in 8/n cycles and so stalls `max(0, k - 8/n)` per line, which is `max(0, k*n/8 - 1)` per
-    /// packet. The C6455's L2 is 2048K at 0080 0000h with 2-cycle latency in a 4 x 128-bit bank
+    /// The program-fetch cost of the L1P line fills the fetch path performed since this was last
+    /// asked, for the packet whose fetch finished at wall-clock cycle `now` (the cycles the CPU
+    /// has executed plus the stalls it has served; stalls advance neither the execute cycle nor
+    /// the pipeline, so the fetch path's clock is their sum). Every fill is charged exactly once.
+    ///
+    /// SPRU862B Table 1-3 gives the average stalls per execute packet for a straight-line miss
+    /// stream at each packet width, over two L2 configurations, and one occupancy per line
+    /// explains all thirty-two numbers: with the fill of the next line overlapped against
+    /// execution of the current one, a width-n packet consumes a 32-byte line in 8/n cycles and
+    /// so stalls `max(0, k - 8/n)` per line, which is `max(0, k*n/8 - 1)` per packet. The
+    /// C6455's L2 is 2048K at 0080 0000h with 2-cycle latency in a 4 x 128-bit bank
     /// configuration (SPRS276M section 4), which is the table's 1-wait-state column - the same
     /// one the L1D read-miss numbers come from - and solving against it gives k = 14/3 for a line
     /// out of L2 SRAM and k = 6 for one the L2 cache holds. The cost of a line the L2 cache
@@ -736,8 +1014,55 @@ impl MemoryHierarchy {
     /// Reporting the fills that happened, rather than answering a question about residency before
     /// the fetch, is what keeps the accounting exact: a C64x+ execute packet may span two fetch
     /// packets, so the fetch of one packet can fill two lines.
-    pub(crate) fn drain_l1p_fills(&mut self) -> std::vec::Drain<'_, LineFill> {
-        self.l1p_fills.drain(..)
+    ///
+    /// The fetch path holds one fill at a time and starts the next line as soon as it is free,
+    /// which is what SPRU862B calls miss pipelining: a sequential line is already on its way, so
+    /// the CPU only stalls for the part of the fill that execution has outrun, while a branch
+    /// target's fill can only begin once the branch has redirected the fetch stream.
+    ///
+    /// A line out of the C6455's L2 SRAM occupies the path 14/3 cycles on average and one out of
+    /// the L2 cache six. The average is what the table gives, so the fraction is spent as a
+    /// repeating 5, 5, 4 over successive fills, the same way the L1D read miss spends its half
+    /// cycle as alternating 12 and 13. Which fill lands on which phase is not documented - only
+    /// the average is.
+    pub(crate) fn fetch_stalls(&mut self, now: u64) -> u32 {
+        if self.l1p_fills.is_empty() {
+            return 0;
+        }
+        let FetchTiming {
+            mut ready,
+            line: mut previous,
+            mut phase,
+        } = self.l1p_fetch;
+        let mut stalls = 0;
+        for fill in self.l1p_fills.drain(..) {
+            let cost = if fill.from_l2_cache {
+                6
+            } else {
+                let cost = if phase == 2 { 4 } else { 5 };
+                phase = (phase + 1) % 3;
+                cost
+            };
+            // The run-ahead is one fill deep: an idle path cannot have queued more than the line
+            // the CPU is about to need.
+            let sequential = previous == fill.line.wrapping_sub(32);
+            let start = if sequential {
+                ready.max((now + stalls).saturating_sub(cost))
+            } else {
+                now + stalls
+            };
+            ready = start + cost;
+            stalls += ready.saturating_sub(now + stalls);
+            previous = fill.line;
+        }
+        // The clock stays at the in-flight fill's completion: an idle path is credited through
+        // the run-ahead clamp above, not by moving the clock forward every packet.
+        self.l1p_fetch = FetchTiming {
+            line: previous,
+            ready,
+            phase,
+        };
+        stalls as u32
     }
     pub(crate) fn cache_register_read(&self, address: u32) -> Option<u32> {
         let value = match address {
@@ -1357,46 +1682,322 @@ mod tests {
         }
     }
 
+    fn clock(cycle: u64, elapsed: u64, queued: u32) -> DataClock {
+        DataClock {
+            cycle,
+            elapsed,
+            queued,
+        }
+    }
+
+    /// What one CPU cycle's accesses cost: the stall each store answers on the spot, then the
+    /// cycle's own. `cycle` is the execute cycle and `elapsed` the wall clock it issues at.
+    fn data_cycle(
+        mm: &mut MemoryHierarchy,
+        cycle: u64,
+        elapsed: u64,
+        loads: &[u32],
+        stores: &[u32],
+    ) -> u32 {
+        mm.begin_data_cycle();
+        for &address in loads {
+            mm.note_load(address);
+        }
+        let mut queued = 0;
+        for &address in stores {
+            queued += mm.note_store(address, clock(cycle, elapsed, queued));
+        }
+        queued + mm.data_stalls(clock(cycle, elapsed, queued))
+    }
+
+    /// An address in L2 SRAM, which an L1D read misses on and fetches from L2 SRAM.
+    const SRAM: u32 = 0x0080_0000;
+
     #[test]
-    fn only_a_dirty_eviction_reports_a_victim_flush() {
-        let (mut mm, mut backing) = hierarchy();
-        cache_external(&mut mm, &mut backing);
-        mm.bind(&mut backing).read_u32(EXTERNAL[0]);
-        mm.bind(&mut backing).read_u32(EXTERNAL[1]);
-        // Dirty the first line, then evict the second: a clean victim is no disruption.
-        mm.bind(&mut backing).write_u32(EXTERNAL[0], 0xdead_beef);
-        mm.bind(&mut backing).read_u32(EXTERNAL[2]);
-        assert!(!mm.take_l1d_victim_flush());
-        // Now evict the dirty one.
-        mm.bind(&mut backing).read_u32(EXTERNAL[3]);
-        assert!(mm.take_l1d_victim_flush());
-        // The flag is a report of what happened since the last drain, so it does not repeat.
-        assert!(!mm.take_l1d_victim_flush());
-        assert_eq!(mm.bind(&mut backing).read_u32(EXTERNAL[0]), 0xdead_beef);
+    fn parallel_resident_accesses_conflict_only_within_a_bank() {
+        let (mut mm, _backing) = hierarchy();
+        // SPRU862B §3.2.1: eight 32-bit banks, so 32 bytes apart is the same bank.
+        assert_eq!(
+            data_cycle(&mut mm, 1, 1, &[L1D_WINDOW, L1D_WINDOW + 0x20], &[]),
+            1
+        );
+        assert_eq!(
+            data_cycle(&mut mm, 2, 2, &[L1D_WINDOW, L1D_WINDOW + 4], &[]),
+            0
+        );
+        // A store competes for the banks like a load does.
+        assert_eq!(
+            data_cycle(&mut mm, 3, 3, &[L1D_WINDOW], &[L1D_WINDOW + 0x20]),
+            1
+        );
+        // Each cycle's record is its own.
+        assert_eq!(data_cycle(&mut mm, 4, 4, &[L1D_WINDOW], &[]), 0);
     }
 
     #[test]
-    fn program_fills_report_the_line_and_its_source() {
+    fn a_bank_conflict_is_absorbed_by_a_stall_already_queued() {
+        let (mut mm, _backing) = hierarchy();
+        mm.begin_data_cycle();
+        mm.note_load(L1D_WINDOW);
+        mm.note_load(L1D_WINDOW + 0x20);
+        assert_eq!(mm.data_stalls(clock(1, 1, 2)), 0);
+    }
+
+    #[test]
+    fn an_access_that_misses_l1d_never_conflicts() {
+        let (mut mm, _backing) = cached();
+        // L2 SRAM is not resident once L1D is a cache, so the pair pays its one miss and no
+        // bank conflict even though both fall in bank 0 ...
+        assert_eq!(data_cycle(&mut mm, 1, 1, &[L1D_WINDOW, SRAM], &[]), 13);
+        // ... and two misses in one bank cost the parallel-miss price and nothing more.
+        assert_eq!(
+            data_cycle(&mut mm, 20, 20, &[SRAM, SRAM + 0x100], &[]),
+            12 + 4
+        );
+    }
+
+    /// A hierarchy whose L1D and L2 caches are on, so that L2 SRAM and DDR2 addresses miss.
+    fn cached() -> (MemoryHierarchy, Backing) {
         let (mut mm, mut backing) = hierarchy();
         cache_external(&mut mm, &mut backing);
-        mm.bind(&mut backing).cache_register_write(L1PCFG, 1);
-        mm.bind(&mut backing).fetch_packet(EXTERNAL[0]);
-        mm.bind(&mut backing).fetch_packet(0x0080_0000);
-        let fills: Vec<_> = mm.drain_l1p_fills().collect();
+        (mm, backing)
+    }
+
+    #[test]
+    fn a_read_miss_out_of_l2_sram_costs_12_or_13_and_pipelines_for_3() {
+        let (mut mm, _backing) = cached();
+        // SPRU862B Table 3-2: 12.5 cycles, spent as alternating 13 and 12 over successive
+        // misses that are not back to back.
+        assert_eq!(data_cycle(&mut mm, 10, 10, &[SRAM], &[]), 13);
+        assert_eq!(data_cycle(&mut mm, 20, 20, &[SRAM], &[]), 12);
+        assert_eq!(data_cycle(&mut mm, 30, 30, &[SRAM], &[]), 13);
+        // A miss in the cycle right after another pipelines behind it for 3, and a run of them
+        // does not take a phase, so the next full-price one resumes the alternation.
+        assert_eq!(data_cycle(&mut mm, 40, 40, &[SRAM], &[]), 12);
+        assert_eq!(data_cycle(&mut mm, 41, 41, &[SRAM], &[]), 3);
+        assert_eq!(data_cycle(&mut mm, 42, 42, &[SRAM], &[]), 3);
+        assert_eq!(data_cycle(&mut mm, 50, 50, &[SRAM], &[]), 13);
+    }
+
+    #[test]
+    fn pipelining_counts_execute_cycles_and_not_stall_cycles() {
+        let (mut mm, _backing) = cached();
+        assert_eq!(data_cycle(&mut mm, 10, 10, &[SRAM], &[]), 13);
+        // The stall cycles the first miss cost froze the pipeline: the next execute cycle is
+        // still the one right after.
+        assert_eq!(data_cycle(&mut mm, 11, 40, &[SRAM], &[]), 3);
+        // Hits and idle cycles in between break the run.
+        assert_eq!(data_cycle(&mut mm, 12, 43, &[L1D_WINDOW], &[]), 0);
+        assert_eq!(data_cycle(&mut mm, 13, 44, &[SRAM], &[]), 12);
+    }
+
+    #[test]
+    fn parallel_read_misses_cost_four_each_after_the_first() {
+        let (mut mm, _backing) = cached();
+        // Two misses in one cycle on different lines: 12.5 + 4.
+        assert_eq!(data_cycle(&mut mm, 10, 10, &[SRAM, SRAM + 0x40], &[]), 17);
+        // Two accesses to one line are one miss.
+        assert_eq!(data_cycle(&mut mm, 20, 20, &[SRAM, SRAM + 8], &[]), 12);
+        // After a paired miss the discount is the parallel price, not the pipelined one.
+        assert_eq!(data_cycle(&mut mm, 30, 30, &[SRAM, SRAM + 0x40], &[]), 17);
+        assert_eq!(data_cycle(&mut mm, 31, 31, &[SRAM, SRAM + 0x40], &[]), 8);
+        assert_eq!(data_cycle(&mut mm, 32, 32, &[SRAM], &[]), 4);
+    }
+
+    #[test]
+    fn a_read_miss_out_of_the_l2_cache_costs_14_or_15_and_pipelines_for_7() {
+        let (mut mm, _backing) = cached();
+        assert_eq!(data_cycle(&mut mm, 10, 10, &[EXTERNAL[0]], &[]), 15);
+        assert_eq!(data_cycle(&mut mm, 11, 11, &[EXTERNAL[1]], &[]), 7);
+        assert_eq!(data_cycle(&mut mm, 20, 20, &[EXTERNAL[0]], &[]), 14);
         assert_eq!(
-            fills,
-            [
-                LineFill {
-                    line: EXTERNAL[0],
-                    from_l2_cache: true,
-                },
-                LineFill {
-                    line: 0x0080_0000,
-                    from_l2_cache: false,
-                },
-            ]
+            data_cycle(&mut mm, 30, 30, &[EXTERNAL[0], EXTERNAL[1]], &[]),
+            15 + 8
         );
-        // Draining is what clears them: the fetch path charges each fill exactly once.
-        assert_eq!(mm.drain_l1p_fills().count(), 0);
+        // L2 serves one request at a time, so a cycle that misses on both sources pays the
+        // dearer price for the pair.
+        assert_eq!(
+            data_cycle(&mut mm, 40, 40, &[SRAM, EXTERNAL[0]], &[]),
+            14 + 8
+        );
+    }
+
+    /// The cost of a read miss that comes right after another, once `evictions` have filled
+    /// L1D's set of dirtied and clean lines in the cycle between them.
+    fn miss_after_eviction(evictions: &[u32]) -> u32 {
+        let (mut mm, mut backing) = cached();
+        mm.bind(&mut backing).read_u32(EXTERNAL[0]);
+        mm.bind(&mut backing).read_u32(EXTERNAL[1]);
+        mm.bind(&mut backing).write_u32(EXTERNAL[0], 0xdead_beef);
+        assert_eq!(data_cycle(&mut mm, 10, 10, &[SRAM], &[]), 13);
+        mm.begin_data_cycle();
+        mm.note_load(SRAM + 0x40);
+        for &address in evictions {
+            mm.bind(&mut backing).read_u32(address);
+        }
+        let stalls = mm.data_stalls(clock(11, 24, 0));
+        // The report is of what happened since the last costed cycle, so it does not repeat:
+        // the next consecutive miss pipelines again.
+        assert_eq!(data_cycle(&mut mm, 12, 30, &[SRAM + 0x80], &[]), 3);
+        assert_eq!(
+            mm.bind(&mut backing).read_u32(EXTERNAL[0]),
+            0xdead_beef,
+            "the dirty line reaches memory"
+        );
+        stalls
+    }
+
+    #[test]
+    fn only_a_dirty_eviction_disrupts_miss_pipelining() {
+        // SPRU862B Table 3-2's fifth row: a victim buffer flush "disrupts miss pipelining".
+        // The two-way set holds EXTERNAL[0] (dirty) and EXTERNAL[1] (clean), and the next two
+        // fills evict the clean one and then the dirty one.
+        assert_eq!(miss_after_eviction(&[]), 3);
+        assert_eq!(miss_after_eviction(&[EXTERNAL[2]]), 3);
+        assert_eq!(miss_after_eviction(&[EXTERNAL[2], EXTERNAL[3]]), 12);
+    }
+
+    #[test]
+    fn write_misses_merge_only_into_the_immediately_preceding_sram_quad_word() {
+        // SPRU871K section 3.5.3. A read miss waits for the buffer to drain, so how long it
+        // waits shows how many entries the stores left. SRAM entries drain in two cycles each.
+        let wait = |stores: &[u32]| {
+            let (mut mm, _backing) = cached();
+            for &address in stores {
+                assert_eq!(data_cycle(&mut mm, 0, 0, &[], &[address]), 0);
+            }
+            data_cycle(&mut mm, 1, 1, &[SRAM + 0x100], &[]) - 13
+        };
+        // One entry, done at cycle 2; the second store to the same quad-word merges into it.
+        assert_eq!(wait(&[SRAM]), 1);
+        assert_eq!(wait(&[SRAM, SRAM + 4]), 1);
+        // Another quad-word between them leaves the first out of reach: three entries, done at 6.
+        assert_eq!(wait(&[SRAM, SRAM + 0x10, SRAM + 4]), 5);
+        // Distinct quad-words do not merge.
+        assert_eq!(wait(&[SRAM, SRAM + 0x10]), 3);
+    }
+
+    #[test]
+    fn write_misses_the_l2_cache_may_hold_drain_in_six_cycles_and_never_merge() {
+        let wait = |stores: &[u32]| {
+            let (mut mm, _backing) = cached();
+            for &address in stores {
+                assert_eq!(data_cycle(&mut mm, 0, 0, &[], &[address]), 0);
+            }
+            data_cycle(&mut mm, 1, 1, &[EXTERNAL[1]], &[]) - 15
+        };
+        assert_eq!(wait(&[EXTERNAL[0]]), 5);
+        // The same quad-word twice is two entries, because the L2 cache may hold it.
+        assert_eq!(wait(&[EXTERNAL[0], EXTERNAL[0] + 4]), 11);
+    }
+
+    #[test]
+    fn a_full_write_buffer_holds_the_store_until_the_oldest_entry_drains() {
+        let (mut mm, _backing) = cached();
+        let quads = [SRAM, SRAM + 0x10, SRAM + 0x20, SRAM + 0x30];
+        for address in quads {
+            assert_eq!(mm.note_store(address, clock(0, 0, 0)), 0);
+        }
+        // The entries finish at cycles 2, 4, 6 and 8; a fifth waits for the first.
+        assert_eq!(mm.note_store(SRAM + 0x40, clock(0, 0, 0)), 2);
+        // The buffer runs on the wall clock including stalls queued ahead of the store.
+        let (mut queued, _backing) = cached();
+        for address in quads {
+            queued.note_store(address, clock(0, 0, 0));
+        }
+        assert_eq!(queued.note_store(SRAM + 0x40, clock(0, 0, 1)), 1);
+        // An entry already drained by then frees its slot.
+        let (mut drained, _backing) = cached();
+        for address in quads {
+            drained.note_store(address, clock(0, 0, 0));
+        }
+        assert_eq!(drained.note_store(SRAM + 0x40, clock(0, 2, 0)), 0);
+        // Entries leave in order: what the CPU waits for next is the second of the original
+        // four, which finishes at cycle 4.
+        assert_eq!(mm.note_store(SRAM + 0x50, clock(0, 2, 0)), 2);
+    }
+
+    #[test]
+    fn a_read_miss_waits_for_the_whole_write_buffer_and_leaves_it_empty() {
+        let (mut mm, _backing) = cached();
+        for quad in 0..3 {
+            assert_eq!(data_cycle(&mut mm, 0, 0, &[], &[SRAM + 0x10 * quad]), 0);
+        }
+        // Three entries, the last done at cycle 6, then the miss's own 12.5.
+        assert_eq!(data_cycle(&mut mm, 0, 0, &[SRAM + 0x100], &[]), 6 + 13);
+        // Whatever was left went with it: the next miss pays only for itself.
+        assert_eq!(data_cycle(&mut mm, 5, 30, &[SRAM + 0x140], &[]), 12);
+    }
+
+    #[test]
+    fn stores_that_hit_l1d_never_enter_the_write_buffer() {
+        let (mut mm, _backing) = cached();
+        for quad in 0..6 {
+            assert_eq!(
+                data_cycle(&mut mm, 0, 0, &[], &[L1D_WINDOW + 0x10 * quad]),
+                0
+            );
+        }
+        assert_eq!(data_cycle(&mut mm, 1, 1, &[SRAM], &[]), 13);
+    }
+
+    /// The L1P cache on, so a fetch from L2 SRAM or the DDR2 window fills a line.
+    fn fetching() -> (MemoryHierarchy, Backing) {
+        let (mut mm, mut backing) = cached();
+        mm.bind(&mut backing).cache_register_write(L1PCFG, 1);
+        (mm, backing)
+    }
+
+    /// Fetch the packet at `address` and ask what its fills cost, with the CPU at `now`.
+    fn fetch(mm: &mut MemoryHierarchy, backing: &mut Backing, address: u32, now: u64) -> u32 {
+        mm.bind(backing).fetch_packet(address);
+        mm.fetch_stalls(now)
+    }
+
+    #[test]
+    fn a_line_out_of_l2_sram_occupies_the_fetch_path_for_5_5_then_4_cycles() {
+        let (mut mm, mut backing) = fetching();
+        // SPRU862B Table 1-3 averages 14/3 cycles a line; none of these is sequential.
+        let costs: Vec<u32> = (0..4)
+            .map(|line| {
+                fetch(
+                    &mut mm,
+                    &mut backing,
+                    SRAM + 0x400 * line,
+                    100 * u64::from(line + 1),
+                )
+            })
+            .collect();
+        assert_eq!(costs, [5, 5, 4, 5]);
+    }
+
+    #[test]
+    fn a_line_out_of_the_l2_cache_occupies_the_fetch_path_for_six_and_takes_no_phase() {
+        let (mut mm, mut backing) = fetching();
+        assert_eq!(fetch(&mut mm, &mut backing, EXTERNAL[0], 100), 6);
+        assert_eq!(fetch(&mut mm, &mut backing, SRAM, 200), 5);
+    }
+
+    #[test]
+    fn the_fetch_path_runs_ahead_to_the_sequentially_next_line() {
+        let (mut mm, mut backing) = fetching();
+        assert_eq!(fetch(&mut mm, &mut backing, SRAM, 100), 5);
+        // The next line's fill began as soon as the path was free at 105, so the CPU, arriving
+        // at 107, only waits for the part it has outrun.
+        assert_eq!(fetch(&mut mm, &mut backing, SRAM + 0x20, 107), 3);
+        // A branch target's fill can only begin when the branch redirects the stream.
+        assert_eq!(fetch(&mut mm, &mut backing, SRAM + 0x800, 200), 4);
+        // An idle path has run ahead by one fill, no more.
+        assert_eq!(fetch(&mut mm, &mut backing, SRAM + 0x820, 300), 0);
+    }
+
+    #[test]
+    fn one_packet_that_fills_two_lines_pays_for_both_once() {
+        let (mut mm, mut backing) = fetching();
+        mm.bind(&mut backing).fetch_packet(SRAM);
+        mm.bind(&mut backing).fetch_packet(SRAM + 0x20);
+        assert_eq!(mm.fetch_stalls(100), 5 + 5);
+        // Asking is what consumes the fills.
+        assert_eq!(mm.fetch_stalls(100), 0);
     }
 }

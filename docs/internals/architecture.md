@@ -38,7 +38,7 @@ resolution, the SPLOOP buffer - belongs to [Execution and timing](execution.md).
 | board | `Board`, `Boot`, `BootSource` | `src/board.rs` | `from_args`, `start`; `Boot::holds_core_zero`, `tick`, progress, `report` |
 | fabric | `Fabric`, `Megamodule`, `Shared` | `src/system.rs` | `read32`/`write32` per requesting core, `tick(cycle)`, `raise(destination, event)` |
 | core bus | `CoreBus<'a>` | `src/system.rs` | everything one core may ask of the device, with its core index already bound |
-| memory hierarchy | `MemoryHierarchy`, `BoundHierarchy` | `src/memory.rs` | `read_u32`, `fetch_packet`, `snoop_read`, `host_snoop_read`, `access_timing` |
+| memory hierarchy | `MemoryHierarchy`, `BoundHierarchy` | `src/memory.rs` | `read_u32`, `fetch_packet`, `snoop_read`, `host_snoop_read`; timing: `note_load`, `note_store`, `data_stalls`, `fetch_stalls` |
 | backing store | `Backing` | `src/memory.rs` | `placement`, `read_bytes`, `write_bytes` by `Requester` |
 | address map | `AddressMap`, `Placement`, `Requester` | `src/space.rs` | which physical memory a requester's address lands in |
 | slave port | `SlavePort`, `PortContext`, `PortWrite` | `src/port.rs` | `read(address, context) -> Option<u32>`, `write(...) -> PortWrite` |
@@ -279,8 +279,9 @@ Given an address and a requester, this is which module answers:
 
 | Access | Path |
 |---|---|
-| Program fetch | `CoreBus::fetch_packet` → `BoundHierarchy::fetch_packet` (L1P) → `Backing` |
+| Program fetch | `CoreBus::fetch_packet` → `BoundHierarchy::fetch_packet` (L1P) → `Backing`; its fill stalls come back through `CoreBus::fetch_stalls` → `MemoryHierarchy::fetch_stalls` |
 | CPU load or store outside `0x0180_0000..0xa000_0000` | `Fabric::memory(core)` → L1D, L2, `Backing` |
+| The timing of those loads and stores | `CoreBus::note_load`/`note_store`/`data_stalls` → `MemoryHierarchy` (L1D bank conflict, write buffer, read-miss cost); the CPU adds the stall cycles it is told to `pending_stalls` |
 | CPU access inside that band | port walk → `Megamodule::cfg_*` → memory, as above |
 | CPU access to a restricted page | `Fabric::check_access` first; a violation latches MPFAR/MPFSR and raises the unit's event |
 | Word-wide master (HPI, IDMA) to memory (`is_memory`) | `Fabric::master_read32`/`master_write32` → privilege-ID-0 protection check → `dma_word`/`dma_store_word`, with the L2 snoop |

@@ -34,7 +34,7 @@ use crate::i2c::I2c;
 use crate::idma::{Idma, Source as IdmaSource};
 use crate::mcbsp::Mcbsp;
 use crate::mdio::Mdio;
-use crate::memory::{is_memory, AccessTiming, Backing, BoundHierarchy, LineFill, MemoryHierarchy};
+use crate::memory::{is_memory, Backing, BoundHierarchy, DataClock, MemoryHierarchy};
 use crate::pdma::{Pdma, MAX_BURST_WORDS};
 use crate::pll::{Pll, Pll2};
 use crate::port::{PortContext, PortWrite, SlavePort};
@@ -3071,12 +3071,26 @@ impl<'a> CoreBus<'a> {
         self.fabric.shared.backing.track_memory_version(address)
     }
 
-    /// Everything one data access tells the timing model - residency, whether a read would need
-    /// a fill, and where the line comes from - in one answer, because the data access path
-    /// charges all three of every access.
+    /// The data-access timing the megamodule's L1D owns: the CPU records each load and store
+    /// and asks for the cycle's stalls. See `MemoryHierarchy::note_load` and `data_stalls`.
     #[inline(always)]
-    pub(crate) fn access_timing(&self, address: u32) -> AccessTiming {
-        self.fabric.mm[self.core].memory.access_timing(address)
+    pub(crate) fn begin_data_cycle(&mut self) {
+        self.fabric.mm[self.core].memory.begin_data_cycle();
+    }
+
+    #[inline(always)]
+    pub(crate) fn note_load(&mut self, address: u32) {
+        self.fabric.mm[self.core].memory.note_load(address);
+    }
+
+    #[inline(always)]
+    pub(crate) fn note_store(&mut self, address: u32, clock: DataClock) -> u32 {
+        self.fabric.mm[self.core].memory.note_store(address, clock)
+    }
+
+    #[inline(always)]
+    pub(crate) fn data_stalls(&mut self, clock: DataClock) -> u32 {
+        self.fabric.mm[self.core].memory.data_stalls(clock)
     }
 
     /// The interrupt lines to take this cycle and whether the exception combiner is asserting,
@@ -3092,13 +3106,10 @@ impl<'a> CoreBus<'a> {
         )
     }
 
+    /// The L1P fill stalls of the packet just fetched; see `MemoryHierarchy::fetch_stalls`.
     #[inline(always)]
-    pub(crate) fn take_l1d_victim_flush(&mut self) -> bool {
-        self.fabric.mm[self.core].memory.take_l1d_victim_flush()
-    }
-
-    pub(crate) fn drain_l1p_fills(&mut self) -> std::vec::Drain<'_, LineFill> {
-        self.fabric.mm[self.core].memory.drain_l1p_fills()
+    pub(crate) fn fetch_stalls(&mut self, now: u64) -> u32 {
+        self.fabric.mm[self.core].memory.fetch_stalls(now)
     }
 
     pub(crate) fn check_access(

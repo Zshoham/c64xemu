@@ -24,8 +24,16 @@ The value the instruction view presents: an encoding with the fetch-packet heade
 _Avoid_: decoded word, fetch entry
 
 **memory hierarchy**:
-The per-core module owning one megamodule's L1P, L1D and L2 caches, its MAR cacheability bits and its cache configuration registers, and the coherence protocol DMA masters share (L2 SRAM is snooped against L1D, nothing else is, L1P is never snooped). It holds no storage: the bytes behind the caches are the backing store, which the fabric passes in on every access.
+The per-core module owning one megamodule's L1P, L1D and L2 caches, its MAR cacheability bits and its cache configuration registers, and the coherence protocol DMA masters share (L2 SRAM is snooped against L1D, nothing else is, L1P is never snooped). It also owns the timing of the L1 caches: the L1D bank conflict rule, the write buffer, the read-miss costs and the L1P fill occupancy. The CPU says what it accessed and which clocks it is on, and is told how many stall cycles that costs; it carries none of that arithmetic itself. It holds no storage: the bytes behind the caches are the backing store, which the fabric passes in on every access.
 _Avoid_: memory system, memory subsystem
+
+**write buffer**:
+The L1D's four-entry, 128-bit buffer between L1D and L2 that holds write misses. It lives in the memory hierarchy beside the caches, because what it costs is cycles rather than bytes: the bytes are already written through. Entries merge only into the immediately preceding quad-word and never when the L2 cache may hold the line, drain in order at two cycles an entry to L2 SRAM and six to the L2 cache, and a read miss waits for the whole buffer.
+_Avoid_: store buffer, victim buffer (the victim buffer is a separate path that flushes dirty L1D lines)
+
+**data clock**:
+The two clocks the CPU hands the memory hierarchy with every data access: the execute cycle, which stall cycles do not advance and which "the cycle right after another miss" is counted in, and the elapsed cycles, which they do and which the write buffer drains on, plus the stall cycles already queued for the access. The hierarchy never reads the CPU's counters itself.
+_Avoid_: timestamp, time base
 
 **backing store**:
 The storage every master shares: each megamodule's L2, L1P and L1D SRAM, the shared L2 RAM and ROM, the DDR2 window and everything sparse. Addresses arrive as the requester issued them and are resolved through the address map, so a core's local window and the global alias of the same memory land on the same bytes while remaining two distinct cache tags.
