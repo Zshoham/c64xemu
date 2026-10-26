@@ -25,7 +25,8 @@ SOFTRESET (SPRUEF8F §2.15.1).
 
 Both are ordinary slave ports (`SlavePort for Emac`, `SlavePort for Mdio`), so the CPU, the EDMA3
 and the HPI all reach them through the router. The MAC is also a DMA master: `Emac::tick` takes
-`&mut impl DmaMemory`, and the fabric lends the MAC out for its cycle
+`&mut impl MasterAccess` and passes `Privilege::ID0_USER` on every access, and the fabric lends
+the MAC out for its cycle
 (`Fabric::lend_emac`) so it can read and write descriptor memory — including another
 peripheral's registers — while the rest of the device stays reachable. See
 [Architecture](architecture.md) for the lending protocol and the tick model.
@@ -90,8 +91,8 @@ pointer, a completion pointer, a free-buffer count and a flow threshold.
 
 ## The CPPI descriptor
 
-A descriptor is four words. `DmaMemory::dma_read_u32` and `dma_write_u32` are little-endian, so
-each word is read and written as the CPU stored it.
+A descriptor is four words. Each is a word in the device's byte order (`MasterAccess::read_word`
+and `write_word`), so each word is read and written as the CPU stored it.
 
 | Word | Field | Transmit | Receive |
 |---|---|---|---|

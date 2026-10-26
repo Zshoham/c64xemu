@@ -280,6 +280,7 @@ impl AtmMaster {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::system::{MasterAccess, Privilege};
     use std::os::unix::net::UnixDatagram;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -361,7 +362,11 @@ mod tests {
     /// The UTOPIA at 0x02b4_0000 enabled as slave 3 in multi-PHY mode, receiver and transmitter
     /// (SPRUE48 section 3), the way the PDMA tests bring it up.
     fn utopia_slave(fabric: &mut Fabric) {
-        fabric.master_write32(0x02b4_0000, (3 << 24) | (1 << 16) | (1 << 14) | 1);
+        fabric.write_word(
+            Privilege::ID0_SUPERVISOR,
+            0x02b4_0000,
+            (3 << 24) | (1 << 16) | (1 << 14) | 1,
+        );
     }
 
     fn cell(fill: u8) -> Vec<u8> {

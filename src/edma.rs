@@ -8,7 +8,7 @@
 
 use crate::edma_tc::ServicedRequest;
 use crate::port::{PortContext, PortWrite, SlavePort};
-use crate::system::Privilege;
+use crate::system::{MasterAccess, Privilege};
 #[cfg(test)]
 const TEST_CONTEXT: PortContext = PortContext {
     endian: crate::system::Endian::Little,
@@ -29,13 +29,6 @@ fn stamped_privilege(opt: u32) -> Privilege {
         id: ((opt >> 24) & 0xf) as u8,
         user: opt >> 31 == 0,
     }
-}
-
-/// What the transfer controllers move data through. Each access names the privilege it is
-/// made with, so the memory system can apply that identity's protection.
-pub trait TransferMemory {
-    fn read(&mut self, privilege: Privilege, address: u32, length: usize) -> Vec<u8>;
-    fn write(&mut self, privilege: Privilege, address: u32, bytes: &[u8]);
 }
 
 const BASE: u32 = 0x02a0_0000;
@@ -791,7 +784,7 @@ impl Edma {
         self.queues.iter().any(|queue| queue.length != 0)
     }
 
-    pub fn tick(&mut self, memory: &mut impl TransferMemory) {
+    pub fn tick(&mut self, memory: &mut impl MasterAccess) {
         let Some(queue) = (0..QUEUES)
             .filter(|queue| self.queues[*queue].length > 0)
             .min_by_key(|queue| ((self.quepri >> (queue * 4)) & 7, *queue))
@@ -863,7 +856,7 @@ impl Edma {
     /// One transfer request out of the PaRAM set at `base`: move the data, update the set as
     fn request(
         &mut self,
-        memory: &mut impl TransferMemory,
+        memory: &mut impl MasterAccess,
         base: usize,
         controller: usize,
         priority: u32,
@@ -972,7 +965,7 @@ impl Edma {
 
     /// One transfer request: `arrays` arrays of ACNT bytes each, stepping by the B indexes.
     /// Constant addressing mode holds the address still (SPRU966C §2.3.8).
-    fn transfer(&self, memory: &mut impl TransferMemory, set: &ParamSet, arrays: u32) {
+    fn transfer(&self, memory: &mut impl MasterAccess, set: &ParamSet, arrays: u32) {
         let source_fixed = set.opt & OPT_SAM != 0;
         let destination_fixed = set.opt & OPT_DAM != 0;
         for array in 0..arrays {
@@ -987,7 +980,7 @@ impl Edma {
                 offset_address(set.dst, set.dst_bidx, array)
             };
             let privilege = stamped_privilege(set.opt);
-            let bytes = memory.read(privilege, source, set.acnt as usize);
+            let bytes = memory.read_or_zero(privilege, source, set.acnt as usize);
             memory.write(privilege, destination, &bytes);
         }
     }
@@ -1093,40 +1086,10 @@ mod tests {
     use crate::port::SlavePort;
     use std::collections::BTreeMap;
 
-    struct Memory(BTreeMap<u32, u8>);
+    type Memory = BTreeMap<u32, u8>;
 
-    impl TransferMemory for Memory {
-        fn read(&mut self, _privilege: Privilege, address: u32, length: usize) -> Vec<u8> {
-            self.dma_read_bytes(address, length)
-        }
-
-        fn write(&mut self, _privilege: Privilege, address: u32, bytes: &[u8]) {
-            self.dma_write_bytes(address, bytes);
-        }
-    }
-
-    impl Memory {
-        fn dma_read_bytes(&mut self, address: u32, length: usize) -> Vec<u8> {
-            (0..length)
-                .map(|offset| {
-                    *self
-                        .0
-                        .get(&address.wrapping_add(offset as u32))
-                        .unwrap_or(&0)
-                })
-                .collect()
-        }
-
-        fn dma_write_bytes(&mut self, address: u32, bytes: &[u8]) {
-            for (offset, byte) in bytes.iter().copied().enumerate() {
-                self.0.insert(address.wrapping_add(offset as u32), byte);
-            }
-        }
-
-        fn dma_read_u32(&mut self, address: u32) -> u32 {
-            u32::from_le_bytes(self.dma_read_bytes(address, 4).try_into().unwrap())
-        }
-    }
+    /// The identity the tests fill and inspect memory as; the sparse memory judges nothing.
+    const HOST: Privilege = Privilege::ID0_SUPERVISOR;
 
     /// A memory that notes the privilege each access was made with.
     struct Witness {
@@ -1134,8 +1097,12 @@ mod tests {
         seen: Vec<Privilege>,
     }
 
-    impl TransferMemory for Witness {
-        fn read(&mut self, privilege: Privilege, address: u32, length: usize) -> Vec<u8> {
+    impl MasterAccess for Witness {
+        fn byte_order(&self) -> crate::system::Endian {
+            self.memory.byte_order()
+        }
+
+        fn read(&mut self, privilege: Privilege, address: u32, length: usize) -> Option<Vec<u8>> {
             self.seen.push(privilege);
             self.memory.read(privilege, address, length)
         }
@@ -1164,7 +1131,7 @@ mod tests {
         let user_core_three = Privilege { id: 3, user: true };
         let supervisor_core_one = Privilege { id: 1, user: false };
         let mut memory = Witness {
-            memory: Memory(BTreeMap::new()),
+            memory: Memory::new(),
             seen: Vec::new(),
         };
         let mut edma = Edma::default();
@@ -1234,9 +1201,9 @@ mod tests {
     fn an_a_synchronised_transfer_moves_one_array_per_request() {
         // SPRU966C Table 2-7: an A-synchronised set submits BCNT x CCNT requests of ACNT bytes,
         // and Table 2-5 steps SRC and DST by the B indexes between them.
-        let mut memory = Memory(BTreeMap::new());
+        let mut memory = Memory::new();
         for offset in 0..8u32 {
-            memory.dma_write_bytes(0x1000 + offset, &[offset as u8 + 1]);
+            memory.write(HOST, 0x1000 + offset, &[offset as u8 + 1]);
         }
         let mut edma = Edma::default();
         edma.write(DCHMAP_BASE, 3 << 5, TEST_CONTEXT);
@@ -1258,8 +1225,8 @@ mod tests {
         edma.write(ESR, 1, TEST_CONTEXT);
         edma.tick(&mut memory);
         // The first request moved four bytes and left the second array pending.
-        assert_eq!(memory.dma_read_u32(0x2000), 0x0403_0201);
-        assert_eq!(memory.dma_read_u32(0x2004), 0);
+        assert_eq!(memory.read_word(HOST, 0x2000).unwrap(), 0x0403_0201);
+        assert_eq!(memory.read_word(HOST, 0x2004).unwrap(), 0);
         assert!(!edma.interrupt_pending());
         assert_eq!(
             edma.read(PARAM_BASE + 3 * 32 + 8, TEST_CONTEXT),
@@ -1268,7 +1235,7 @@ mod tests {
 
         edma.write(ESR, 1, TEST_CONTEXT);
         edma.tick(&mut memory);
-        assert_eq!(memory.dma_read_u32(0x2004), 0x0807_0605);
+        assert_eq!(memory.read_word(HOST, 0x2004).unwrap(), 0x0807_0605);
         // The final request raises the completion code and the null link empties the set.
         assert_eq!(edma.read(IPR, TEST_CONTEXT), Some(1 << 5));
         assert!(edma.interrupt_pending());
@@ -1285,9 +1252,9 @@ mod tests {
     fn an_ab_synchronised_transfer_moves_a_frame_per_request() {
         // SPRU966C Table 2-7: an AB-synchronised set submits CCNT requests of ACNT x BCNT
         // bytes, and only the C indexes step between them.
-        let mut memory = Memory(BTreeMap::new());
+        let mut memory = Memory::new();
         for offset in 0..16u32 {
-            memory.dma_write_bytes(0x3000 + offset, &[offset as u8]);
+            memory.write(HOST, 0x3000 + offset, &[offset as u8]);
         }
         let mut edma = Edma::default();
         edma.write(DCHMAP_BASE + 4, 1 << 5, TEST_CONTEXT);
@@ -1308,7 +1275,7 @@ mod tests {
         edma.write(ESR, 1 << 1, TEST_CONTEXT);
         edma.tick(&mut memory);
         // Two arrays of two bytes, four bytes apart at the source and two at the destination.
-        assert_eq!(memory.dma_read_u32(0x4000), 0x0504_0100);
+        assert_eq!(memory.read_word(HOST, 0x4000).unwrap(), 0x0504_0100);
         assert_eq!(edma.read(PARAM_BASE + 32 + 28, TEST_CONTEXT), Some(1));
         assert_eq!(edma.read(PARAM_BASE + 32 + 4, TEST_CONTEXT), Some(0x3008));
         assert_eq!(edma.read(PARAM_BASE + 32 + 12, TEST_CONTEXT), Some(0x4008));
@@ -1318,7 +1285,7 @@ mod tests {
     fn a_null_set_reports_a_missed_event() {
         // SPRU966C §2.3.3: a set whose three counts are zero moves nothing, sets the event
         // missed bit and leaves the channel in the secondary event register.
-        let mut memory = Memory(BTreeMap::new());
+        let mut memory = Memory::new();
         let mut edma = Edma::default();
         edma.write(DCHMAP_BASE + 4 * 7, 2 << 5, TEST_CONTEXT);
         edma.write(ESR, 1 << 7, TEST_CONTEXT);
@@ -1339,8 +1306,8 @@ mod tests {
         // intermediate/final classification for a null set's already-zero counts.
         for counts in [(0, 0), (0, 1)] {
             for enables in [0, OPT_TCINTEN | OPT_TCCHEN | OPT_ITCINTEN | OPT_ITCCHEN] {
-                let mut memory = Memory(BTreeMap::new());
-                memory.dma_write_bytes(0x1000, &[1, 2, 3, 4]);
+                let mut memory = Memory::new();
+                memory.write(HOST, 0x1000, &[1, 2, 3, 4]);
                 let mut edma = Edma::default();
                 edma.write(DCHMAP_BASE + 3 * 4, 1 << 5, TEST_CONTEXT);
                 program(
@@ -1377,11 +1344,11 @@ mod tests {
                     edma.read(SER, TEST_CONTEXT),
                     Some(u32::from(counts == (0, 0)))
                 );
-                assert_eq!(memory.dma_read_u32(0x2000), 0);
+                assert_eq!(memory.read_word(HOST, 0x2000).unwrap(), 0);
                 assert!(edma.take_serviced_request().is_none());
                 edma.tick(&mut memory);
                 assert_eq!(
-                    memory.dma_read_u32(0x3000),
+                    memory.read_word(HOST, 0x3000).unwrap(),
                     if enables == 0 { 0 } else { 0x0403_0201 }
                 );
             }
@@ -1397,7 +1364,7 @@ mod tests {
             for static_bit in [0, OPT_STATIC] {
                 for link in [32, NULL_LINK] {
                     for qdma in [false, true] {
-                        let mut memory = Memory(BTreeMap::new());
+                        let mut memory = Memory::new();
                         let mut edma = Edma::default();
                         let original = [static_bit, 0x1000, counts.0, 0x2000, 4, link, 8, counts.1];
                         let replacement = [OPT_STATIC, 0x3000, 0x10004, 0x4000, 4, NULL_LINK, 8, 1];
@@ -1448,7 +1415,7 @@ mod tests {
                                 Some(u32::from(static_bit == 0))
                             );
                         }
-                        assert!(memory.0.is_empty(), "zero-byte sets never move data");
+                        assert!(memory.is_empty(), "zero-byte sets never move data");
                     }
                 }
             }
@@ -1460,7 +1427,7 @@ mod tests {
         // SPRU966C sections 4.2.1.5, 4.2.4.1 and 4.2.4.2: a channel's DMAQNUM field picks the
         // queue, the entry records the event type and channel number, QSTAT reports the head
         // and the occupancy, and QUEPRI decides which queue is served first.
-        let mut memory = Memory(BTreeMap::new());
+        let mut memory = Memory::new();
         let mut edma = Edma::default();
         // Channel 1 to queue 0, channel 2 to queue 1.
         edma.write(DMAQNUM_BASE, 1 << 8, TEST_CONTEXT);
@@ -1504,7 +1471,7 @@ mod tests {
     fn a_queue_past_its_watermark_threshold_reports_an_error() {
         // SPRU966C Table 4-24: the queue threshold error stands once the occupancy reaches the
         // programmed watermark, and clearing it through CCERRCLR also clears the watermark.
-        let mut memory = Memory(BTreeMap::new());
+        let mut memory = Memory::new();
         let mut edma = Edma::default();
         edma.write(
             QWMTHRA,

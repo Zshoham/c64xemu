@@ -38,6 +38,7 @@ resolution, the SPLOOP buffer - belongs to [Execution and timing](execution.md).
 | board | `Board`, `Boot`, `BootSource` | `src/board.rs` | `from_args`, `start`; `Boot::holds_core_zero`, `tick`, progress, `report` |
 | fabric | `Fabric`, `Megamodule`, `Shared` | `src/system.rs` | `read32`/`write32` per requesting core, `tick(cycle)`, `raise(destination, event)` |
 | core bus | `CoreBus<'a>` | `src/system.rs` | everything one core may ask of the device, with its core index already bound |
+| master access | `MasterAccess`, `Privilege` | `src/system/master.rs` | `read`/`write(privilege, address, ...)`, `read_word`/`write_word`, `read_element`/`write_element`; the fabric is the one production implementation |
 | memory hierarchy | `MemoryHierarchy`, `BoundHierarchy` | `src/memory.rs` | `read_u32`, `fetch_packet`, `snoop_read`, `host_snoop_read`; timing: `note_load`, `note_store`, `data_stalls`, `fetch_stalls` |
 | backing store | `Backing` | `src/memory.rs` | `placement`, `read_bytes`, `write_bytes` by `Requester` |
 | address map | `AddressMap`, `Placement`, `Requester` | `src/space.rs` | which physical memory a requester's address lands in |
@@ -284,11 +285,10 @@ Given an address and a requester, this is which module answers:
 | The timing of those loads and stores | `CoreBus::note_load`/`note_store`/`data_stalls` → `MemoryHierarchy` (L1D bank conflict, write buffer, read-miss cost); the CPU adds the stall cycles it is told to `pending_stalls` |
 | CPU access inside that band | port walk → `Megamodule::cfg_*` → memory, as above |
 | CPU access to a restricted page | `Fabric::check_access` first; a violation latches MPFAR/MPFSR and raises the unit's event |
-| Word-wide master (HPI, IDMA) to memory (`is_memory`) | `Fabric::master_read32`/`master_write32` → privilege-ID-0 protection check → `dma_word`/`dma_store_word`, with the L2 snoop |
-| `TransferMemory` master (EDMA3) to memory | `TransferMemory::read`/`write` with the `Privilege` stamped on the PaRAM set → `requestor_read_bytes`/`requestor_write_bytes` → protection check → `dma_bytes`/`dma_store`, with the L2 snoop |
-| `DmaMemory` master (EMAC) to memory | `EmacMaster`: `dma_read_bytes`/`dma_write_bytes` and the descriptor words → PrivID 0 user-mode protection check → `dma_bytes`/`dma_store`/`dma_word`/`dma_store_word`, with the L2 snoop |
-| `master_*32` or `dma_*_bytes` to the configuration space | `Fabric::master_register_read`/`master_register_write`: the master's `Privilege` presented to the EDMA3, then the port walk; the megamodule registers (`0x0180_0000..0x01c0_0000`) read zero and ignore writes (SPRU871K section 5.3.1); anything else is device memory |
-| HPI host side | `Fabric::hpi_host_read`/`hpi_host_write` through `lend_hpi` → `hpi_read32`/`hpi_write32`, which drop accesses inside `DeviceProfile::host_excluded` (denied reads complete with zero) → `master_read32`/`master_write32` |
+| System master (HPI, IDMA, EDMA3, EMAC, UTOPIA PDMA) to memory (`is_memory`) | `MasterAccess for Fabric` (`src/system/master.rs`): `read`/`write` under the `Privilege` the master passes - HPI and IDMA ID 0 supervisor, EMAC and PDMA ID 0 user, the EDMA3 the one stamped on the PaRAM set → `admit`: the unit of the megamodule that owns the page judges every byte, and the first protected byte latches the fault and refuses the whole access → `memory_bytes`/`store_memory_bytes`, with the L2 snoop |
+| A word or an element of a master (`read_word`, `read_element`, and the writes) | The same access, with the bytes assembled in one place: a word is its four bytes in the device's byte order, an element narrower than a word (a PDMA switch element) is the low bytes right-justified in that order; a refused read is `None` |
+| System master to a peripheral aperture (`!is_memory`) | `register_word`/`store_register_word`: the master's `Privilege` presented to the EDMA3 (`present_to_edma`) and `Shared::touched`, then the port walk; the megamodule registers (`0x0180_0000..0x01c0_0000`) read zero and ignore writes (SPRU871K section 5.3.1); anything else is device memory, which is also where a lent-out master's own aperture lands. Not protected: protection judges memory pages only. A byte access is assembled around whole register words, and a word access is one access to the register |
+| HPI host side | `Fabric::hpi_host_read`/`hpi_host_write` through `lend_hpi` → `hpi_read32`/`hpi_write32`, which drop accesses inside `DeviceProfile::host_excluded` (denied reads complete with zero) → `read_word`/`write_word` as ID 0 supervisor |
 | Debugger or front-end read | `Fabric::host_read_bytes` - backing plus `host_snoop_read`, disturbing no cache state |
 
 A master that moves data - either MAC, the EDMA3, the HPI host side - is moved out of its slot
@@ -296,19 +296,21 @@ for the duration of its own transfer (`lend_emac`, `lend_edma`, `lend_hpi`), bec
 callback needs `&mut Fabric` to reach memory *and* registers. The consequence worth knowing is
 that the slot is empty while the callback runs, so a master is not addressable by its own
 transfer: an access to its own register block finds no port and falls through to memory behind
-the aperture.
+the aperture. Master access relies on exactly this for the EMAC's descriptor RAM, which sits in
+the MAC's own aperture: its descriptor words are reached like any register access a master
+makes, find no port, and are memory.
 
 ### Where snooping enters
 
 Coherence is applied by the fabric on the megamodule that owns the memory, and only there.
-`Fabric::snooped_l2` resolves a DMA address through the backing store and answers only for
-`Placement::CoreL2`; `dma_bytes` then calls `MemoryHierarchy::snoop_read` and `dma_store` calls
-`snoop_write` on that megamodule. So L2 SRAM is snooped against L1D, external memory is not
-snooped at all, and memory a core has converted into cache is not L2 SRAM and is not snooped
-either. On a multicore device the line may be tagged with the local or the global address
-depending on which the core used, so both are looked for. `host_read_bytes` and
-`host_write_bytes` do the same for the debug port, including on another core's memory.
-[Memory and caches](memory-and-caches.md) owns the protocol itself.
+`Fabric::snooped_l2` (`src/system/master.rs`) resolves a DMA address through the backing store
+and answers only for `Placement::CoreL2`; `memory_bytes` then calls
+`MemoryHierarchy::snoop_read` and `store_memory_bytes` calls `snoop_write` on that megamodule. So
+L2 SRAM is snooped against L1D, external memory is not snooped at all, and memory a core has
+converted into cache is not L2 SRAM and is not snooped either. On a multicore device the line may
+be tagged with the local or the global address depending on which the core used, so both are
+looked for. `host_read_bytes` and `host_write_bytes` do the same for the debug port, including on
+another core's memory. [Memory and caches](memory-and-caches.md) owns the protocol itself.
 
 ## The device profile
 
@@ -515,6 +517,7 @@ Every file in `src/`.
 | `sploop.rs` | The SPLOOP hardware loop buffer |
 | `sysclk3.rs` | The SYSCLK3 schedule: `Sysclk3Block` and `Clocked`, which keep the SYSCLK3 blocks out of the device tick on quiet edges |
 | `system.rs` | The fabric: megamodules, shared peripherals, the router, the device tick, event raising, and `CoreBus` |
+| `system/master.rs` | Master access: the `MasterAccess` trait every system master moves data through, `Privilege`, and the fabric's implementation - route, protection, snoop, byte order |
 | `timer.rs` | The 64-bit timers |
 | `trace.rs` | Execution tracing: one event stream, rendered as aligned text or JSON Lines |
 | `ui.rs` | The browser dashboard: the HTTP server and the JSON it serves |

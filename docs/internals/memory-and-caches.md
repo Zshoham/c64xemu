@@ -268,12 +268,12 @@ sees it.
 ## Coherence
 
 The protocol is what SPRU862B chapter 2 grants and nothing more: **L2 SRAM is snooped against
-L1D, nothing else is, and L1P is never snooped at all.** `src/system.rs` routes it. `snooped_l2`
-asks `Backing::placement` for the DMA address and answers only for `CoreL2`, so external memory
-is outside the protocol whatever the MAR says and memory the core has converted into cache is not
-L2 SRAM either. It returns the owning megamodule and the local address that core would have used,
-and `dma_bytes` and `dma_store` apply the snoop under both tags, because on a multicore device
-the line may be tagged with either.
+L1D, nothing else is, and L1P is never snooped at all.** `src/system/master.rs` (master access)
+routes it. `snooped_l2` asks `Backing::placement` for the DMA address and answers only for
+`CoreL2`, so external memory is outside the protocol whatever the MAR says and memory the core has
+converted into cache is not L2 SRAM either. It returns the owning megamodule and the local
+address that core would have used, and `memory_bytes` and `store_memory_bytes` apply the snoop
+under both tags, because on a multicore device the line may be tagged with either.
 
 - A DMA read is served from L1D where that line is dirty (`snoop_read` →
   `Cache::snoop_read_range`), so a buffer the CPU has only written into its cache still goes out
@@ -337,8 +337,8 @@ PDMA ID 0 user (SPRS612G section 5.2 and Table 5-3); `Privilege` carries the pai
 EDMA3's transfers are made for whoever programmed them: every write of a PaRAM word stamps PRIV
 and PRIVID into the set's OPT (bit 31, bits 27–24) from the identity the fabric last presented
 to the channel controller — a CPU access presents its core index and mode through
-`check_access`, a system master's register access its own through `master_register_read` and
-`master_register_write` — and `Edma::transfer` issues the reads and writes under the stamp the
+`check_access`, a system master's register access its own through master access
+(`register_word`/`store_register_word`) — and `Edma::transfer` issues the reads and writes under the stamp the
 set carries when the request runs, not the CPU's privilege at that moment (SPRU966C section
 2.10.2). Any new path into the EDMA3's slave port has to present its identity the same way, or
 it is judged and stamped as whoever came before it. The channel controller's own register
@@ -352,7 +352,7 @@ on L2, L1P, L1D, and 125, 121, 123 for a requester's. That event reaches the CPU
 through the exception combiner — see [Interrupts and exceptions](interrupts.md).
 
 The EMAC's descriptor words cross the same check as its packet buffers, with PrivID 0 in user
-mode (`EmacMaster::dma_read_u32`/`dma_write_u32`). A refused descriptor read returns zero, so a
+mode (`MasterAccess::read_word`/`write_word`). A refused descriptor read returns zero, so a
 transmit descriptor without UR sends nothing; the zero also reads as a descriptor the host did
 not hand over, which the model reports as the owner host error. Whether silicon raises that
 error for a faulted read is unverified, and no case pins it. A refused write is discarded, so
@@ -365,8 +365,8 @@ the EMAC's own descriptor RAM in the peripheral aperture, are not protected.
 `memory:emac-{tx,rx}-descriptor-without-user-read`, `-without-user-write` and
 `-with-user-access` cover both directions.
 
-Every system-master word - EMAC descriptor words and the HPI's and IDMA's
-`master_read32`/`master_write32` - is judged on all four of its bytes by `dma_access_allowed`,
+Every system-master word - EMAC descriptor words and the HPI's and IDMA's words - is judged on
+all four of its bytes by `admit`, the one judge of master access (`src/system/master.rs`),
 as byte transfers are. Each descriptor word is a separate access, so a descriptor that
 straddles a page boundary is judged word by word: a refused word reads as zero while its
 neighbours on the other page are read normally. SPRU871K does not say how an access spanning

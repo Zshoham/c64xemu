@@ -1,4 +1,5 @@
 use crate::port::{PortContext, PortWrite, SlavePort};
+use crate::system::{MasterAccess, Privilege};
 use std::collections::{BTreeMap, VecDeque};
 #[cfg(test)]
 const TEST_CONTEXT: PortContext = PortContext {
@@ -847,7 +848,7 @@ impl Emac {
             || self.rx_pause_timer != 0
     }
 
-    pub fn tick(&mut self, memory: &mut impl DmaMemory) {
+    pub fn tick(&mut self, memory: &mut impl MasterAccess) {
         self.process_pause_frame();
         self.update_flow_control();
         // TXPTYPE selects fixed priority (7 highest) or round robin. One complete packet
@@ -894,15 +895,19 @@ impl Emac {
         self.interrupt_pending() || ((!self.wrapper_control || self.ewctl & 1 != 0) && mdio_pending)
     }
 
-    fn process_tx(&mut self, memory: &mut impl DmaMemory, channel: usize) {
+    fn process_tx(&mut self, memory: &mut impl MasterAccess, channel: usize) {
         if self.tx_control == 0 || self.host_error() {
             return;
         }
         if self.tx_teardown & (1 << channel) != 0 {
             self.tx_teardown &= !(1 << channel);
             if self.tx_hdp[channel] != 0 {
-                let flags = memory.dma_read_u32(self.tx_hdp[channel] + 12);
-                memory.dma_write_u32(self.tx_hdp[channel] + 12, (flags & !OWNER) | TDOWNCMPLT);
+                let flags = dma_word(memory, self.tx_hdp[channel] + 12);
+                store_dma_word(
+                    memory,
+                    self.tx_hdp[channel] + 12,
+                    (flags & !OWNER) | TDOWNCMPLT,
+                );
             }
             self.tx_hdp[channel] = 0;
             self.tx_active &= !(1 << channel);
@@ -922,7 +927,7 @@ impl Emac {
             return;
         }
         let first = self.tx_hdp[channel];
-        let first_flags = memory.dma_read_u32(first + 12);
+        let first_flags = dma_word(memory, first + 12);
         // A queued descriptor the host did not hand over, or a first buffer without SOP, is a
         // host error rather than an empty queue (SPRU975E §2.16.1.4 and Table 58).
         if first_flags & OWNER == 0 {
@@ -938,10 +943,10 @@ impl Emac {
         let mut packet = Vec::with_capacity((first_flags & 0xffff) as usize);
         let last;
         loop {
-            let next = memory.dma_read_u32(descriptor);
-            let buffer = memory.dma_read_u32(descriptor + 4);
-            let offset_length = memory.dma_read_u32(descriptor + 8);
-            let flags_length = memory.dma_read_u32(descriptor + 12);
+            let next = dma_word(memory, descriptor);
+            let buffer = dma_word(memory, descriptor + 4);
+            let offset_length = dma_word(memory, descriptor + 8);
+            let flags_length = dma_word(memory, descriptor + 12);
             let offset = if descriptor == first {
                 offset_length >> 16
             } else {
@@ -956,15 +961,15 @@ impl Emac {
                 self.raise_tx_error(TXERR_LENGTH, channel);
                 return;
             }
-            packet.extend(memory.dma_read_bytes(buffer.wrapping_add(offset), length));
+            packet.extend(memory.read_or_zero(DMA_PRIVILEGE, buffer.wrapping_add(offset), length));
             if flags_length & EOP != 0 {
                 last = descriptor;
                 if next == 0 {
-                    memory.dma_write_u32(descriptor + 12, (flags_length & !OWNER) | EOQ);
+                    store_dma_word(memory, descriptor + 12, (flags_length & !OWNER) | EOQ);
                     self.tx_hdp[channel] = 0;
                     self.tx_active &= !(1 << channel);
                 } else {
-                    memory.dma_write_u32(descriptor + 12, flags_length & !OWNER);
+                    store_dma_word(memory, descriptor + 12, flags_length & !OWNER);
                     self.tx_hdp[channel] = next;
                     self.tx_active |= 1 << channel;
                 }
@@ -978,7 +983,7 @@ impl Emac {
         }
 
         if last != first {
-            memory.dma_write_u32(first + 12, first_flags & !OWNER);
+            store_dma_word(memory, first + 12, first_flags & !OWNER);
         }
         packet.truncate((first_flags & 0xffff) as usize);
         self.record_transmit(&packet);
@@ -986,7 +991,7 @@ impl Emac {
         self.tx_completion[channel] = last;
     }
 
-    fn process_rx(&mut self, memory: &mut impl DmaMemory) {
+    fn process_rx(&mut self, memory: &mut impl MasterAccess) {
         if self.rx_control == 0 || self.host_error() {
             return;
         }
@@ -998,8 +1003,12 @@ impl Emac {
             // teardown marker in the completion pointer (SPRU975E §2.11).
             self.rx_teardown &= !(1 << channel);
             if self.rx_hdp[channel] != 0 {
-                let flags = memory.dma_read_u32(self.rx_hdp[channel] + 12);
-                memory.dma_write_u32(self.rx_hdp[channel] + 12, (flags & !OWNER) | TDOWNCMPLT);
+                let flags = dma_word(memory, self.rx_hdp[channel] + 12);
+                store_dma_word(
+                    memory,
+                    self.rx_hdp[channel] + 12,
+                    (flags & !OWNER) | TDOWNCMPLT,
+                );
             }
             self.rx_hdp[channel] = 0;
             self.rx_completion[channel] = TEARDOWN_MARKER;
@@ -1087,7 +1096,7 @@ impl Emac {
         }
 
         let first = self.rx_hdp[channel];
-        if memory.dma_read_u32(first + 12) & OWNER == 0 {
+        if dma_word(memory, first + 12) & OWNER == 0 {
             return;
         }
         let mut frame = self.pop_received().unwrap().data;
@@ -1107,32 +1116,37 @@ impl Emac {
         let mut next_after = 0u32;
         let mut overrun = false;
         loop {
-            let flags = memory.dma_read_u32(descriptor + 12);
+            let flags = dma_word(memory, descriptor + 12);
             if flags & OWNER == 0 {
                 overrun = true;
                 break;
             }
-            let next = memory.dma_read_u32(descriptor);
-            let buffer = memory.dma_read_u32(descriptor + 4);
+            let next = dma_word(memory, descriptor);
+            let buffer = dma_word(memory, descriptor + 4);
             if buffer == 0 {
                 // A posted descriptor with no buffer is a receive host error (SPRU975E
                 // Table 58 code 4h).
                 self.raise_rx_error(RXERR_BUFFER, channel);
                 return;
             }
-            let capacity = (memory.dma_read_u32(descriptor + 8) & 0xffff) as usize;
+            let capacity = (dma_word(memory, descriptor + 8) & 0xffff) as usize;
             let offset = if descriptor == first {
                 self.rx_buffer_offset
             } else {
                 0
             };
             let fragment = (frame.len() - stored).min(capacity);
-            memory.dma_write_bytes(
+            memory.write(
+                DMA_PRIVILEGE,
                 buffer.wrapping_add(offset),
                 &frame[stored..stored + fragment],
             );
             let reported = if no_chain { frame.len() } else { fragment };
-            memory.dma_write_u32(descriptor + 8, (offset << 16) | (reported & 0xffff) as u32);
+            store_dma_word(
+                memory,
+                descriptor + 8,
+                (offset << 16) | (reported & 0xffff) as u32,
+            );
             stored += fragment;
             last = descriptor;
             next_after = next;
@@ -1160,7 +1174,7 @@ impl Emac {
 
         let mut walk = first;
         loop {
-            let flags = memory.dma_read_u32(walk + 12);
+            let flags = dma_word(memory, walk + 12);
             let mut updated = flags & !OWNER;
             if walk == first {
                 updated |= SOP | status | (reported_length & 0xffff) as u32;
@@ -1172,11 +1186,11 @@ impl Emac {
                 if next_after == 0 {
                     updated |= EOQ;
                 }
-                memory.dma_write_u32(walk + 12, updated);
+                store_dma_word(memory, walk + 12, updated);
                 break;
             }
-            memory.dma_write_u32(walk + 12, updated);
-            walk = memory.dma_read_u32(walk);
+            store_dma_word(memory, walk + 12, updated);
+            walk = dma_word(memory, walk);
         }
         self.rx_completion[channel] = last;
         self.rx_hdp[channel] = next_after;
@@ -1296,58 +1310,23 @@ fn channel_register(address: u32) -> Option<(u32, usize)> {
     None
 }
 
-pub trait DmaMemory {
-    fn dma_read_bytes(&mut self, address: u32, length: usize) -> Vec<u8>;
-    fn dma_write_bytes(&mut self, address: u32, bytes: &[u8]);
+/// The identity the EMACs' DMA runs under. Every peripheral master but the HPI and SRIO carries
+/// PrivID 0 (SPRS612G Table 5-3; on the C6455 every system master does, SPRS276M section 5.2),
+/// and the EMACs always transfer in user mode (SPRS612G section 5.2: "For most peripheral
+/// masters (EMAC0, EMAC1, UTOPIA, TSIP0, TSIP1, and TSIP2), the privilege mode is always user
+/// mode").
+const DMA_PRIVILEGE: Privilege = Privilege::ID0_USER;
 
-    fn dma_read_u32(&mut self, address: u32) -> u32 {
-        let bytes = self.dma_read_bytes(address, 4);
-        u32::from_le_bytes(bytes.try_into().unwrap())
-    }
-
-    fn dma_write_u32(&mut self, address: u32, value: u32) {
-        self.dma_write_bytes(address, &value.to_le_bytes());
-    }
+/// A descriptor word in the device's byte order, judged like the packet buffers; a refused one
+/// reads as zero. A descriptor in the EMAC's own descriptor RAM is a register-aperture access
+/// like any other the fabric makes for a master, which the empty slot of a lent-out EMAC turns
+/// into memory.
+fn dma_word(memory: &mut impl MasterAccess, address: u32) -> u32 {
+    memory.read_word(DMA_PRIVILEGE, address).unwrap_or(0)
 }
 
-impl DmaMemory for BTreeMap<u32, u8> {
-    fn dma_read_bytes(&mut self, address: u32, length: usize) -> Vec<u8> {
-        (0..length)
-            .map(|offset| {
-                self.get(&address.wrapping_add(offset as u32))
-                    .copied()
-                    .unwrap_or(0)
-            })
-            .collect()
-    }
-
-    fn dma_write_bytes(&mut self, address: u32, bytes: &[u8]) {
-        for (offset, byte) in bytes.iter().copied().enumerate() {
-            self.insert(address.wrapping_add(offset as u32), byte);
-        }
-    }
-}
-
-#[cfg(test)]
-fn read_u32(memory: &BTreeMap<u32, u8>, address: u32) -> u32 {
-    u32::from_le_bytes([
-        memory.get(&address).copied().unwrap_or(0),
-        memory.get(&address.wrapping_add(1)).copied().unwrap_or(0),
-        memory.get(&address.wrapping_add(2)).copied().unwrap_or(0),
-        memory.get(&address.wrapping_add(3)).copied().unwrap_or(0),
-    ])
-}
-
-#[cfg(test)]
-fn read_bytes(memory: &BTreeMap<u32, u8>, address: u32, length: usize) -> Vec<u8> {
-    (0..length)
-        .map(|offset| {
-            memory
-                .get(&address.wrapping_add(offset as u32))
-                .copied()
-                .unwrap_or(0)
-        })
-        .collect()
+fn store_dma_word(memory: &mut impl MasterAccess, address: u32, value: u32) {
+    memory.write_word(DMA_PRIVILEGE, address, value);
 }
 
 #[cfg(test)]
@@ -1510,7 +1489,7 @@ mod tests {
         // SPRU975E §2.5.5: a receive packet fills as many descriptors as it needs; the first
         // carries SOP and the packet length, the last carries EOP and, when the chain ends
         // there, EOQ. The buffer offset applies to the start of the packet only.
-        let mut memory = BTreeMap::new();
+        let mut memory: BTreeMap<u32, u8> = BTreeMap::new();
         let mut emac = Emac::default();
         // A twenty-byte frame is short, so RXCSFEN has to be set for it to reach memory.
         emac.write(RXMBPENABLE, RXMBP_PROMISCUOUS | RXMBP_CSFEN, TEST_CONTEXT);
@@ -1524,10 +1503,10 @@ mod tests {
         for slot in 0..3u32 {
             let descriptor = 0x1000 + slot * 16;
             let next = if slot == 2 { 0 } else { descriptor + 16 };
-            memory.dma_write_u32(descriptor, next);
-            memory.dma_write_u32(descriptor + 4, 0x2000 + slot * 0x100);
-            memory.dma_write_u32(descriptor + 8, 8);
-            memory.dma_write_u32(descriptor + 12, OWNER);
+            store_dma_word(&mut memory, descriptor, next);
+            store_dma_word(&mut memory, descriptor + 4, 0x2000 + slot * 0x100);
+            store_dma_word(&mut memory, descriptor + 8, 8);
+            store_dma_word(&mut memory, descriptor + 12, OWNER);
         }
         emac.write(RXHDP_BASE, 0x1000, TEST_CONTEXT);
         let frame: Vec<u8> = (0..20u8).collect();
@@ -1535,16 +1514,19 @@ mod tests {
         emac.tick(&mut memory);
 
         // Eight, eight and four bytes, the first fragment two bytes into its buffer.
-        assert_eq!(read_u32(&memory, 0x1008), (2 << 16) | 8);
-        assert_eq!(read_u32(&memory, 0x1018), 8);
-        assert_eq!(read_u32(&memory, 0x1028), 4);
-        assert_eq!(read_bytes(&memory, 0x2002, 8), frame[..8]);
-        assert_eq!(read_bytes(&memory, 0x2100, 8), frame[8..16]);
-        assert_eq!(read_bytes(&memory, 0x2200, 4), frame[16..]);
+        assert_eq!(dma_word(&mut memory, 0x1008), (2 << 16) | 8);
+        assert_eq!(dma_word(&mut memory, 0x1018), 8);
+        assert_eq!(dma_word(&mut memory, 0x1028), 4);
+        let landed = |memory: &mut BTreeMap<u32, u8>, address, length| {
+            memory.read_or_zero(DMA_PRIVILEGE, address, length)
+        };
+        assert_eq!(landed(&mut memory, 0x2002, 8), frame[..8]);
+        assert_eq!(landed(&mut memory, 0x2100, 8), frame[8..16]);
+        assert_eq!(landed(&mut memory, 0x2200, 4), frame[16..]);
 
-        let first = memory.dma_read_u32(0x100c);
-        let middle = memory.dma_read_u32(0x101c);
-        let last = memory.dma_read_u32(0x102c);
+        let first = dma_word(&mut memory, 0x100c);
+        let middle = dma_word(&mut memory, 0x101c);
+        let last = dma_word(&mut memory, 0x102c);
         assert_eq!(first & (SOP | EOP | OWNER), SOP);
         // The class and match flags the frame arrived with land in the SOP descriptor.
         assert_eq!(first & (UNDERSIZED | NOMATCH), UNDERSIZED | NOMATCH);

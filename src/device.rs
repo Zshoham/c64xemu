@@ -651,7 +651,7 @@ impl Device {
 mod tests {
     use super::*;
     use crate::memory::{L1DCFG, L1PCFG, L2CFG};
-    use crate::system::Endian;
+    use crate::system::{Endian, MasterAccess, Privilege};
 
     /// Boot controller registers (SPRS612G section 3.9) and the chip-level inter-processor
     /// interrupt registers (section 3.7.2).
@@ -938,9 +938,10 @@ mod tests {
                         );
                     }
                     // The host filter must not leak into the IDMA's word-access path.
-                    device.fabric().master_write32(address, attempted);
+                    let idma = Privilege::ID0_SUPERVISOR;
+                    device.fabric().write_word(idma, address, attempted);
                     assert_eq!(device.cpu_mut().bus_mut().read32(address), attempted);
-                    assert_eq!(device.fabric().master_read32(address), Some(attempted));
+                    assert_eq!(device.fabric().read_word(idma, address), Some(attempted));
                 }
                 // The port remains usable for boot-image memory after denied accesses.
                 host_set(&mut device, 0x0080_1000, 0x1234_5678);
