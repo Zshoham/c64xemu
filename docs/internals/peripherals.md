@@ -275,8 +275,12 @@ source, but the mask registers and their write-one-to-clear pairing are exactly 
 The two DDR2 profiles share an address window, not register values. C6455 remains the default
 profile; C6472 selects its own MIDR and reset values, and its SDCFG includes EBANK at bit 3 plus
 BOOT_UNLOCK-gated DDR2 fields. C6472 DMCCTL exposes RL in bits 2:0; its other bits retain the
-documented reset value. These are functional register semantics only. The C6472 DDR2 data path,
-reset initialization progress and interface-ready transition are not yet cycle-modeled.
+documented reset value. IFRDY follows the C6472 SDCFG enable fields, not DMCCTL bit 5. Since this
+model has no DDR clock or initialization sequencer, the write that enables SDRAM, DDR and DDR2
+marks the initialization complete immediately. The C6472 DDR2 data path and initialization
+timing remain unmodeled. SPRU894J §4.3's introductory paragraph says TIMUNLOCK=0 is unlocked,
+but Table 20's TIMUNLOCK field and CL field plus §2.11.3's setup sequence say 1 unlocks timing
+registers and CL; the model follows those explicit field/sequence descriptions.
 
 ## Device configuration
 

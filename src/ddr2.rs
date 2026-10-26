@@ -30,8 +30,9 @@ const DMCCTL: u32 = BASE + 0xe4;
 const MIDR_VALUE: u32 = (0x0031 << 16) | (0x03 << 8) | 0x0f;
 /// C6472 module id 034h, major revision 0Bh, minor revision 1Fh (SPRU894J Figure 19).
 const C6472_MIDR_VALUE: u32 = (0x0034 << 16) | (0x0b << 8) | 0x1f;
-/// DMCSTAT bit 30 always reads one, bit 31 carries the endianness and bit 2 the interface-ready
-/// status (SPRU970G Table 19).
+/// DMCSTAT bit 30 reads one on the C6455 (SPRU970G Table 19); on the C6472 it is the
+/// DUAL_CLK_MODE input and has reset value one (SPRU894J Figure 20). Bit 31 is endianness and
+/// bit 2 is interface-ready on both devices.
 const DMCSTAT_ONES: u32 = 1 << 30;
 const DMCSTAT_BIG_ENDIAN: u32 = 1 << 31;
 const DMCSTAT_IFRDY: u32 = 1 << 2;
@@ -53,6 +54,8 @@ const DMCCTL_IFRESET: u32 = 1 << 5;
 /// SDCFG locks: BOOT_UNLOCK guards bits 22-16 and TIMUNLOCK the timing registers.
 const SDCFG_BOOT_UNLOCK: u32 = 1 << 23;
 const SDCFG_TIMUNLOCK: u32 = 1 << 15;
+const SDCFG_CL: u32 = 0x7 << 9;
+const C6472_SDCFG_ENABLES: u32 = (1 << 20) | (1 << 17) | (1 << 16);
 /// A refresh rate below 100h is replaced by twice the refresh cycle time SDTIM1 holds
 /// (SPRU970G Table 21).
 const REFRESH_FLOOR: u32 = 0x0100;
@@ -79,6 +82,10 @@ enum DeviceKind {
 
 pub struct Ddr2 {
     device: DeviceKind,
+    /// C6472 IFRDY is independent of DMCCTL.RL. The untimed model marks the interface ready
+    /// once software enables SDRAM, DDR and DDR2 in SDCFG; the register write stands in for the
+    /// completion of the documented initialization sequence.
+    interface_ready: bool,
     config: u32,
     refresh: u32,
     timing1: u32,
@@ -112,6 +119,7 @@ impl Ddr2 {
         };
         Self {
             device,
+            interface_ready: false,
             config,
             refresh,
             timing1,
@@ -130,10 +138,14 @@ impl SlavePort for Ddr2 {
                 DeviceKind::C6472 => C6472_MIDR_VALUE,
             },
             DMCSTAT => {
-                // The interface logic is ready once software has released its reset.
+                // C6455 exposes IFRESET in DMCCTL; C6472 reserves those DMCCTL bits and reports
+                // IFRDY separately after its SDCFG-controlled initialization.
                 DMCSTAT_ONES
                     | (u32::from(context.endian == Endian::Big) * DMCSTAT_BIG_ENDIAN)
-                    | (u32::from(self.control & DMCCTL_IFRESET == 0) * DMCSTAT_IFRDY)
+                    | (u32::from(match self.device {
+                        DeviceKind::C6455 => self.control & DMCCTL_IFRESET == 0,
+                        DeviceKind::C6472 => self.interface_ready,
+                    }) * DMCSTAT_IFRDY)
             }
             SDCFG => self.config,
             SDRFC => self.refresh,
@@ -154,6 +166,12 @@ impl SlavePort for Ddr2 {
                 // PAGESIZE; the reserved fields keep their reset values, and DDR_DRIVE only
                 // moves when the same write unlocks it (SPRU970G Table 20).
                 let mut writable = SDCFG_BOOT_UNLOCK | SDCFG_TIMUNLOCK | (1 << 14) | 0xe77;
+                if self.device == DeviceKind::C6472 && self.config & SDCFG_TIMUNLOCK == 0 {
+                    // SPRU894J Table 20 explicitly gates CL with TIMUNLOCK. The prose above
+                    // Table 20 says TIMUNLOCK=0 is unlocked, but the field description and
+                    // initialization sequence both define 1 as unlocked; follow those specifics.
+                    writable &= !SDCFG_CL;
+                }
                 if self.device == DeviceKind::C6472 {
                     // SPRU894J Table 20 adds EBANK at bit 3 and DDR2_TERM[1] at bit 27.
                     writable |= 1 << 3;
@@ -165,6 +183,11 @@ impl SlavePort for Ddr2 {
                     };
                 }
                 self.config = (self.config & !writable) | (value & writable);
+                if self.device == DeviceKind::C6472 {
+                    // With no DDR clock/sequencer timing in this model, complete the documented
+                    // reset/configuration initialization at the enabling SDCFG write.
+                    self.interface_ready = self.config & C6472_SDCFG_ENABLES == C6472_SDCFG_ENABLES;
+                }
             }
             SDRFC => {
                 let rate = value & 0xffff;
@@ -335,6 +358,48 @@ mod tests {
         assert_eq!(
             ddr2.read(SDTIM2, LITTLE_CONTEXT),
             Some(0x7654_3210 & 0x01ff_ffff)
+        );
+    }
+
+    #[test]
+    fn c6472_cas_latency_is_locked_until_timunlock_was_set() {
+        let mut ddr2 = Ddr2::c6472();
+        let initial = ddr2.read(SDCFG, LITTLE_CONTEXT).unwrap();
+        ddr2.write(SDCFG, (initial & !SDCFG_CL) | (5 << 9), LITTLE_CONTEXT);
+        assert_eq!(ddr2.read(SDCFG, LITTLE_CONTEXT), Some(initial));
+
+        ddr2.write(SDCFG, initial | SDCFG_TIMUNLOCK, LITTLE_CONTEXT);
+        ddr2.write(
+            SDCFG,
+            (initial & !SDCFG_CL) | SDCFG_TIMUNLOCK | (5 << 9),
+            LITTLE_CONTEXT,
+        );
+        assert_eq!(
+            ddr2.read(SDCFG, LITTLE_CONTEXT),
+            Some((initial & !SDCFG_CL) | SDCFG_TIMUNLOCK | (5 << 9))
+        );
+    }
+
+    #[test]
+    fn c6472_ifrdy_follows_the_untimed_sdcfg_initialization() {
+        let mut ddr2 = Ddr2::c6472();
+        assert_eq!(ddr2.read(DMCSTAT, LITTLE_CONTEXT), Some(1 << 30));
+
+        let partial = C6472_SDCFG_RESET | SDCFG_BOOT_UNLOCK | (1 << 17) | (1 << 16);
+        ddr2.write(SDCFG, partial, LITTLE_CONTEXT);
+        assert_eq!(ddr2.read(DMCSTAT, LITTLE_CONTEXT), Some(1 << 30));
+
+        ddr2.write(SDCFG, partial | (1 << 20), LITTLE_CONTEXT);
+        assert_eq!(
+            ddr2.read(DMCSTAT, LITTLE_CONTEXT),
+            Some((1 << 30) | DMCSTAT_IFRDY)
+        );
+
+        // DMCCTL.RL is writable on C6472, but reserved bit 5 does not release IFRDY.
+        ddr2.write(DMCCTL, 0, LITTLE_CONTEXT);
+        assert_eq!(
+            ddr2.read(DMCSTAT, LITTLE_CONTEXT),
+            Some((1 << 30) | DMCSTAT_IFRDY)
         );
     }
 }
