@@ -55,6 +55,7 @@ const DMCCTL_IFRESET: u32 = 1 << 5;
 /// BOOT_UNLOCK guards each profile's `boot_locked` SDCFG bits; TIMUNLOCK guards SDTIM1/SDTIM2.
 const SDCFG_BOOT_UNLOCK: u32 = 1 << 23;
 const SDCFG_TIMUNLOCK: u32 = 1 << 15;
+const C6472_SDCFG_ENABLES: u32 = (1 << 20) | (1 << 17) | (1 << 16);
 /// A refresh rate below 100h is replaced by twice the refresh cycle time SDTIM1 holds
 /// (SPRU970G Table 21).
 const REFRESH_FLOOR: u32 = 0x0100;
@@ -92,6 +93,9 @@ pub(crate) struct Ddr2Profile {
     boot_locked: u32,
     /// DMCCTL writable bits (SPRU970G/SPRU894J Table 25).
     control_mask: u32,
+    /// None derives IFRDY from IFRESET=0 (SPRU970G Tables 19/25); Some(mask)
+    /// requires all SDCFG mask bits, the untimed C6472 approximation (SPRU894J §2.11.3).
+    ready_enables: Option<u32>,
 }
 /// C6455 DDR2 register contract (SPRU970G §4).
 pub(crate) static C6455_DDR2: Ddr2Profile = Ddr2Profile {
@@ -103,6 +107,7 @@ pub(crate) static C6455_DDR2: Ddr2Profile = Ddr2Profile {
     writable: SDCFG_BOOT_UNLOCK | SDCFG_TIMUNLOCK | (1 << 14) | 0xe77,
     boot_locked: 1 << 18,
     control_mask: 0xffff,
+    ready_enables: None,
 };
 /// C6472 DDR2 register contract (SPRU894J §4).
 pub(crate) static C6472_DDR2: Ddr2Profile = Ddr2Profile {
@@ -114,10 +119,15 @@ pub(crate) static C6472_DDR2: Ddr2Profile = Ddr2Profile {
     writable: SDCFG_BOOT_UNLOCK | SDCFG_TIMUNLOCK | (1 << 14) | 0xe7f,
     boot_locked: (1 << 27) | (0x7f << 16),
     control_mask: 7,
+    ready_enables: Some(C6472_SDCFG_ENABLES),
 };
 
 pub struct Ddr2 {
     profile: &'static Ddr2Profile,
+    /// C6472 IFRDY is independent of DMCCTL.RL. The untimed model marks the interface ready
+    /// once software enables SDRAM, DDR and DDR2 in SDCFG; the register write stands in for the
+    /// completion of the documented initialization sequence.
+    interface_ready: bool,
     config: u32,
     refresh: u32,
     timing1: u32,
@@ -143,6 +153,7 @@ impl Ddr2 {
     pub(crate) fn new(profile: &'static Ddr2Profile) -> Self {
         Self {
             profile,
+            interface_ready: false,
             config: profile.sdcfg_reset,
             refresh: profile.sdrfc_reset,
             timing1: profile.sdtim1_reset,
@@ -158,11 +169,14 @@ impl SlavePort for Ddr2 {
         let value = match address {
             MIDR => self.profile.midr,
             DMCSTAT => {
-                // The interface logic is ready once software has released IFRESET. The C6472
-                // reserves that DMCCTL bit, so it does not report ready through it.
+                // C6455 exposes IFRESET in DMCCTL; C6472 reserves those DMCCTL bits and reports
+                // IFRDY separately after its SDCFG-controlled initialization.
                 DMCSTAT_ONES
                     | (u32::from(context.endian == Endian::Big) * DMCSTAT_BIG_ENDIAN)
-                    | (u32::from(self.control & DMCCTL_IFRESET == 0) * DMCSTAT_IFRDY)
+                    | (u32::from(match self.profile.ready_enables {
+                        None => self.control & DMCCTL_IFRESET == 0,
+                        Some(_) => self.interface_ready,
+                    }) * DMCSTAT_IFRDY)
             }
             SDCFG => self.config,
             SDRFC => self.refresh,
@@ -188,6 +202,11 @@ impl SlavePort for Ddr2 {
                     writable |= self.profile.boot_locked;
                 }
                 self.config = (self.config & !writable) | (value & writable);
+                if let Some(enables) = self.profile.ready_enables {
+                    // With no DDR clock/sequencer timing in this model, complete the documented
+                    // reset/configuration initialization at the enabling SDCFG write.
+                    self.interface_ready = self.config & enables == enables;
+                }
             }
             SDRFC => {
                 let rate = value & 0xffff;
@@ -304,8 +323,27 @@ mod tests {
     }
 
     #[test]
-    fn c6472_boot_locked_and_reserved_sdcfg_bits() {
-        // SPRU894J Table 20: boot-locked fields and reserved bits.
+    fn c6472_enable_subsets_and_boot_bits() {
+        // SPRU894J §2.11.3/Table 20: enable subsets, non-sticky IFRDY and boot locks.
+        for subset in 0..8 {
+            let mut d = Ddr2::c6472();
+            let enables = ((subset & 1) << 16) | ((subset & 2) << 16) | ((subset & 4) << 18);
+            d.write(
+                SDCFG,
+                0x00200420 | SDCFG_BOOT_UNLOCK | enables,
+                LITTLE_CONTEXT,
+            );
+            assert_eq!(
+                d.read(DMCSTAT, LITTLE_CONTEXT),
+                Some(if subset == 7 {
+                    DMCSTAT_ONES | DMCSTAT_IFRDY
+                } else {
+                    DMCSTAT_ONES
+                })
+            );
+            d.write(SDCFG, 0x00a00420, LITTLE_CONTEXT);
+            assert_eq!(d.read(DMCSTAT, LITTLE_CONTEXT), Some(DMCSTAT_ONES));
+        }
         for bit in [27, 22, 21, 20, 19, 18, 17, 16] {
             let mut d = Ddr2::c6472();
             let changed = 0x00200420 ^ (1 << bit);
@@ -426,5 +464,38 @@ mod tests {
             ddr2.write(SDCFG, value & !SDCFG_TIMUNLOCK, LITTLE_CONTEXT);
             assert_eq!(ddr2.read(SDCFG, LITTLE_CONTEXT), Some(0x00200820));
         }
+    }
+
+    #[test]
+    fn c6472_ifrdy_follows_the_untimed_sdcfg_initialization() {
+        let mut ddr2 = Ddr2::c6472();
+        assert_eq!(ddr2.read(DMCSTAT, LITTLE_CONTEXT), Some(1 << 30));
+
+        // Section 2.11.3 first sets BOOT_UNLOCK and TIMUNLOCK, then programs the SDCFG
+        // fields while clearing BOOT_UNLOCK. The final write starts initialization.
+        let initial = ddr2.read(SDCFG, LITTLE_CONTEXT).unwrap();
+        ddr2.write(
+            SDCFG,
+            initial | SDCFG_BOOT_UNLOCK | SDCFG_TIMUNLOCK,
+            LITTLE_CONTEXT,
+        );
+        assert_eq!(ddr2.read(DMCSTAT, LITTLE_CONTEXT), Some(1 << 30));
+
+        ddr2.write(
+            SDCFG,
+            initial | (1 << 20) | (1 << 17) | (1 << 16) | SDCFG_TIMUNLOCK,
+            LITTLE_CONTEXT,
+        );
+        assert_eq!(
+            ddr2.read(DMCSTAT, LITTLE_CONTEXT),
+            Some((1 << 30) | DMCSTAT_IFRDY)
+        );
+
+        // DMCCTL.RL is writable on C6472, but reserved bit 5 does not release IFRDY.
+        ddr2.write(DMCCTL, 0, LITTLE_CONTEXT);
+        assert_eq!(
+            ddr2.read(DMCSTAT, LITTLE_CONTEXT),
+            Some((1 << 30) | DMCSTAT_IFRDY)
+        );
     }
 }
