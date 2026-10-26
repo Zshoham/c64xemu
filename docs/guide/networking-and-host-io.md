@@ -85,10 +85,11 @@ then started with `--net-unix /tmp/c64xemu.sock --net-peer /tmp/tap.sock`.
 The host port interface is driven from a process over a second Unix datagram socket:
 `--hpi-unix PATH`, `--hpi-peer PATH`, `--hpi-poll CYCLES`.
 
-**One datagram is one host access**, five bytes: `[direction, port, 0, 0, value]`, where
-direction is `r` or `w` and port is the HCNTL encoding from
+**One datagram is one host access**, eight bytes: `[direction, port, 0, 0, value]`, where value
+is a little-endian 32-bit word, direction is `r` or `w` and port is the HCNTL encoding from
 [SPRU969B](../reference/spru969b.pdf) Table 4 — 0 HPIC, 1 HPID with autoincrement, 2 HPIA, 3 HPID
-without autoincrement. That is all a host needs to reach DSP memory and to exchange interrupts
+without autoincrement. A read is answered with the four-byte value, or an empty datagram while
+the host is held off. That is all a host needs to reach DSP memory and to exchange interrupts
 with the CPU: write HPIA, then read or write HPID.
 
 `tests/tools/hpi_host.py --image <image>` is the host half of a mailbox built on exactly that: it
