@@ -33,6 +33,7 @@ resolution, the SPLOOP buffer - belongs to [Execution and timing](execution.md).
 | Layer | Type | File | Seam it presents |
 |---|---|---|---|
 | machine | `Machine`, `MachineArgs` | `src/machine.rs` | `load`, `arm_halt`, `run`/`resume(&mut [StopCondition])`, `snapshot`, `state_json` |
+| host connections | `HostConnections`, `Wiring` | `src/host.rs` | `open`, `install`, `retire`, `service(fabric, cycle)`, `next_due(cycle)`, the Ethernet history, capture and `finish` the state report and front ends read |
 | device | `Device`, `DeviceProfile` | `src/device.rs` | `on_board`, `run_cycles`, `step_cycle`, `halted_core`, `focus`/`set_focus`, `with_core`, `boot`, focused-megamodule views, loading, `fabric` |
 | board | `Board`, `Boot`, `BootSource` | `src/board.rs` | `from_args`, `start`; `Boot::holds_core_zero`, `tick`, progress, `report` |
 | fabric | `Fabric`, `Megamodule`, `Shared` | `src/system.rs` | `read32`/`write32` per requesting core, `tick(cycle)`, `raise(destination, event)` |
@@ -85,8 +86,27 @@ device's own operations on the focused megamodule, so the machine never reaches 
 bus to read them. `set_focus` moves the fabric so the newly focused core is inspected and driven
 exactly like the old one. Loading goes through the device as well (`load_image`,
 `load_boot_table`, `apply_boot_configuration`, `configure_caches`); the machine reaches
-`Device::fabric()` only to hand it to a host connection - the Ethernet backend, the HPI host
-side and the UTOPIA ATM master - which attach to the fabric rather than to any core.
+`Device::fabric()` only to hand it to the host connections, which attach to the fabric rather than
+to any core.
+
+### Host connections
+
+`HostConnections` (`src/host.rs`) is the set of host-side connections attached to the fabric: the
+Ethernet backend (`netio.rs`), the HPI host and the UTOPIA's ATM master. The machine opens it
+from the command line, lends it the device's fabric and the run clock, and asks two things of
+it: `service(fabric, cycle)`, which does whatever is due in one fixed order - Ethernet, HPI,
+UTOPIA - and `next_due(cycle)`, how many cycles the device may run before a connection is due,
+`None` when nothing attached polls. Behind it, `HpiHost` and `AtmMaster` decode their datagram
+protocols, perform each request through the fabric's `hpi_host_*` and `utopia_master_*`
+operations and reply, over a `HostLink` that only moves datagrams; the machine knows neither
+wire format. `install` and `retire` mark a device being rebuilt: polls restart and the pcap input
+is preloaded, or the old device's transmitted frames are archived.
+
+The 4096-cycle batch cap stays in the machine: it bounds how long the run loop goes without
+its own stop checks (SIGTERM, fault, exit point, halt), and applies with nothing attached. The
+CIO handshake is not a host connection - any core can reach it - so `Machine::pump_cio` answers
+it on the core that did. `Machine::service_host` is the one place both run loops call to serve
+the connections and then CIO, so a stepped cycle and a batch service identically.
 
 ### The board and its boot
 
@@ -382,9 +402,10 @@ boot and its counter cannot pace a poll or end a budget.
 
 Both operations share a fast path. With only a `Budget` member and neither Ethernet history nor exception
 tracing on, `resume_budget` runs batches of up to 4096 cycles between service points instead of
-re-evaluating the set every cycle, clamping the batch to the next Ethernet poll, the next HPI
-poll and the deadline. Outside that path, one cycle is `Machine::step`: poll the Ethernet
-backend, poll the HPI host side, pump the CIO handshake, then `Device::step_cycle`.
+re-evaluating the set every cycle, clamping the batch to `HostConnections::next_due` and the
+deadline. Outside that path, one cycle is `Machine::step`: `Machine::service_host` - the host
+connections, then the CIO handshake - then `Device::step_cycle`. Both paths serve through
+`service_host`.
 
 A batch run therefore reports one of the stop reasons as its outcome. A spent budget is an error
 exit with the state report already written:
@@ -470,6 +491,7 @@ Every file in `src/`.
 | `events.rs` | The device event map: peripheral source to system event, destination and EDMA3 channel |
 | `gdb.rs` | The GDB remote serial protocol stub over TCP |
 | `gpio.rs` | The general-purpose input/output peripheral and its edge detection |
+| `host.rs` | The host connections attached to the fabric: `HostConnections` serves the Ethernet backend, the HPI host (`HpiHost`) and the UTOPIA's ATM master (`AtmMaster`) in one order and answers when the next is due; the HPI and ATM datagram protocols live here |
 | `hpi.rs` | The host port interface, both sides of it |
 | `i2c.rs` | The I2C module, and the EEPROM a board puts on the bus |
 | `i2cboot.rs` | The ROM bootloader's I2C EEPROM boot mode, C6455 and C6472, and the C6472's handover to UTOPIA boot |
@@ -479,7 +501,7 @@ Every file in `src/`.
 | `mcbsp.rs` | The two multichannel buffered serial ports |
 | `mdio.rs` | The MDIO module and the PHY on the other end of it |
 | `memory.rs` | The memory hierarchy - L1P, L1D, L2, MAR bits, cache configuration - the backing store, and access timing |
-| `netio.rs` | The Ethernet backend: receive admission, TX capture and handoff, live history and polling, with a private Unix-datagram `Bridge`; `HostLink`, the polled datagram channel the HPI host and the UTOPIA's ATM master use |
+| `netio.rs` | The Ethernet backend: receive admission, TX capture and handoff, live history and polling, with a private Unix-datagram `Bridge`; `HostLink`, the polled datagram channel under the HPI host and the ATM master, which moves datagrams and leaves their meaning to `host.rs` |
 | `pcap.rs` | pcap file reading and writing |
 | `pdma.rs` | The C6472 UTOPIA PDMA: channel proxies, receive and transmit bursts, ABU/block addressing and interrupts |
 | `pll.rs` | The PLL1 controller with its reset controller register, and PLL2 |

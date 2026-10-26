@@ -25,6 +25,7 @@ mod emifa;
 mod events;
 mod gdb;
 mod gpio;
+mod host;
 mod hpi;
 mod i2c;
 mod i2cboot;

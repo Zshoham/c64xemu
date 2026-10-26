@@ -7,7 +7,8 @@
 //!
 //! `Bridge` carries one raw Ethernet frame per datagram, retaining its socket retry/drop
 //! policy. `tests/tools/tap_bridge.py` can relay these frames to a TAP without emulator
-//! privileges. `HostLink` is the separate datagram adapter for the HPI host and the ATM master.
+//! privileges. `HostLink` is the separate datagram channel under the HPI host and the ATM
+//! master; `host.rs` owns what those two say over it and which connection is due when.
 
 use std::io::ErrorKind;
 use std::os::unix::net::{SocketAddr, UnixDatagram};
@@ -400,9 +401,10 @@ impl Drop for Bridge {
 }
 
 /// A datagram channel for an external peripheral master - the HPI host, the UTOPIA's ATM
-/// master - polled on its own schedule. The caller interprets requests; replies go to the
-/// configured peer or the sender of the most recently received datagram.
-pub struct HostLink {
+/// master - polled on its own schedule. It moves datagrams and knows nothing of what they say;
+/// the adapter that owns it interprets requests. Replies go to the configured peer or the
+/// sender of the most recently received datagram.
+pub(crate) struct HostLink {
     socket: UnixDatagram,
     bound: PathBuf,
     peer: Option<PathBuf>,
@@ -411,7 +413,11 @@ pub struct HostLink {
 }
 
 impl HostLink {
-    pub fn bind(path: &Path, peer: Option<&Path>, poll_interval: u64) -> Result<Self, String> {
+    pub(crate) fn bind(
+        path: &Path,
+        peer: Option<&Path>,
+        poll_interval: u64,
+    ) -> Result<Self, String> {
         if path.exists() {
             std::fs::remove_file(path).map_err(|error| format!("{}: {error}", path.display()))?;
         }
@@ -444,23 +450,8 @@ impl HostLink {
         self.poll.delay(cycle)
     }
 
-    /// The next HPI access: direction, port and little-endian value.
-    pub fn receive(&mut self) -> Option<(u8, u8, u32)> {
-        let mut bytes = [0; 16];
-        while let Some(length) = self.receive_datagram(&mut bytes) {
-            if length >= 8 {
-                return Some((
-                    bytes[0],
-                    bytes[1],
-                    u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
-                ));
-            }
-        }
-        None
-    }
-
     /// Receive into the caller's bounded buffer without allocating.
-    pub fn receive_datagram(&mut self, bytes: &mut [u8]) -> Option<usize> {
+    pub(crate) fn receive_datagram(&mut self, bytes: &mut [u8]) -> Option<usize> {
         loop {
             match self.socket.recv_from(bytes) {
                 Ok((length, from)) => {
@@ -475,7 +466,7 @@ impl HostLink {
         }
     }
 
-    pub fn reply(&mut self, bytes: &[u8]) {
+    pub(crate) fn reply(&mut self, bytes: &[u8]) {
         let _ = match (&self.peer, &self.learned) {
             (Some(peer), _) => self.socket.send_to(bytes, peer),
             (None, Some(address)) => match address.as_pathname() {

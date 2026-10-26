@@ -109,15 +109,24 @@ No other module knows which boot is running. `Boot` in `board.rs`.
 _Avoid_: ROM boot (for the whole; that is one kind), boot state
 
 **machine**:
-The module every front end drives: a loaded image, the CPU, and the host connections the
-device needs — the CIO handshake, the Ethernet backend, the HPI host side, the UTOPIA's ATM
-master, the trace sink.
-It owns the halt rule and the state snapshot, so the batch runner, the console debugger,
-the browser dashboard and the GDB stub all run through the same seam.
+The module every front end drives: a loaded image, the CPU, the host connections the device
+needs, the CIO handshake and the trace sink. It owns the run clock, the halt rule and the state
+snapshot, so the batch runner, the console debugger, the browser dashboard and the GDB stub all
+run through the same seam. Before each cycle, or batch of cycles, it serves the host connections
+and then the CIO handshake, the same way on both run paths.
 _Avoid_: emulator, session, driver
 
+**host connections**:
+The host-side connections attached to the fabric rather than to any core: the Ethernet backend,
+the HPI host and the UTOPIA's ATM master. The machine lends them the fabric and the run clock;
+they serve whatever is due in one fixed order (Ethernet, HPI, UTOPIA) and say how many cycles the
+device may run before the next is due. Each is an adapter over a socket or file; the HPI and ATM
+datagram protocols live behind them, so the machine knows no wire format. The CIO handshake is
+not one: it is answered on whichever core reached it. `HostConnections` in `host.rs`.
+_Avoid_: host link (that is the datagram channel under two of them), peripherals, host I/O
+
 **Ethernet backend**:
-The host-side module that exchanges frames with the fabric: it admits live received frames when the MAC has room, retains every transmitted frame for capture, and keeps a separate bounded history for inspection. Its socket adapter moves datagrams, while the machine supplies the emulated clock and the fabric owns the MAC's silicon behavior.
+The host-side module that exchanges frames with the fabric: it admits live received frames when the MAC has room, retains every transmitted frame for capture, and keeps a separate bounded history for inspection. It is one of the host connections; its socket adapter moves datagrams, while the machine supplies the emulated clock and the fabric owns the MAC's silicon behavior.
 _Avoid_: network service, frame broker
 
 **halt rule**:

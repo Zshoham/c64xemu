@@ -1,11 +1,12 @@
 //! The machine every front end drives, and the command-line options that build it.
 //!
 //! A loaded image, a CPU, and the host connections the device needs - the CIO handshake, the
-//! Ethernet backend, the HPI host side, the trace sink - are the same thing whether the caller
-//! is the batch runner, the console debugger, the browser dashboard or the GDB stub. They live
-//! here once, so `--pcap-in`, `--net-unix`, `--hpi-unix`, `--boot-table` and `--trace` mean the
-//! same in every subcommand. Drivers update their breakpoint addresses when the list changes,
-//! then run or resume with stop conditions and read the snapshot; halt lifecycle stays here.
+//! Ethernet backend, the HPI host side, the UTOPIA's ATM master, the trace sink - are the same
+//! thing whether the caller is the batch runner, the console debugger, the browser dashboard or
+//! the GDB stub. They live here once, so `--pcap-in`, `--net-unix`, `--hpi-unix`,
+//! `--utopia-unix`, `--boot-table` and `--trace` mean the same in every subcommand. Drivers
+//! update their breakpoint addresses when the list changes, then run or resume with stop
+//! conditions and read the snapshot; halt lifecycle stays here.
 
 use crate::board::{Board, BootSource};
 use crate::cache::CacheView;
@@ -15,10 +16,10 @@ use crate::cpu::Cpu;
 use crate::cpu::{CpuSnapshot, StatsCounters};
 use crate::device::{Device, DeviceProfile};
 use crate::elf::{Image, Segment};
-use crate::netio::{hex, Ethernet, EthernetFiles, HostLink};
+use crate::host::{Endpoint, HostConnections, Wiring};
+use crate::netio::{hex, EthernetFiles};
 use crate::system::{Endian, Fabric};
 use crate::trace::Trace;
-use crate::utopia::{CELL_BYTES, MAX_CELL_BYTES, NULL_PHY};
 use crate::view::{SploopDump, UnitIssue};
 use clap::{Args, ValueEnum};
 use serde_json::{json, Value};
@@ -226,9 +227,8 @@ pub struct Machine {
     cio: Option<(u32, u32)>,
     /// Everything the program has written through CIO, for the state dump.
     cio_output: Vec<u8>,
-    ethernet: Ethernet,
-    host_link: Option<HostLink>,
-    utopia_link: Option<HostLink>,
+    /// The Ethernet backend, the HPI host and the ATM master the device is attached to.
+    host: HostConnections,
     trace_exceptions: bool,
     profiling: bool,
     trace: Option<(PathBuf, bool, Option<usize>, u64)>,
@@ -287,6 +287,11 @@ pub enum StopReason {
     Terminated,
 }
 
+/// The most cycles the budget path hands the device before it looks at its stop checks again
+/// (SIGTERM, fault, exit point, halt). Host connections clip a batch shorter when one is due
+/// sooner; the cap itself is the run loop's, not a host polling interval.
+const BATCH_CYCLES: u64 = 4096;
+
 impl Machine {
     pub fn load(path: &Path, args: &MachineArgs) -> Result<Self, String> {
         let image = Image::load(path)?;
@@ -338,28 +343,26 @@ impl Machine {
             by_address,
             cio,
             cio_output: Vec::new(),
-            ethernet: Ethernet::open(
-                args.net_poll,
+            host: HostConnections::open(Wiring {
+                net_poll: args.net_poll,
                 net_port,
-                EthernetFiles {
+                net: EthernetFiles {
                     pcap_in: args.pcap_in.as_deref(),
                     pcap_out: args.pcap_out.as_deref(),
                     socket: args.net_unix.as_deref(),
                     peer: args.net_peer.as_deref(),
                 },
-            )?,
-            host_link: match &args.hpi_unix {
-                Some(path) => Some(HostLink::bind(
-                    path,
-                    args.hpi_peer.as_deref(),
-                    args.hpi_poll,
-                )?),
-                None => None,
-            },
-            utopia_link: match &args.utopia_unix {
-                Some(path) => Some(HostLink::bind(path, None, args.utopia_poll)?),
-                None => None,
-            },
+                hpi: args.hpi_unix.as_deref().map(|socket| Endpoint {
+                    socket,
+                    peer: args.hpi_peer.as_deref(),
+                    poll: args.hpi_poll,
+                }),
+                utopia: args.utopia_unix.as_deref().map(|socket| Endpoint {
+                    socket,
+                    peer: None,
+                    poll: args.utopia_poll,
+                }),
+            })?,
             trace_exceptions: args.trace_exceptions,
             profiling: args.profile,
             trace: args.trace.as_ref().map(|path| {
@@ -427,9 +430,7 @@ impl Machine {
             by_address: Vec::new(),
             cio: None,
             cio_output: Vec::new(),
-            ethernet: Ethernet::offline(),
-            host_link: None,
-            utopia_link: None,
+            host: HostConnections::offline(),
             trace_exceptions: false,
             profiling: false,
             trace: None,
@@ -462,8 +463,7 @@ impl Machine {
     pub fn reload(&mut self) -> Result<(), String> {
         let trace = std::mem::replace(self.device.cpu_mut().trace_mut(), Trace::off());
         // Frames the old device transmitted belong in the TX archive before it is rebuilt.
-        self.with_ethernet(Ethernet::collect);
-        self.ethernet.reset_history();
+        self.with_host(HostConnections::retire);
         // Rebuilding the device also rebuilds its CPUs, including their fetch-halt sets.
         let result = self.install();
         self.install_halt(false);
@@ -483,13 +483,6 @@ impl Machine {
         self.device = Device::on_board(&self.board, self.entry, endian);
         let profiling = self.profiling;
         self.device.cpu_mut().set_profiling(profiling);
-        self.ethernet.reset_poll();
-        for link in [&mut self.host_link, &mut self.utopia_link]
-            .into_iter()
-            .flatten()
-        {
-            link.reset_poll();
-        }
         if let Some((table, address)) = &self.boot_config {
             // The configuration table runs before the boot table, which is the order the ROM
             // uses when a boot parameter block asks for one (SPRUEC6G sections 2.3.4, 6.2.3).
@@ -514,7 +507,7 @@ impl Machine {
             // Nothing to preload: the host, bus or network supplies the image during boot.
             Load::Wire => {}
         }
-        self.with_ethernet(Ethernet::preload);
+        self.with_host(HostConnections::install);
         if let Some((path, json, ring, start)) = self.trace.clone() {
             self.open_trace(&path, json, ring, start)
                 .map_err(|error| format!("{}: {error}", path.display()))?;
@@ -523,15 +516,10 @@ impl Machine {
     }
 
     fn step(&mut self) -> Result<(), String> {
-        self.with_ethernet(Ethernet::service);
-        self.service_host_port();
-        self.service_utopia_master();
-        self.pump_cio()?;
+        self.service_host()?;
         // Every core out of reset runs this cycle, and the shared peripherals advance once.
         self.device.step_cycle();
-        if self.ethernet.history_enabled() {
-            self.with_ethernet(Ethernet::collect);
-        }
+        self.with_host(HostConnections::after_cycle);
         if self.trace_exceptions {
             if let Some(cause) = self.device.cpu_mut().take_exception_cause() {
                 eprintln!("exception at {:#010x}: {cause}", self.device.cpu_mut().pc());
@@ -551,87 +539,22 @@ impl Machine {
         }
     }
 
-    /// The Ethernet backend with the device's fabric and the run clock it measures by. The
-    /// machine chooses the clock; the backend owns poll scheduling and frame lifetimes.
-    fn with_ethernet<R>(
+    /// The host connections with the device's fabric and the run clock they measure by. The
+    /// machine chooses the clock; the connections own poll scheduling and what they say.
+    fn with_host<R>(
         &mut self,
-        operation: impl FnOnce(&mut Ethernet, &mut Fabric, u64) -> R,
+        operation: impl FnOnce(&mut HostConnections, &mut Fabric, u64) -> R,
     ) -> R {
         let cycle = self.run_clock();
-        operation(&mut self.ethernet, self.device.fabric(), cycle)
+        operation(&mut self.host, self.device.fabric(), cycle)
     }
 
-    fn service_host_port(&mut self) {
-        let cycle = self.run_clock();
-        let Some(link) = self.host_link.as_mut() else {
-            return;
-        };
-        if !link.take_due(cycle) {
-            return;
-        }
-        while let Some((direction, port, value)) = link.receive() {
-            let Some(port) = host_port(port) else {
-                continue;
-            };
-            // The host port is the device's, not any core's: the host link attaches to the
-            // fabric like the Ethernet backend and the ATM master.
-            let fabric = self.device.fabric();
-            if direction == b'r' {
-                match fabric.hpi_host_read(port) {
-                    Some(value) => link.reply(&value.to_le_bytes()),
-                    None => link.reply(&[]),
-                }
-            } else {
-                fabric.hpi_host_write(port, value);
-            }
-        }
-    }
-
-    /// The ATM master's requests, one datagram each: the opcode, the five-bit PHY address it
-    /// drives, and for a write the cell's wire bytes. The replies are the address phase's
-    /// answer - URCLAV/UXCLAV, or nothing for a high-impedance pin - and the transfer's.
-    fn service_utopia_master(&mut self) {
-        const REQUEST_HEADER: usize = 2;
-        const INVALID: u8 = 0xff;
-        let cycle = self.run_clock();
-        let Some(link) = self.utopia_link.as_mut() else {
-            return;
-        };
-        if !link.take_due(cycle) {
-            return;
-        }
-        // One byte past the longest request, so an oversized cell is seen even when recv_from
-        // truncates the datagram.
-        let mut bytes = [0; REQUEST_HEADER + MAX_CELL_BYTES + 1];
-        let shortest_write = REQUEST_HEADER + CELL_BYTES;
-        let longest_write = REQUEST_HEADER + MAX_CELL_BYTES;
-        while let Some(length) = link.receive_datagram(&mut bytes) {
-            if length < REQUEST_HEADER || bytes[1] > NULL_PHY {
-                link.reply(&[INVALID]);
-                continue;
-            }
-            let (opcode, phy) = (bytes[0], bytes[1]);
-            let fabric = self.device.fabric();
-            match (opcode, length) {
-                (b'p', REQUEST_HEADER) => match fabric.utopia_master_poll_receive(phy) {
-                    Some(room) => link.reply(&[u8::from(room)]),
-                    None => link.reply(&[]),
-                },
-                (b'w', _) if (shortest_write..=longest_write).contains(&length) => {
-                    let accepted = fabric.utopia_master_send_cell(phy, &bytes[2..length]);
-                    link.reply(&[u8::from(accepted)]);
-                }
-                (b'x', REQUEST_HEADER) => match fabric.utopia_master_poll_transmit(phy) {
-                    Some(waiting) => link.reply(&[u8::from(waiting)]),
-                    None => link.reply(&[]),
-                },
-                (b'r', REQUEST_HEADER) => match fabric.utopia_master_take_cell(phy) {
-                    Some(cell) => link.reply(cell.bytes()),
-                    None => link.reply(&[0]),
-                },
-                _ => link.reply(&[INVALID]),
-            }
-        }
+    /// What the device is owed before a cycle runs, whichever run loop is running it: the host
+    /// connections that are due, then the CIO handshake. Answers whether a core was parked on the
+    /// handshake, which the batched loop uses to let the next batch's first cycle past it.
+    fn service_host(&mut self) -> Result<bool, String> {
+        self.with_host(HostConnections::service);
+        self.pump_cio()
     }
 
     /// Answers the RTS library's CIO request on every core the program has parked on the
@@ -674,11 +597,11 @@ impl Machine {
 
     pub(crate) fn enable_ethernet_history(&mut self) {
         let cycle = self.run_clock();
-        self.ethernet.enable_history(cycle);
+        self.host.enable_history(cycle);
     }
 
     pub(crate) fn ethernet_history_json(&mut self) -> Value {
-        self.with_ethernet(Ethernet::history_json)
+        self.with_host(HostConnections::history_json)
     }
 
     /// Flushes the trace and writes any captured frames. Every front end calls this on the way
@@ -686,7 +609,7 @@ impl Machine {
     /// behind as a batch run.
     pub fn finish(&mut self) -> Result<(), String> {
         self.device.cpu_mut().trace_mut().flush();
-        self.with_ethernet(Ethernet::finish)
+        self.with_host(HostConnections::finish)
     }
 
     /// Bytes written through the TI RTS CIO channel during this run.
@@ -759,7 +682,7 @@ impl Machine {
     fn run_until_stop(&mut self, conditions: &mut [StopCondition]) -> Result<StopReason, String> {
         let start_cycles = self.run_clock();
         let start_packets = self.device.cpu_mut().packets_executed();
-        if !self.ethernet.history_enabled() && !self.trace_exceptions {
+        if !self.host.history_enabled() && !self.trace_exceptions {
             if let [StopCondition::Budget(budget)] = conditions {
                 return self.resume_budget(start_cycles, *budget);
             }
@@ -828,17 +751,11 @@ impl Machine {
                 return Ok(StopReason::Budget);
             }
 
-            self.with_ethernet(Ethernet::service);
-            self.service_host_port();
-            self.service_utopia_master();
-            let handled_cio = self.pump_cio()?;
+            let handled_cio = self.service_host()?;
 
-            let mut batch = 4096u64;
-            if let Some(delay) = self.ethernet.poll_delay(current) {
+            let mut batch = BATCH_CYCLES;
+            if let Some(delay) = self.host.next_due(current) {
                 batch = batch.min(delay);
-            }
-            for link in [&self.host_link, &self.utopia_link].into_iter().flatten() {
-                batch = batch.min(link.poll_delay(current));
             }
             if let Some(limit) = deadline {
                 batch = batch.min(limit.saturating_sub(current).max(1));
@@ -1114,9 +1031,8 @@ impl Machine {
     /// The machine state a batch run reports, and the same JSON the debugger's `state` command
     /// writes: one description of a finished program, whoever ran it.
     pub fn state_json(&mut self, profile: bool) -> Value {
-        let tx_frames: Vec<String> = self.with_ethernet(|ethernet, fabric, cycle| {
-            ethernet
-                .transmitted(fabric, cycle)
+        let tx_frames: Vec<String> = self.with_host(|host, fabric, cycle| {
+            host.transmitted(fabric, cycle)
                 .iter()
                 .map(|frame| hex(frame))
                 .collect()
@@ -1139,7 +1055,7 @@ impl Machine {
             "registers": registers,
             "cio_output": String::from_utf8_lossy(&self.cio_output),
             "tx_frames": tx_frames,
-            "net_dropped": self.ethernet.dropped(),
+            "net_dropped": self.host.dropped(),
             "device": snapshot.device,
             "cores": snapshot.cores,
             "stats": snapshot.stats,
@@ -1384,17 +1300,6 @@ fn non_zero_cycles(text: &str) -> Result<u64, String> {
         Ok(0) => Err("poll interval must be at least one cycle".into()),
         Ok(cycles) => Ok(cycles),
         Err(_) => Err(format!("invalid cycle count {text}")),
-    }
-}
-
-/// The HCNTL encoding a host process sends, as SPRU969B Table 4 numbers it.
-fn host_port(code: u8) -> Option<crate::hpi::HostPort> {
-    match code {
-        0 => Some(crate::hpi::HostPort::Control),
-        1 => Some(crate::hpi::HostPort::DataAutoIncrement),
-        2 => Some(crate::hpi::HostPort::Address),
-        3 => Some(crate::hpi::HostPort::Data),
-        _ => None,
     }
 }
 
@@ -1681,6 +1586,50 @@ mod tests {
                     address: 0
                 })
             );
+        }
+    }
+
+    /// The stepped and the batched run loops serve the same connections: a host request waiting
+    /// when the run starts is answered by whichever one runs, and the host connections do not
+    /// stop either from reaching its budget.
+    #[test]
+    fn both_run_loops_serve_the_host_connections() {
+        use std::os::unix::net::UnixDatagram;
+        for batched in [false, true] {
+            let directory = std::env::temp_dir()
+                .join(format!("c64xemu-machine-{}-{batched}", std::process::id()));
+            std::fs::create_dir_all(&directory).unwrap();
+            let emulator = directory.join("hpi");
+            let host_path = directory.join("host");
+            let host = UnixDatagram::bind(&host_path).unwrap();
+            host.set_nonblocking(true).unwrap();
+            let mut machine = Machine::bare(Cpu::new(0));
+            machine.device.cpu_mut().write_words(0, &[0; 200]);
+            machine.host = HostConnections::open(Wiring {
+                net_poll: 1,
+                net_port: 0,
+                net: EthernetFiles::default(),
+                hpi: Some(Endpoint {
+                    socket: &emulator,
+                    peer: None,
+                    poll: 10,
+                }),
+                utopia: None,
+            })
+            .unwrap();
+            // HPIC read, with the software reset released so the host gets an answer.
+            machine.device.fabric().write32(0, 0x0288_0030, 0);
+            host.send_to(&[b'r', 0, 0, 0, 0, 0, 0, 0], &emulator)
+                .unwrap();
+            let mut conditions = vec![StopCondition::Budget(25)];
+            if !batched {
+                conditions.push(StopCondition::Packets(100));
+            }
+            assert_eq!(machine.run(&mut conditions).unwrap(), StopReason::Budget);
+            assert_eq!(machine.cycles(), 25);
+            let mut reply = [0; 16];
+            assert_eq!(host.recv(&mut reply).unwrap(), 4, "batched {batched}");
+            std::fs::remove_dir_all(&directory).unwrap();
         }
     }
 

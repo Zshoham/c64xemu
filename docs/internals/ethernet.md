@@ -403,17 +403,19 @@ selected MAC's FIFO can take the next one, then `inject_frame_on` delivers it. `
 frames are injected at load instead, all at once. Enabling history records that preload
 without injecting it again.
 
-The run loop polls on a cycle boundary, not from a thread. `Ethernet::service` does nothing
-until its `PollSchedule` is due, then advances it by `--net-poll` cycles (default 1024). The
-machine uses `poll_delay` to clip each batch to the next poll without inspecting socket or
-queue state; the HPI host link clips with its own `PollSchedule` the same way. The clock
-remains the focused core's cycle count, or the device's while a ROM boot holds core 0. One
-poll drains the socket, delivers what fits, collects transmitted frames, sends them, and
-flushes anything a full peer socket refused earlier. `--net-port` selects the MAC.
+The run loop polls on a cycle boundary, not from a thread. `HostConnections::service` runs
+`Ethernet::service` first, and that does nothing until its `PollSchedule` is due, then advances
+it by `--net-poll` cycles (default 1024). The machine asks `HostConnections::next_due` how long
+a batch may run and clips it there without inspecting socket or queue state; the HPI host link
+and the ATM master each have their own `PollSchedule` behind the same call. The clock remains
+the focused core's cycle count, or the device's while a ROM boot holds core 0. One poll drains
+the socket, delivers what fits, collects transmitted frames, sends them, and flushes anything a
+full peer socket refused earlier. `--net-port` selects the MAC.
 
-Reload first collects what the old fabric transmitted, then preserves the host backlog, socket
-and complete TX archive, while resetting the poll deadline and live-history sequence and
-preloading the `--pcap-in` frames into the rebuilt fabric.
+Reload first collects what the old fabric transmitted (`HostConnections::retire`), then
+preserves the host backlog, socket and complete TX archive, while resetting the poll deadline
+and live-history sequence and preloading the `--pcap-in` frames into the rebuilt fabric
+(`HostConnections::install`).
 
 ## What the suite pins
 
