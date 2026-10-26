@@ -85,9 +85,14 @@ the receiver can tell who called. `NMIGRn` is the same shape for a non-maskable 
 
 ## Shared memory and power
 
-The shared-memory controller owns the 768 KB SL2 and its per-core page ownership, arbitration and
-atomic monitors. The power/sleep controller can stop a core's clock: stage `MDCTLn.NEXT`, write
-the domain's GO bit in `PTCMD`, poll `PTSTAT.GOSTAT`, read the reached state from `MDSTATn.STATE`.
+Every access to the 768 KB SL2 goes through the shared-memory controller: it wakes the page the
+access lands in, counts the read in the requesting core's profiler, and judges LL, SL and CMTL
+with its atomic monitors - a second SL after a stored link breaks the link, so the commit
+returns 0 and stores nothing. A User-mode write to one of its supervisor-only registers is
+refused, recorded in SL2MPFSR and SL2MPFAR, and raised as event 63 in all six cores. Prefetch
+and arbitration are not modelled. The power/sleep controller can stop a core's clock: stage
+`MDCTLn.NEXT`, write the domain's GO bit in `PTCMD`, poll `PTSTAT.GOSTAT`, read the reached state
+from `MDSTATn.STATE`.
 Both are in [Peripherals](../internals/peripherals.md).
 
 ## Six cores at the front ends

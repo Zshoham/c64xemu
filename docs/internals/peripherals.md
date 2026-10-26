@@ -298,14 +298,20 @@ which is real state the model has.
 | Power/sleep controller, `src/psc.rs` | `02AE 0000h` | a global PSC owning every register plus one local PSC per clock domain; software stages MDCTLn.NEXT, writes the domain's GO bit in PTCMD, PTSTAT.GOSTAT reads 1 in flight, MDSTATn.STATE reports what was reached ([SPRUEG3B](../reference/sprueg3b.pdf) §4.1.2 and §9.6) |
 | Shared-memory controller, `src/smc.rs` | control at `02AA 8000h` (32K), profilers SMCP0-5 at `02C2 0000h` + 16K per core | the SL2 register file and the six per-core profilers on the UMAP1 interface |
 
-The SMC module is the register file plus the queries the device model is meant to drive it with.
-It models neither the SL2 storage nor the prefetch buffers, arbitration, write token controller or
-wait states of [SPRUEG5D](../reference/sprueg5d.pdf) §2.3 to §2.5. The queries it exposes
-(`prefetchable_pages`, `page_sleep_state`, `note_protection_fault`, the link monitor and
-`SharedMemoryProfiler::note_access`) are compiled for the unit tests only: nothing in the memory
-path calls them yet, so the register file is real and its effects are not (see the ROADMAP item
-*The SMC is a register file nothing drives*). SPRUEG5D gives no base addresses at all; both come
-from SPRS612G Table 2-2.
+The SMC module is the register file plus what the fabric drives it with on the SL2 access path
+(see [Memory and caches](memory-and-caches.md)): the atomic-access monitors answer LL, SL and CMTL
+(`load_link`, `store_link`, `commit_link`), an access wakes its page and is served and counted
+(`request`, `SharedMemoryProfiler::note_access`), and a User-mode write to SL2PFCPEN,
+SL2PFCFLUSH, SL2PDSLEEP0-5 or SL2PDWAKE0-5 is refused and latched (`refuse_user_write`).
+Event 63 (`EventMap::smc_fault`) is a level the device tick raises in all six megamodules for as
+long as SL2MPFSR holds a fault; event 64 is each profiler's own. It does not model the SL2
+storage or the prefetch buffers, arbitration, write token controller or further wait states of
+[SPRUEG5D](../reference/sprueg5d.pdf) §2.3 to §2.5, so nothing prefetches: SL2PFCPEN and
+SL2PFCFLUSH are registers that change no access and SL2PFCCNT never counts. SPRUEG5D gives no
+base addresses at all; both come from SPRS612G Table 2-2. The choices the guide leaves open -
+which address bits select a bank, which addresses a power-down page covers, which megamodule a
+master's request enters through, and which registers are supervisor-only beyond the four it
+names - are stated where they are made in `smc.rs`.
 
 The C6455's equivalent of the chip configuration block is `src/devcfg.rs` at a different address
 with different fields. The two devices share no register there beyond the idea.

@@ -43,6 +43,14 @@ _Avoid_: memory, RAM, physical memory
 The per-device table that answers which physical memory an access lands in, given the requester and the address: the local windows a megamodule sees, the global alias block a multicore device gives every core's memories, the shared memories, and the DDR2 window. It deliberately does not canonicalise the aliases away, because two addresses for one byte are two cache tags on silicon.
 _Avoid_: memory map, decoder
 
+**shared-memory controller**:
+The C6472's SMC, the block every access to the shared L2 (SL2) passes through on its way to the backing store (`smc.rs`): the register file, one atomic-access monitor per bank, the page power state, and the six per-core profilers that sit on each megamodule's request path. It stores nothing - the bytes are the backing store's - and judges nothing a master does, because it has no memory protection of its own (SPRUEG5D section 1.2); what it refuses is a User-mode CPU write to one of its supervisor-only registers, which it latches and raises as system event 63 in every megamodule. The fabric asks it on every CPU and master access that names SL2 and is not answered by the megamodule's own caches, in terms of an offset into the shared RAM, so the local window and every core's global alias of one word are one address to it. A device without one (the C6455) has no SL2 and nothing to ask.
+_Avoid_: SL2 controller, shared memory (which is the storage)
+
+**linked reservation**:
+What LL, SL and CMTL judge, and the one place each device keeps it. On SL2 it is the shared-memory controller's atomic-access monitor for the word's bank: shared by all six cores, one owner at a time, and answering by SPRUEG5D Tables 3 and 4 (a second SL breaks the link, a store by anyone does not). Everywhere else it is the megamodule's own `LinkReservation`, checked against the backing store's per-word write stamps, which any master's write moves. The CPU holds neither: it asks the fabric through the core bus (`load_link`, `store_link`, `commit_link`) and is told whether a commit succeeded and what to store.
+_Avoid_: lock, semaphore, exclusive monitor
+
 **privilege**:
 The identity memory protection judges an access by: a PrivID (a core's index, 0 for the system masters, the programmer's for an EDMA3 transfer) and a user or supervisor mode. It is not the requester, which only chooses the address view an access resolves through in the address map; the two travel separately because one master can issue accesses under another's privilege.
 _Avoid_: AID for the PrivID itself (an AID is the page-attribute bit a PrivID is checked against)

@@ -307,7 +307,11 @@ def dumped(stderr: str, address: int) -> list[int]:
             collecting = line.startswith(f"dump {address:#010x}")
             continue
         if collecting and line.strip():
-            words.extend(int(word, 16) for word in line.split()[1:])
+            try:
+                words.extend(int(word, 16) for word in line.split()[1:])
+            except ValueError:
+                # The run's own closing line (a cycle limit, say) is not part of the dump.
+                collecting = False
     return words
 
 
@@ -626,3 +630,131 @@ def test_c6472_timers_all_count_alike(
         f"the twelve timers disagree by {spread} counts: {deltas}"
     )
     assert worst == 0, f"the firmware's own check found a deviation of {worst} thousandths"
+
+
+SMC_FIRMWARE = ROOT / "tests/firmware/c6472_smc"
+
+
+@pytest.fixture(scope="module")
+def smc_firmware(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """The shared-memory controller firmware: C for the experiments, assembly for the three atomic
+    instructions and the User-mode store, which cl6x has no way to say.
+
+    It uses the C6472 rendezvous firmware's memory map - code and data in the local 608 KB L2, the
+    results in the shared window at a fixed address - and leaves every cache off, as reset does.
+    """
+    program = Program(
+        name="c6472_smc",
+        weight=0,
+        sources=(str(SMC_FIRMWARE / "main.c"), str(SMC_FIRMWARE / "atomics.asm")),
+        includes=(),
+        cflags=("-O1",),
+        link_flags=(),
+        entry="_c_int00",
+        max_cycles=5_000_000,
+        opt_levels=("-O1",),
+        rts=True,
+        expect={},
+        cio_output=None,
+        rx_frames=(),
+        tx_frames=None,
+        boot_table=None,
+        boot_config=None,
+        link_cmd=str(SMC_FIRMWARE / "link.cmd"),
+    )
+    workdir = tmp_path_factory.mktemp("c6472-smc")
+    image = build_target_program(program, workdir)
+    if image is None:
+        pytest.skip("could not build the C6472 shared-memory controller firmware")
+    return image
+
+
+# `struct results` of tests/firmware/c6472_smc/main.c, in word order.
+SMC_RESULT_FIELDS = (
+    "word",
+    "loaded",
+    "contended_cmtl",
+    "memory_after",
+    "link_data",
+    "link_status",
+    "control_cmtl",
+    "control_memory",
+    "supervisor_flag",
+    "prefetch_enable",
+    "fault_status",
+    "fault_address",
+) + tuple(f"seen{core}" for core in range(CORES)) + tuple(
+    f"done{core}" for core in range(CORES)
+)
+
+
+@pytest.fixture(scope="module")
+def smc_results(candidate_binary: Path, smc_firmware: Path) -> dict[str, int]:
+    """Run the firmware on the six-core device, cores 1-5 held until core 0 releases them."""
+    completed = subprocess.run(
+        [
+            str(candidate_binary),
+            "run",
+            str(smc_firmware),
+            "--device",
+            "c6472",
+            "--boot-mode",
+            "4",
+            "--max-cycles",
+            "5000000",
+            "--dump",
+            f"0x00200000:{4 * len(SMC_RESULT_FIELDS)}",
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    words = dumped(completed.stderr, 0x0020_0000)
+    assert len(words) == len(SMC_RESULT_FIELDS), completed.stderr
+    return dict(zip(SMC_RESULT_FIELDS, words))
+
+
+def test_c6472_a_second_store_link_breaks_the_link_and_the_commit_changes_nothing(
+    smc_results: dict[str, int],
+) -> None:
+    """LL, SL(A), SL(B), CMTL on a non-prefetchable word of the shared L2, caches off.
+
+    SPRUEG5D section 3.1.2 Table 3: a matching SL that meets LinkdtV already set must "Invalidate
+    the Link (LinkV = 0)", and section 3.1.3 Table 4: a commit against LinkV = 0 must "Discard the
+    request and return 0". The monitor keeps the first datum - SL2AMLDATA still reports A, and
+    SL2AMLSTAT has LinkdtV set and LinkV clear (the register's CPUID field is core 0's) - and the
+    word keeps what it held. A single SL is the control: it commits, returns 1 and stores.
+    """
+    results = smc_results
+    assert results["loaded"] == 0x1111_1111, "LL is a plain load of the word"
+    assert results["contended_cmtl"] == 0
+    assert results["memory_after"] == 0x1111_1111, "the discarded commit wrote nothing"
+    assert results["link_data"] == 0xAAAA_0001, "LinkData is still A"
+    status = results["link_status"]
+    assert status & 1 == 1, "LinkdtV is still set"
+    assert status & 2 == 0, "LinkV was cleared by the second SL"
+    assert (status >> 2) & 7 == 0, "the monitor belongs to core 0"
+    assert (status & 0x00FF_FFE0) == 0, "the word is the first granule of the shared L2"
+    assert results["control_cmtl"] == 1
+    assert results["control_memory"] == 0xC0DE_0003
+
+
+def test_c6472_a_user_mode_write_to_an_smc_register_raises_event_63_on_all_six_cores(
+    smc_results: dict[str, int],
+) -> None:
+    """A User-mode store to SL2PFCPEN is refused, recorded and raised everywhere.
+
+    SPRUEG5D section 5.1: the SMC "generates an exception back to that C64x+ megamodule as well as
+    to other C64x+ megamodules connected to it", and section 5.3 puts the accessing megamodule's
+    id and mode in SL2MPFSR and the address in SL2MPFAR (MODE reads 1, nonsecure: a User-mode
+    write). SPRS612G Table 7-10 makes that exception system event 63, latched in every core's
+    EVTFLAG1 bit 31. A Supervisor-mode write of the same register, made first, raises nothing.
+    """
+    results = smc_results
+    assert results["supervisor_flag"] == 0, "a Supervisor write is not a fault"
+    assert results["prefetch_enable"] == 0, "the refused write did not reach the register"
+    assert results["fault_status"] == (0 << 2) | (1 << 1), "core 0, nonsecure"
+    assert results["fault_address"] == 0x02AA_8000
+    assert [results[f"done{core}"] for core in range(CORES)] == [1] * CORES
+    assert [results[f"seen{core}"] for core in range(CORES)] == [1] * CORES

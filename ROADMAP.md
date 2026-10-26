@@ -558,7 +558,10 @@ counter, high-word latch and full DIER mask alongside the existing MVC/privilege
 **[x] Linked atomics.** *Done.* LL records the aligned word and its memory-write generation, SL
 buffers a matching word without exposing it, and CMTL reports success after load latency and
 commits only if no CPU, IDMA, EMAC or debugger write changed the reservation. The paired
-`cpu:linked-atomic-*` cases cover a successful update and failure after an intervening STW.
+`cpu:linked-atomic-*` cases cover a successful update and failure after an intervening STW. The
+reservation is held by the megamodule behind the core bus rather than by the CPU, and on the
+C6472's shared L2 the shared-memory controller's monitors answer instead (see *The SMC is a
+register file nothing drives*).
 
 **[x] Exceptions.** *Done.* `SWE`, `SWENR` and internal exceptions are delivered:
 EFR/ECR, IERR, NRP and NTSR carry the documented context, `SWENR` enters at REP, the loop
@@ -1425,27 +1428,56 @@ record, which is why this is written down: every case id and every expectation w
 so the amendment was to the setup and not to an answer. That historical record remains in
 `tests/vectors/component-python-baseline.json`; the current per-case vectors are executable.
 
-**[ ] The SMC is a register file nothing drives.** *Found by the interaction audit; open.* Every
-query the C6472 shared-memory controller offers the memory path - `load_link`, `link`,
-`take_link`, `note_protection_fault`, `prefetchable_pages`, `page_sleep_state`,
-`SharedMemoryProfiler::note_access`, `note_prefetch` - is `#[cfg(test)]` in `src/smc.rs`, and
-nothing in the device calls any of them: the unit tests pin each rule through direct calls, and
-the CPU, the EDMA3 and the EMAC never reach it. Three consequences are documented answers the
-model gives wrongly today. (1) Linked atomics on SL2 bypass the monitor: the CPU keeps its
-reservation privately (`src/cpu.rs` LL/SL/CMTL), so a second SL after a stored link overwrites the
-buffered word and CMTL commits, where SPRUEG5D section 3.1.2 Table 3 says a matching SL with
-LinkdtV already set must "Invalidate the Link (LinkV = 0)" and section 3.1.3 Table 4 says a commit
-against LinkV = 0 must "Discard the request and return '0'". (2) A User-mode CPU write to an SMC
-register raises nothing, where section 5.1 says the SMC "generates an exception back to that
-C64x+ megamodule as well as to other C64x+ megamodules connected to it" and section 5.3 says it
-records the megamodule ID in SL2MPFSR.Faulted_CPU_ID and the mode in SL2MPFSR.MODE; event 63 can
-therefore never assert. (3) Page sleep, prefetchability and the profilers' access counters never
-see an access. The cases to write are firmware on the C6472 with caches off and a non-prefetchable
-SL2 word: LL, SL(A), SL(B), CMTL must return zero and leave memory unchanged, with the monitor's
-LinkData still A; and a User-mode write to SL2PFCPEN on one core must leave CPU_ID, MODE and
-MPFAR in SL2MPFSR/SL2MPFAR and assert event 63 on all six cores. Which bank a given address
-selects is not settled by SPRUEG5D (the unit tests take address bits 6-5 from the monitor
-granule), so a two-core contention case must use the same address for both cores.
+**[x] The SMC is a register file nothing drives.** *Fixed.* The C6472 shared-memory controller
+is now on the SL2 access path, so what SPRUEG5D documents runs on real accesses and the
+`#[cfg(test)]` hooks are gone: `load_link`, `store_link` and `commit_link` (the monitors),
+`request` (page wake, bank and wait states), `refuse_user_write` (the protection latch) and
+`SharedMemoryProfiler::note_access` are the controller's production interface. Three answers the
+model gave wrongly are now right, each pinned by a native case at the fabric seam
+(`system::tests::shared_l2`) and, for the first two, by C6472 firmware
+(`tests/firmware/c6472_smc`, `test_multicore.py`), both of which fail on the previous binary.
+
+(1) LL, SL and CMTL no longer live in the CPU. The CPU asks the fabric through the core bus, and
+on an SL2 word the monitor of that word's bank answers: a second SL that meets LinkdtV already
+set invalidates the link (section 3.1.2 Table 3), and a commit against LinkV = 0 is discarded and
+returns 0 (section 3.1.3 Table 4), with memory unchanged and LinkData still the first datum. An
+ordinary store does not break an SL2 link, because Tables 3 and 4 give it no part in the monitor.
+Every other address, on both devices, keeps the version-stamp reservation exactly as it was, now
+held per core in its megamodule (`LinkReservation`) and checked against the backing store's write
+stamps: the reservation is a core's, the stamps are the device's, and the fabric holds both.
+
+(2) A User-mode CPU write to SL2PFCPEN, SL2PFCFLUSH, SL2PDSLEEP0-5 or SL2PDWAKE0-5 is refused
+and latched: SL2MPFSR gets the megamodule id and MODE = 1, SL2MPFAR the address, and the level
+raises `EventMap::smc_fault` - event 63, SPRS612G Table 7-10 - in all six megamodules on the next
+device tick (section 5.1 and 5.3) until SL2MPFSR.CLEAR is written.
+
+(3) Every CPU load, store and program fetch that names SL2 and that the megamodule's own caches do
+not answer, and every master transfer through a global alias of SL2, is a request: it wakes the
+page it lands in (section 4.3), and a read is served in three wait states - the documented figure
+for a request that misses the prefetch buffers (section 2.4) - by the bank its granule selects and
+counted by the requesting megamodule's profiler; LL and CMTL are read requests whatever the
+caches hold, and SL and stores are not. Nothing prefetches, so `note_prefetch` and
+`prefetchable_pages` were deleted rather than kept for a caller that does not exist: SL2PFCPEN is
+a register that changes no access, and SL2PFCCNT never counts.
+
+Where SPRUEG5D is silent the model chose the conservative reading, and says so beside each choice
+in `smc.rs`. **[unverified]** The bank an address selects is its bits 6-5 (the guide gives the
+bank width and the profiler's `megamodule_to_smc_addr[1:0]` but not the decode). The monitors
+compare the word, not the 256-bit granule, because CMTL writes "into LinkAdr address", which a
+granule cannot name. The address the SMC sees is the offset into the shared RAM ("ADDR IN SMC",
+Table 11), so the local window and every alias of one word are one address. Page 0 is the first
+512 KB of SL2 and page 1 the next 256 KB (the guide gives sizes and no addresses), a page woken by
+an access stays awake until the next SL2PDSLEEP or SL2PDWAKE write merges the cores' permissions
+again, and the wake costs no cycles (the guide gives no figure, and the model has no power
+controller timing). A master's request is attributed to the megamodule whose global alias it
+used, because the guide says every access goes through an L2 controller and a master has no other
+way to name one. A User-mode write to SL2MPFSR is accepted: section 5.3 says "the writable
+registers", but only the four registers of sections 5.1, 5.2, 5.8 and 5.9 are named
+supervisor-only. MODE is always 1, because the model has no secure mode. A load that misses L1D is
+one request however many words its line fill moves, and LDDW is two requests. Instruction
+fetches count as one request per fetch packet that L1P does not answer. SL2 ROM accesses are not
+SMC traffic in the model. The SMC does not judge master accesses (section 1.2: no memory
+protection support), so `admit` is unchanged and the SMC sits in the transfer stage after it.
 
 **[-] PERCFG0 gating.** The registers are modelled and pinned - the lock sequence, PERSTAT0 and
 PERSTAT1 with the five documented states, the write-once EMIFACTL/DDR2CTL - and what the control
@@ -2287,10 +2319,10 @@ came from these methods, in this order of what they have actually paid.
    defects; the C6455 MDIO interrupt bypassed EWCTL; SOFTRESET cleared the separate control
    module's EWCTL; frozen L1D hits advanced the LRU; User-mode CPU writes changed
    supervisor-only cache registers) and two were coverage gaps that passed at once. One more
-   scout finding, the SMC, was not an interaction defect but a block no production path reaches,
-   and became the open item *The SMC is a register file nothing drives*. Scouts sketch tests and
-   predict verdicts; each defect was settled by writing its test red first, and the scouts'
-   predictions held in all eight.
+   scout finding, the SMC, was not an interaction defect but a block no production path reached,
+   and became the item *The SMC is a register file nothing drives*, since closed. Scouts sketch
+   tests and predict verdicts; each defect was settled by writing its test red first, and the
+   scouts' predictions held in all eight.
 2. **Reading a manual closely enough to solve it rather than quote it.** The L1P and L1D miss
    numbers came out of a table of averages that one occupancy explains; the cache aperture
    geometry came out of a figure. The same reading is what refuted an item this list used to

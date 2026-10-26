@@ -34,7 +34,7 @@ use crate::i2c::I2c;
 use crate::idma::{Idma, Source as IdmaSource};
 use crate::mcbsp::Mcbsp;
 use crate::mdio::Mdio;
-use crate::memory::{Backing, BoundHierarchy, DataClock, MemoryHierarchy};
+use crate::memory::{Backing, BoundHierarchy, DataClock, LinkReservation, MemoryHierarchy};
 use crate::pdma::{Pdma, MAX_BURST_WORDS};
 use crate::pll::{Pll, Pll2};
 use crate::port::{PortContext, PortWrite, SlavePort};
@@ -171,6 +171,15 @@ pub(crate) enum Permission {
     Execute,
 }
 
+/// What kind of request a CPU access makes of the shared L2: a program fetch and a load are read
+/// requests, a store is not (SPRUEG5D section 7.1.1: the profiler counts read requests).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Sl2Access {
+    Load,
+    Store,
+    Fetch,
+}
+
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum Endian {
     #[default]
@@ -227,6 +236,8 @@ pub(crate) struct Megamodule {
     /// Whether the boot controller is holding this core in reset. Its memories still answer -
     /// a host or core 0 initialises them while the core waits (SPRUEC6G section 4.3.2).
     held_in_reset: bool,
+    /// This core's LL reservation on memory the shared-memory controller does not monitor.
+    link: LinkReservation,
 }
 
 impl Megamodule {
@@ -260,6 +271,7 @@ impl Megamodule {
             idle_level_events: [0; 4],
             idle_cpu_lines: 0,
             held_in_reset: false,
+            link: LinkReservation::default(),
         }
     }
 
@@ -1030,6 +1042,20 @@ impl Shared {
         self.peripheral_dirty = true;
     }
 
+    /// One request reaching SL2 RAM at `offset` through megamodule `core`'s L2 controller: the
+    /// SMC wakes the page and serves it, and that megamodule's profiler files a read request
+    /// under the bank and wait states it was served in. A write is not a read request, so the
+    /// profiler does not count it (SPRUEG5D section 7.1.1).
+    fn sl2_request(&mut self, core: usize, offset: u32, read: bool) {
+        let Some(smc) = self.smc.as_mut() else {
+            return;
+        };
+        let service = smc.request(offset);
+        if read {
+            self.smc_profilers[core].note_access(service.bank, service.wait_states);
+        }
+    }
+
     fn new(profile: &'static DeviceProfile, endian: Endian, boot_mode: u8) -> Self {
         // HPI boot is mode 1 on both devices. Whether the host's DSPINT ends it is the C6455's
         // rule (SPRS276M section 2.4); the C6472's host releases each core through the boot
@@ -1139,6 +1165,9 @@ pub struct Fabric {
     mm: Box<[Box<Megamodule>]>,
     /// How many megamodules there are, so the per-cycle paths index rather than iterate.
     cores: usize,
+    /// Whether the device has a shared L2, so the per-access check for it is a flag on a device
+    /// that does not (`observe_sl2`).
+    has_sl2: bool,
     shared: Shared,
     /// The device cycle the shared peripherals have been advanced to. Each core asks the
     /// fabric to tick as it finishes its own cycle, and the first ask of a cycle is the one
@@ -1171,6 +1200,7 @@ impl Fabric {
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
             cores: profile.cores(),
+            has_sl2: profile.map.shared_ram_bytes() != 0,
             shared: Shared::new(profile, Endian::Little, boot_mode),
             ticked_cycle: None,
             pending_nmi: 0,
@@ -1255,6 +1285,7 @@ impl Fabric {
 
     #[inline(always)]
     pub(crate) fn read32(&mut self, core: usize, address: u32) -> u32 {
+        self.observe_sl2(core, address, Sl2Access::Load);
         if directly_routed_memory(address) {
             return self.memory(core).read_u32(address);
         }
@@ -1271,6 +1302,7 @@ impl Fabric {
 
     #[inline(always)]
     pub(crate) fn write32(&mut self, core: usize, address: u32, value: u32) {
+        self.observe_sl2(core, address, Sl2Access::Store);
         if directly_routed_memory(address) {
             self.memory(core).write_u32(address, value);
             return;
@@ -2423,12 +2455,36 @@ impl Fabric {
             }
             return false;
         }
+        // The shared-memory controller's registers answer a CPU in User mode with a protection
+        // error, and keep what faulted (SPRUEG5D sections 5.1 to 5.3, 5.8, 5.9).
+        if user
+            && permission == Permission::Write
+            && crate::smc::is_register(address)
+            && self.refuse_user_smc_write(core, address)
+        {
+            return false;
+        }
         // Every page grants the CPU everything until software narrows one, which is the reset
         // state and the state the whole of this project's firmware runs in.
         if !self.mm[core].mpu_restrictive {
             return true;
         }
         self.check_restricted_access(core, address, permission, user)
+    }
+
+    /// A User-mode write to an SMC register: the controller refuses it and latches the fault,
+    /// and the fabric makes the exception visible to every megamodule on the next device tick.
+    #[inline(never)]
+    fn refuse_user_smc_write(&mut self, core: usize, address: u32) -> bool {
+        let refused = self
+            .shared
+            .smc
+            .as_mut()
+            .is_some_and(|smc| smc.refuse_user_write(core, address));
+        if refused {
+            self.shared.touched();
+        }
+        refused
     }
 
     /// Tell the EDMA3 which master its next register access is made for. Master access calls
@@ -2473,21 +2529,25 @@ impl Fabric {
 
     #[inline(always)]
     pub(crate) fn read_u8(&mut self, core: usize, address: u32) -> u8 {
+        self.observe_sl2(core, address, Sl2Access::Load);
         self.memory(core).read_u8(address)
     }
 
     #[inline(always)]
     pub(crate) fn write_u8(&mut self, core: usize, address: u32, value: u8) {
+        self.observe_sl2(core, address, Sl2Access::Store);
         self.memory(core).write_u8(address, value);
     }
 
     #[inline(always)]
     pub(crate) fn read_u16(&mut self, core: usize, address: u32) -> u16 {
+        self.observe_sl2(core, address, Sl2Access::Load);
         self.memory(core).read_u16(address)
     }
 
     #[inline(always)]
     pub(crate) fn write_u16(&mut self, core: usize, address: u32, value: u16) {
+        self.observe_sl2(core, address, Sl2Access::Store);
         self.memory(core).write_u16(address, value);
     }
 
@@ -2498,7 +2558,100 @@ impl Fabric {
 
     #[inline(always)]
     pub(crate) fn fetch_packet(&mut self, core: usize, address: u32) -> [u8; 32] {
+        self.observe_sl2(core, address, Sl2Access::Fetch);
         self.memory(core).fetch_packet(address)
+    }
+
+    // ------------------------------------------------------------------
+    // The shared L2 and the linked atomics.
+    // ------------------------------------------------------------------
+
+    /// A CPU access to `address` from `core`: when it names SL2 RAM, the shared-memory controller
+    /// is asked to serve it - unless the megamodule's own caches answer it first, in which case
+    /// the access never leaves the megamodule and the SMC does not see it.
+    ///
+    /// Every CPU access asks, so a device with no SL2 answers with one flag, and one with it
+    /// answers everything else with two subtractions and two compares
+    /// (`AddressMap::shared_ram_offset`).
+    #[inline(always)]
+    fn observe_sl2(&mut self, core: usize, address: u32, access: Sl2Access) {
+        if !self.has_sl2 {
+            return;
+        }
+        if let Some(offset) = self.profile.map.shared_ram_offset(address) {
+            self.serve_sl2(core, address, offset, access);
+        }
+    }
+
+    #[inline(never)]
+    fn serve_sl2(&mut self, core: usize, address: u32, offset: u32, access: Sl2Access) {
+        let memory = &self.mm[core].memory;
+        let answered = match access {
+            Sl2Access::Fetch => memory.answers_fetch(address),
+            Sl2Access::Load | Sl2Access::Store => memory.answers_data(address),
+        };
+        if !answered {
+            self.shared
+                .sl2_request(core, offset, access != Sl2Access::Store);
+        }
+    }
+
+    /// LL (SPRUEG5D section 3.1.1, SPRU871K for the instruction): read the word at `address`, and
+    /// link it to `core` so a later SL and CMTL can be judged.
+    ///
+    /// On SL2 the link is the shared-memory controller's: the access is a read request to it
+    /// whatever the caches hold, and the monitor of the bank the word lives in logs the core and
+    /// the word. Everywhere else it is the core's own `LinkReservation` against the backing
+    /// store's write stamps. The word itself is read as any load reads it.
+    pub(crate) fn load_link(&mut self, core: usize, address: u32) -> u32 {
+        let address = address & !3;
+        if let (Some(offset), true) = (
+            self.profile.map.shared_ram_offset(address),
+            self.shared.smc.is_some(),
+        ) {
+            self.shared.sl2_request(core, offset, true);
+            if let Some(smc) = self.shared.smc.as_mut() {
+                smc.load_link(core, offset);
+            }
+            return self.memory(core).read_u32(address);
+        }
+        let value = self.read32(core, address);
+        let version = self.shared.backing.track_memory_version(address);
+        self.mm[core].link.load(address, version);
+        value
+    }
+
+    /// SL (SPRUEG5D section 3.1.2): `value` is what `core` would store at `address` if its link
+    /// holds. On SL2 the monitor judges it (Table 3) and keeps the datum itself; the write never
+    /// reaches memory. Elsewhere the core's reservation buffers it for CMTL.
+    pub(crate) fn store_link(&mut self, core: usize, address: u32, value: u32) {
+        let address = address & !3;
+        if let (Some(offset), Some(smc)) = (
+            self.profile.map.shared_ram_offset(address),
+            self.shared.smc.as_mut(),
+        ) {
+            smc.store_link(core, offset, value);
+            return;
+        }
+        let version = self.shared.backing.memory_version(address);
+        self.mm[core].link.store(address, value, version);
+    }
+
+    /// CMTL (SPRUEG5D section 3.1.3): the word to store at `address` when `core`'s link holds,
+    /// `None` when the commit fails and the core is to get 0. The link ends either way. On SL2 a
+    /// commit is a read request to the controller whose monitor answers (Table 4); the caller
+    /// does the store, as it does any other.
+    pub(crate) fn commit_link(&mut self, core: usize, address: u32) -> Option<u32> {
+        let address = address & !3;
+        if let (Some(offset), true) = (
+            self.profile.map.shared_ram_offset(address),
+            self.shared.smc.is_some(),
+        ) {
+            self.shared.sl2_request(core, offset, true);
+            return self.shared.smc.as_mut()?.commit_link(core, offset);
+        }
+        let version = self.shared.backing.memory_version(address);
+        self.mm[core].link.commit(address, version)
     }
 
     pub(crate) fn read_bytes(&mut self, core: usize, address: u32, length: usize) -> Vec<u8> {
@@ -2661,12 +2814,19 @@ impl<'a> CoreBus<'a> {
         self.fabric.mm[self.core].memory.l1p_epoch()
     }
 
-    pub(crate) fn memory_version(&self, address: u32) -> u64 {
-        self.fabric.shared.backing.memory_version(address)
+    /// LL: read the word at `address` and link it. See `Fabric::load_link`.
+    pub(crate) fn load_link(&mut self, address: u32) -> u32 {
+        self.fabric.load_link(self.core, address)
     }
 
-    pub(crate) fn track_memory_version(&mut self, address: u32) -> u64 {
-        self.fabric.shared.backing.track_memory_version(address)
+    /// SL: offer `value` to the link on `address`. See `Fabric::store_link`.
+    pub(crate) fn store_link(&mut self, address: u32, value: u32) {
+        self.fabric.store_link(self.core, address, value);
+    }
+
+    /// CMTL: the word to store if the link on `address` holds. See `Fabric::commit_link`.
+    pub(crate) fn commit_link(&mut self, address: u32) -> Option<u32> {
+        self.fabric.commit_link(self.core, address)
     }
 
     /// The data-access timing the megamodule's L1D owns: the CPU records each load and store
@@ -4993,6 +5153,370 @@ mod tests {
                 transfer(&crate::device::C6455, 0, false, attributes, true);
             assert_eq!(destination, DATA);
             assert_eq!(status, 0);
+        }
+    }
+
+    /// The shared-memory controller on the SL2 access path: what the CPU and the masters do to
+    /// the shared L2 is judged by the controller SPRUEG5D documents, and what they do anywhere
+    /// else is not.
+    mod shared_l2 {
+        use super::*;
+        use crate::memory::L1DCFG;
+
+        /// The SL2 RAM through every core's local window, and through core 3's and core 0's
+        /// global alias (SPRS612G Table 2-2: aliases every 16 MB from 1000 0000h).
+        const SL2: u32 = 0x0020_0000;
+        const SL2_VIA_CORE0: u32 = 0x1020_0000;
+        const SL2_VIA_CORE3: u32 = 0x1320_0000;
+        const SMC: u32 = crate::smc::BASE;
+        const SL2PFCPEN: u32 = SMC;
+        const SL2MPFSR: u32 = SMC + 0x8;
+        const SL2MPFAR: u32 = SMC + 0xc;
+        const SL2PDSTAT: u32 = SMC + 0x10;
+        const SL2AMLSTAT0: u32 = SMC + 0x100;
+        const SL2AMLDATA0: u32 = SMC + 0x120;
+        const SL2PDSLEEP0: u32 = SMC + 0x200;
+        /// Core `n`'s profiler registers: SL2BNKMSK, SL2PWSCNT0, SL2PCMD and SL2STATMASK.
+        fn profiler(core: u32, offset: u32) -> u32 {
+            crate::smc::PROFILER_BASE + crate::smc::PROFILER_STRIDE * core + offset
+        }
+        const BNKMSK: u32 = 0x00;
+        const PWSCNT0: u32 = 0x04;
+        const PCMD: u32 = 0x28;
+        const STATMASK: u32 = 0x30;
+        const ENPROFILE: u32 = 1 << 1;
+
+        fn c6472() -> Fabric {
+            Fabric::new(&crate::device::C6472)
+        }
+
+        /// Whether `event` is latched in core `core`'s EVTFLAG.
+        fn flagged(fabric: &Fabric, core: usize, event: usize) -> bool {
+            fabric.megamodule(core).event_flag_registers()[event / 32] & (1 << (event % 32)) != 0
+        }
+
+        /// How many read requests core `core`'s profiler filed under `wait_states`.
+        fn counted(fabric: &mut Fabric, core: u32, wait_states: u32) -> u32 {
+            fabric.read32(0, profiler(core, PWSCNT0 + 4 * wait_states))
+        }
+
+        /// LinkV and LinkdtV of the monitor that serves the SL2 offset `offset`.
+        fn link_flags(fabric: &mut Fabric, offset: u32) -> u32 {
+            fabric.read32(0, SL2AMLSTAT0 + 4 * ((offset >> 5) & 3)) & 3
+        }
+
+        #[test]
+        fn two_cores_contending_for_one_word_leave_it_unchanged_and_the_monitor_holds_the_first_datum(
+        ) {
+            // SPRUEG5D Table 3: an SL that meets LinkdtV already set invalidates the link, and
+            // Table 4: a commit against LinkV = 0 is discarded and returns 0.
+            let mut fabric = c6472();
+            fabric.write32(0, SL2, 0x1111_1111);
+            assert_eq!(fabric.core(0).load_link(SL2), 0x1111_1111);
+            fabric.core(0).store_link(SL2, 0xaaaa_aaaa);
+            assert_eq!(link_flags(&mut fabric, 0), 3, "LinkV and LinkdtV");
+            fabric.core(0).store_link(SL2, 0xbbbb_bbbb);
+            assert_eq!(link_flags(&mut fabric, 0), 1, "LinkV cleared, LinkdtV left");
+            assert_eq!(fabric.core(0).commit_link(SL2), None);
+            assert_eq!(fabric.read32(0, SL2), 0x1111_1111, "memory is unchanged");
+            assert_eq!(fabric.read32(1, SL2AMLDATA0), 0xaaaa_aaaa, "LinkData is A");
+        }
+
+        #[test]
+        fn a_clean_link_commits_once_and_stores_the_datum_the_sl_gave_it() {
+            let mut fabric = c6472();
+            fabric.core(2).load_link(SL2 + 0x44);
+            fabric.core(2).store_link(SL2 + 0x44, 0x1234_5678);
+            // The SL stored nothing in memory; the commit hands the datum back to be stored.
+            assert_eq!(fabric.read32(2, SL2 + 0x44), 0);
+            assert_eq!(fabric.core(2).commit_link(SL2 + 0x44), Some(0x1234_5678));
+            assert_eq!(fabric.core(2).commit_link(SL2 + 0x44), None, "single-shot");
+        }
+
+        #[test]
+        fn a_foreign_cores_store_link_is_discarded_and_its_load_link_takes_the_link_over() {
+            let mut fabric = c6472();
+            fabric.core(0).load_link(SL2);
+            // Table 3: LinkV set, the megamodule id does not match: discard.
+            fabric.core(1).store_link(SL2, 0xdead_beef);
+            assert_eq!(fabric.read32(0, SL2AMLDATA0), 0);
+            assert_eq!(link_flags(&mut fabric, 0), 2, "LinkV, no datum");
+            fabric.core(0).store_link(SL2, 0x0000_0001);
+            // Section 3.1.1: an LL from any megamodule re-logs the monitor, whatever its state.
+            fabric.core(1).load_link(SL2);
+            assert_eq!(
+                link_flags(&mut fabric, 0),
+                2,
+                "LinkdtV cleared by the new LL"
+            );
+            assert_eq!(
+                fabric.core(0).commit_link(SL2),
+                None,
+                "core 0 lost the link"
+            );
+            fabric.core(1).load_link(SL2);
+            fabric.core(1).store_link(SL2, 0x0000_0002);
+            assert_eq!(fabric.core(1).commit_link(SL2), Some(2));
+        }
+
+        #[test]
+        fn an_ordinary_store_does_not_break_a_link_on_sl2_because_the_monitor_does_not_see_it() {
+            // SPRUEG5D section 3.1 describes what LL, SL and CMTL do to the monitor and gives an
+            // ordinary store no part in it; only the version-tracking reservation of the other
+            // memories breaks on one.
+            let mut fabric = c6472();
+            fabric.core(0).load_link(SL2);
+            fabric.core(0).store_link(SL2, 0x0a0a_0a0a);
+            fabric.write32(1, SL2, 0x5555_5555);
+            assert_eq!(fabric.core(0).commit_link(SL2), Some(0x0a0a_0a0a));
+        }
+
+        #[test]
+        fn the_monitor_sees_one_word_whichever_alias_names_it() {
+            // SPRUEG5D Table 11: the monitor holds an address in the SMC, so the local window and
+            // any core's global alias of one word are one address.
+            let mut fabric = c6472();
+            fabric.core(0).load_link(SL2 + 0x80);
+            fabric.core(0).store_link(SL2_VIA_CORE3 + 0x80, 7);
+            assert_eq!(fabric.core(0).commit_link(SL2_VIA_CORE0 + 0x80), Some(7));
+            // A different word is a different address, and it invalidates the link.
+            fabric.core(0).load_link(SL2 + 0x80);
+            fabric.core(0).store_link(SL2 + 0x84, 7);
+            assert_eq!(fabric.core(0).commit_link(SL2 + 0x80), None);
+        }
+
+        #[test]
+        fn linked_atomics_outside_sl2_keep_the_version_tracking_reservation_on_both_devices() {
+            for profile in [&crate::device::C6455, &crate::device::C6472] {
+                let mut fabric = Fabric::new(profile);
+                let word = 0x0080_1000;
+                fabric.write32(0, word, 0x4433_2211);
+                assert_eq!(fabric.core(0).load_link(word), 0x4433_2211);
+                // A second SL replaces the buffered word, and CMTL commits the last one.
+                fabric.core(0).store_link(word, 1);
+                fabric.core(0).store_link(word, 2);
+                assert_eq!(fabric.core(0).commit_link(word), Some(2));
+                assert_eq!(fabric.core(0).commit_link(word), None, "the link ended");
+                // A store by anybody in between breaks it.
+                fabric.core(0).load_link(word);
+                fabric.core(0).store_link(word, 3);
+                fabric.write32(0, word, 0);
+                assert_eq!(fabric.core(0).commit_link(word), None);
+                // So does an SL to another word, and a CMTL with no SL behind it.
+                fabric.core(0).load_link(word);
+                fabric.core(0).store_link(word + 4, 4);
+                assert_eq!(fabric.core(0).commit_link(word), None);
+                fabric.core(0).load_link(word);
+                assert_eq!(fabric.core(0).commit_link(word), None);
+            }
+        }
+
+        #[test]
+        fn the_reservation_outside_sl2_belongs_to_the_core_and_never_reaches_the_monitors() {
+            let mut fabric = c6472();
+            let ddr2 = 0xe000_0000;
+            fabric.core(0).load_link(ddr2);
+            fabric.core(0).store_link(ddr2, 9);
+            // Another core's CMTL has no link of its own to commit.
+            assert_eq!(fabric.core(1).commit_link(ddr2), None);
+            assert_eq!(fabric.core(0).commit_link(ddr2), Some(9));
+            for bank in 0..4 {
+                assert_eq!(fabric.read32(0, SL2AMLSTAT0 + 4 * bank), 0);
+            }
+        }
+
+        #[test]
+        fn a_user_mode_write_to_an_smc_register_is_refused_latched_and_raised_on_every_core() {
+            let mut fabric = c6472();
+            let event = crate::device::C6472.events.smc_fault.unwrap();
+            // Section 5.1: readable in every mode, writable only in supervisor mode.
+            assert!(fabric.check_access(2, SL2PFCPEN, Permission::Read, true));
+            assert!(fabric.check_access(2, SL2PFCPEN, Permission::Write, false));
+            assert_eq!(fabric.read32(0, SL2MPFSR), 7 << 2, "no fault recorded yet");
+            fabric.tick_once();
+            assert!((0..6).all(|core| !flagged(&fabric, core, event)));
+
+            assert!(!fabric.check_access(2, SL2PFCPEN, Permission::Write, true));
+            // Section 5.3: the accessing megamodule id, the mode (nonsecure: 1) and the address.
+            assert_eq!(fabric.read32(5, SL2MPFSR), (2 << 2) | (1 << 1));
+            assert_eq!(fabric.read32(5, SL2MPFAR), SL2PFCPEN);
+            for _ in 0..8 {
+                fabric.tick_once();
+            }
+            for core in 0..6 {
+                assert!(
+                    flagged(&fabric, core, event),
+                    "event {event} on core {core}"
+                );
+            }
+            // The latest fault overwrites the previous one, whatever core it came from.
+            assert!(!fabric.check_access(4, SL2PDSLEEP0 + 0x14, Permission::Write, true));
+            assert_eq!(fabric.read32(0, SL2MPFSR), (4 << 2) | (1 << 1));
+            assert_eq!(fabric.read32(0, SL2MPFAR), SL2PDSLEEP0 + 0x14);
+            // Writing 1 to CLEAR drops the level and the status.
+            fabric.write32(0, SL2MPFSR, 1);
+            assert_eq!(fabric.read32(0, SL2MPFSR), 7 << 2);
+            assert_eq!(fabric.read32(0, SL2MPFAR), 0);
+        }
+
+        #[test]
+        fn only_a_cpu_in_user_mode_faults_and_only_a_device_with_a_controller_has_one() {
+            let mut fabric = c6472();
+            // Read-only registers and the supervisor's own writes do not fault.
+            assert!(fabric.check_access(0, SL2PDSTAT, Permission::Write, true));
+            assert!(fabric.check_access(0, SL2AMLSTAT0, Permission::Write, true));
+            assert!(fabric.check_access(0, SL2PFCPEN, Permission::Write, false));
+            assert_eq!(fabric.read32(0, SL2MPFSR), 7 << 2);
+            // A DMA master writing the register is not a megamodule with an id to record.
+            fabric.write_word(Privilege::ID0_USER, SL2PFCPEN, 0xf);
+            assert_eq!(fabric.read32(0, SL2PFCPEN), 0xf);
+            assert_eq!(fabric.read32(0, SL2MPFSR), 7 << 2);
+            // The C6455 has no SMC at that address, so there is nothing to fault.
+            let mut c6455 = Fabric::default();
+            assert!(c6455.check_access(0, SL2PFCPEN, Permission::Write, true));
+        }
+
+        #[test]
+        fn the_profiler_counts_a_cpu_read_and_a_dma_read_to_an_enabled_bank() {
+            let mut fabric = c6472();
+            // Reset: profiling is off, and a read counts nothing.
+            fabric.read32(0, SL2);
+            assert_eq!(counted(&mut fabric, 0, 3), 0);
+            fabric.write32(0, profiler(0, PCMD), ENPROFILE);
+
+            // SPRUEG5D section 2.4: a read that misses the prefetch buffers is served in three
+            // wait states, and section 7.1.1: the profiler counts read requests. A store is not.
+            fabric.read32(0, SL2);
+            fabric.read32(0, SL2 + 0x20);
+            fabric.read_u8(0, SL2 + 0x41);
+            fabric.read_u16(0, SL2 + 0x62);
+            fabric.write32(0, SL2 + 0x64, 1);
+            assert_eq!(counted(&mut fabric, 0, 3), 4);
+            // Another megamodule's request is that megamodule's, and its profiler is still off.
+            fabric.read32(1, SL2);
+            assert_eq!(counted(&mut fabric, 0, 3), 4);
+            assert_eq!(counted(&mut fabric, 1, 3), 0);
+
+            // A master reaches SL2 through a global alias, and enters through the megamodule
+            // whose alias it is: 64 bytes are two 256-bit bank words.
+            assert_eq!(
+                fabric
+                    .read(HOST, SL2_VIA_CORE0 + 0x40, 64)
+                    .map(|bytes| bytes.len()),
+                Some(64)
+            );
+            assert_eq!(counted(&mut fabric, 0, 3), 6);
+            fabric.write(HOST, SL2_VIA_CORE0, &[1, 2, 3, 4]);
+            assert_eq!(
+                counted(&mut fabric, 0, 3),
+                6,
+                "a DMA write is not a read request"
+            );
+            fabric.read(HOST, SL2_VIA_CORE3, 4);
+            assert_eq!(counted(&mut fabric, 0, 3), 6);
+            assert_eq!(counted(&mut fabric, 3, 3), 0, "core 3's profiler is off");
+
+            // Nothing but SL2 reaches the SMC: the core's own L2 and DDR2 are not its business.
+            fabric.read32(0, 0x0080_0000);
+            fabric.read32(0, 0xe000_0000);
+            fabric.read(HOST, 0x1080_0000, 4);
+            assert_eq!(counted(&mut fabric, 0, 3), 6);
+        }
+
+        #[test]
+        fn the_bank_mask_decides_which_banks_the_profiler_counts() {
+            let mut fabric = c6472();
+            fabric.write32(0, profiler(0, PCMD), ENPROFILE);
+            // Bank 2 only: the granule at offset 0x40 selects it (the guide does not say how a
+            // bank is selected; the unit tests of the SMC document the choice).
+            fabric.write32(0, profiler(0, BNKMSK), 1 << 2);
+            fabric.read32(0, SL2);
+            fabric.read32(0, SL2 + 0x20);
+            assert_eq!(counted(&mut fabric, 0, 3), 0);
+            fabric.read32(0, SL2 + 0x40);
+            assert_eq!(counted(&mut fabric, 0, 3), 1);
+        }
+
+        #[test]
+        fn a_program_fetch_from_sl2_is_a_read_request_and_a_cached_one_is_not() {
+            let mut fabric = c6472();
+            fabric.write32(0, profiler(0, PCMD), ENPROFILE);
+            fabric.fetch_packet(0, SL2);
+            fabric.fetch_packet(0, SL2 + 0x20);
+            assert_eq!(counted(&mut fabric, 0, 3), 2);
+            // With L1P on, a line it holds never leaves the megamodule: one fill, then hits.
+            fabric.write32(0, crate::memory::L1PCFG, 4);
+            fabric.fetch_packet(0, SL2 + 0x100);
+            fabric.fetch_packet(0, SL2 + 0x100);
+            assert_eq!(counted(&mut fabric, 0, 3), 3);
+        }
+
+        #[test]
+        fn a_load_the_l1d_answers_never_reaches_the_smc() {
+            let mut fabric = c6472();
+            fabric.write32(0, profiler(0, PCMD), ENPROFILE);
+            fabric.write32(0, L1DCFG, 3);
+            // The first load fills a line; the rest of that line is the L1D's.
+            fabric.read32(0, SL2);
+            assert_eq!(counted(&mut fabric, 0, 3), 1);
+            fabric.read32(0, SL2 + 4);
+            fabric.read32(0, SL2);
+            assert_eq!(counted(&mut fabric, 0, 3), 1);
+            fabric.read32(0, SL2 + 0x1000);
+            assert_eq!(counted(&mut fabric, 0, 3), 2);
+        }
+
+        #[test]
+        fn load_link_and_commit_link_are_read_requests_whatever_the_caches_hold() {
+            let mut fabric = c6472();
+            fabric.write32(0, profiler(0, PCMD), ENPROFILE);
+            fabric.write32(0, L1DCFG, 3);
+            fabric.read32(0, SL2);
+            assert_eq!(counted(&mut fabric, 0, 3), 1);
+            // The line is in L1D, and LL still goes to the monitor: one request. CMTL is another.
+            fabric.core(0).load_link(SL2);
+            fabric.core(0).store_link(SL2, 5);
+            fabric.core(0).commit_link(SL2);
+            assert_eq!(counted(&mut fabric, 0, 3), 3, "LL and CMTL, not SL");
+        }
+
+        #[test]
+        fn the_statistics_event_is_raised_on_the_core_whose_request_it_was() {
+            let mut fabric = c6472();
+            let event = crate::device::C6472.events.smc_event.unwrap();
+            fabric.write32(0, profiler(0, PCMD), ENPROFILE);
+            fabric.write32(0, profiler(0, STATMASK), 1 << 3);
+            fabric.write32(1, profiler(1, PCMD), ENPROFILE);
+            // Core 1 never unmasked an event, so its request combines nothing.
+            fabric.read32(1, SL2);
+            fabric.read32(0, SL2);
+            for _ in 0..8 {
+                fabric.tick_once();
+            }
+            assert!(flagged(&fabric, 0, event));
+            assert!(!flagged(&fabric, 1, event));
+        }
+
+        #[test]
+        fn a_cpu_or_master_access_wakes_the_page_it_lands_in() {
+            // SPRUEG5D section 4.3. Both pages are asleep out of reset (section 5.5); page 0 is
+            // the first 512 KB of SL2 and page 1 the 256 KB after it (section 4.2).
+            let mut fabric = c6472();
+            assert_eq!(fabric.read32(0, SL2PDSTAT), 0);
+            fabric.read32(0, SL2 + 0x7_fffc);
+            assert_eq!(fabric.read32(0, SL2PDSTAT), 1 << 2);
+            fabric.write(HOST, SL2_VIA_CORE3 + 0x8_0000, &[0]);
+            assert_eq!(fabric.read32(0, SL2PDSTAT), (1 << 2) | (1 << 3));
+            // Every core granting permission puts both to sleep again; a store wakes one.
+            for core in 0..6 {
+                fabric.write32(core, SL2PDSLEEP0 + 4 * core as u32, (1 << 2) | (1 << 3));
+            }
+            assert_eq!(fabric.read32(0, SL2PDSTAT), 0);
+            fabric.write32(1, SL2 + 0x8_0000, 1);
+            assert_eq!(fabric.read32(0, SL2PDSTAT), 1 << 3);
+            // Outside SL2 nothing wakes.
+            fabric.read32(0, 0x0080_0000);
+            assert_eq!(fabric.read32(0, SL2PDSTAT), 1 << 3);
         }
     }
 }

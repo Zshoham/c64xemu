@@ -225,6 +225,40 @@ impl AddressMap {
         Some((core, offset % self.global_stride))
     }
 
+    /// The offset into the shared L2 RAM an access names, whichever core issued it: through the
+    /// local window every megamodule has, or through any core's global alias of that window. This
+    /// is the SMC's view of an address (SPRUEG5D Table 11, "ADDR IN SMC"), and `None` for
+    /// everything else - including every address on a device with no shared L2 - after two
+    /// subtractions and two compares, because every CPU access asks.
+    #[inline]
+    pub(crate) fn shared_ram_offset(&self, address: u32) -> Option<u32> {
+        self.shared_ram
+            .offset(address)
+            .or_else(|| self.shared_ram_alias(address).map(|(_, offset)| offset))
+    }
+
+    /// The core whose global alias block an address is in, and the offset into the shared L2 RAM
+    /// it names there. A DMA master is not a core and has no local window, so this is the only
+    /// way one reaches the shared L2 (`placement(Requester::Dma, ..)` agrees), and the core the
+    /// alias block belongs to is the megamodule whose L2 controller the access enters through.
+    ///
+    /// The alias blocks are `global_stride` apart, a power of two, so the address inside a block
+    /// is a mask and the block a shift. A device with no aliases has a stride of zero, which no
+    /// block offset is below.
+    #[inline]
+    pub(crate) fn shared_ram_alias(&self, address: u32) -> Option<(usize, u32)> {
+        let block = address.wrapping_sub(self.global_base);
+        if block >= self.global_stride * self.cores as u32 {
+            return None;
+        }
+        debug_assert!(self.global_stride.is_power_of_two());
+        let offset = self.shared_ram.offset(block & (self.global_stride - 1))?;
+        Some((
+            (block >> self.global_stride.trailing_zeros()) as usize,
+            offset,
+        ))
+    }
+
     /// Where an access lands. The order matters: the local windows are checked first because
     /// they are what a core issues almost every cycle, and the global block is a single
     /// subtraction away when it is not one of them.
@@ -374,5 +408,51 @@ mod tests {
             C6472_MAP.placement(Requester::Core(0), 0x0010_0000),
             Placement::SharedRom { offset: 0 }
         );
+    }
+
+    #[test]
+    fn the_shared_ram_offset_is_one_address_through_the_local_window_and_every_alias() {
+        // The SMC's address is the offset into the RAM, so every name for a word agrees, and
+        // agrees with the placement the storage resolves it to.
+        for address in [0x0020_0000, 0x0020_0004, 0x0027_ffff, 0x002b_fffc] {
+            let offset = address - 0x0020_0000;
+            assert_eq!(C6472_MAP.shared_ram_offset(address), Some(offset));
+            for core in 0..6u32 {
+                let alias = 0x1000_0000 + core * 0x0100_0000 + address;
+                assert_eq!(C6472_MAP.shared_ram_offset(alias), Some(offset));
+                assert_eq!(
+                    C6472_MAP.shared_ram_alias(alias),
+                    Some((core as usize, offset))
+                );
+                assert_eq!(
+                    C6472_MAP.placement(Requester::Dma, alias),
+                    Placement::Shared { offset }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_shared_ram_offset_answers_for_the_ram_alone() {
+        // One byte past the 768 KB, the ROM below, a core's own L2 and the seventh alias block.
+        for address in [
+            0x002c_0000,
+            0x001f_ffff,
+            0x0010_0000,
+            0x0080_0000,
+            0x1020_0000 + 0x000c_0000,
+            0x1620_0000,
+            0x1680_0000,
+            0xe000_0000,
+        ] {
+            assert_eq!(C6472_MAP.shared_ram_offset(address), None, "{address:#x}");
+        }
+        // A master has no local window, so only an alias names the RAM for it.
+        assert_eq!(C6472_MAP.shared_ram_alias(0x0020_0000), None);
+        // The C6455 has no shared L2 and no aliases to find one in.
+        for address in [0x0020_0000, 0x0080_0000, 0x1020_0000, 0xe000_0000] {
+            assert_eq!(C6455_MAP.shared_ram_offset(address), None);
+            assert_eq!(C6455_MAP.shared_ram_alias(address), None);
+        }
     }
 }

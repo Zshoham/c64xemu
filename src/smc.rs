@@ -1,15 +1,26 @@
-//! The TMS320C6472 shared-memory controller (SMC) register file, and the six per-core SMC
-//! profilers that sit on the UMAP1 interface between each megamodule and the SMC.
+//! The TMS320C6472 shared-memory controller (SMC): its register file, the shared-L2 (SL2) request
+//! path that drives it, and the six per-core SMC profilers that sit on the UMAP1 interface between
+//! each megamodule and the SMC.
 //!
 //! SPRUEG5D is the SMC user's guide; it deliberately does not give the base addresses of either
 //! register block, so both come from SPRS612G Table 2-2: the SMC control registers occupy 32K at
 //! 0x02AA8000, and SMCP0-5 occupy 16K each at 0x02C20000 + 0x4000 * core.
 //!
-//! This module is the register file plus the queries the device model drives it with. It models
-//! neither the SL2 storage nor the prefetch buffers, the arbitration, the write token controller
-//! or the wait states of SPRUEG5D sections 2.3 to 2.5: those live in the memory path, which reads
-//! the levels this block exposes (`prefetchable_pages`, `page_sleep_state`) and pushes events into
-//! it (`note_protection_fault`, `SharedMemoryProfiler::note_access`).
+//! The fabric puts this block on the SL2 access path (`Fabric::read32` and its siblings, the
+//! master transfer stage and the three linked-atomic instructions), so what the SMC documents runs
+//! on real accesses: the atomic-access monitors answer LL, SL and CMTL (`load_link`,
+//! `store_link`, `commit_link`), an access wakes the page it lands in and is timed and counted by
+//! the requesting megamodule's profiler (`request`, `SharedMemoryProfiler::note_access`), and a
+//! User-mode write to a supervisor-only register is refused and latched as a protection fault
+//! (`refuse_user_write`). Every address this module takes is an offset into the shared L2 RAM -
+//! "ADDR IN SMC" of SPRUEG5D Table 11 - so the local window and every core's global alias of the
+//! same word are one address to the monitor.
+//!
+//! The storage itself is the backing store's. These parts of SPRUEG5D sections 2.3 to 2.5 are not
+//! modelled: the prefetch buffers and their generators, the per-bank arbitration, the write token
+//! controller, and every wait state beyond the fixed one `request` reports. Nothing prefetches, so
+//! SL2PFCPEN and SL2PFCFLUSH hold values that change nothing observable (a flush has no buffer to
+//! discard) and SL2PFCCNT never advances.
 //!
 //! Neither type has any time-dependent state of its own, so neither has a `tick`. Everything
 //! derived - the merged page power state, the counter saturation status - is recomputed at the
@@ -55,6 +66,14 @@ pub(crate) const BANKS: usize = 4;
 /// section 7.4 names the two power domains "SMC Pg0" and "SMC Pg1".
 pub(crate) const PAGES: usize = 2;
 
+/// How SL2 RAM splits into the two power-down pages: page 0 is the first 64-bit x 4K x 16 = 512 KB
+/// and page 1 the next 64-bit x 2K x 16 = 256 KB (SPRUEG5D section 4.2, Figure 5).
+///
+/// UNCERTAIN: the guide gives the two sizes and calls them the "first" and "second" physical
+/// page, but never says which addresses either one covers. This module lays them out in address
+/// order, the one reading that needs no invented interleave.
+const PAGE0_BYTES: u32 = 512 * 1024;
+
 /// SL2PDSTAT/SL2PDSLEEP/SL2PDWAKE carry page 0 in bit 2 (P2) and page 1 in bit 3 (P3).
 ///
 /// UNCERTAIN: SPRUEG5D names the fields P2 and P3 throughout, and Tables 10 and 13 describe them
@@ -71,9 +90,12 @@ const NO_FAULT_CPU_ID: u32 = 7;
 /// SL2AMLSTAT holds the monitored address in bits 23-5 (SPRUEG5D Table 11), i.e. the 256-bit
 /// granule the monitor is watching.
 ///
-/// UNCERTAIN: Table 11 calls the field "ADDR IN SMC" without saying whether it is the megamodule
-/// address or an SMC-internal offset. This module stores the address the memory path supplied,
-/// masked to bits 23-5, which is the in-place reading of the register figure.
+/// Table 11 calls the field "ADDR IN SMC", and this module takes that literally: the address is
+/// the offset into the shared L2 RAM the fabric resolved, so the local window and every global
+/// alias of one word are the same address to the monitor. What is compared is the word, not the
+/// granule: CMTL writes LinkData "into LinkAdr address" (section 3.1.3), which a granule address
+/// cannot name, so an SL to a different word of the monitored granule is an address mismatch.
+/// That is also what the version-tracking reservation the other memories use answers.
 const AML_ADDR_MASK: u32 = 0x00ff_ffe0;
 
 /// The C6472 shared-memory controller register file (SPRUEG5D section 5).
@@ -105,7 +127,7 @@ pub(crate) struct SharedMemory {
 /// sections 3.1, 5.6 and 5.7).
 #[derive(Clone, Copy, Default)]
 struct Monitor {
-    /// LinkAdr, the monitored 256-bit granule.
+    /// LinkAdr: the monitored word, as an offset into SL2 RAM.
     address: u32,
     /// CPU_ID of the megamodule that took the link.
     cpu_id: u32,
@@ -179,8 +201,8 @@ impl SlavePort for SharedMemory {
     /// `PortWrite::Unhandled` when the address is not one of this block's registers.
     ///
     /// The supervisor-mode check of SPRUEG5D sections 5.1, 5.2, 5.8 and 5.9 is not made here,
-    /// because the mode of the access is not visible at this interface: the memory path applies it
-    /// and reports a violating write with `note_protection_fault` instead.
+    /// because the mode of the access is not visible at this interface: the CPU path applies it
+    /// before the write is made, with `refuse_user_write`.
     fn write(&mut self, address: u32, value: u32, _context: PortContext) -> PortWrite {
         match address {
             SL2PFCPEN => self.prefetch_enable = value,
@@ -218,39 +240,70 @@ impl SlavePort for SharedMemory {
 }
 
 impl SharedMemory {
-    /// SL2PFCPEN as a level, for the memory path's prefetchable/non-prefetchable decision: bit n
-    /// covers the n-th of the 32 equal-sized SL2 pages (SPRUEG5D sections 2.3.1 and 5.1).
-    #[cfg(test)]
-    pub(crate) fn prefetchable_pages(&self) -> u32 {
-        self.prefetch_enable
+    /// Whether a write the CPU makes in User mode to `address` is refused, and if so, latch it.
+    ///
+    /// SPRUEG5D sections 5.1, 5.2, 5.8 and 5.9: SL2PFCPEN, SL2PFCFLUSH, SL2PDSLEEP0-5 and
+    /// SL2PDWAKE0-5 can be written "only in secure supervisor mode or supervisor mode". A write in
+    /// secure user or user mode makes the SMC raise its exception towards every megamodule and
+    /// record the latest exception status (section 5.1), and section 5.3 says what: the accessing
+    /// megamodule id into SL2MPFSR.CPU_ID, the accessing mode into SL2MPFSR.MODE and the address
+    /// into SL2MPFAR. "A non-supervisor mode write returns a memory protection error to the
+    /// configuration bus interface", so the write does not happen.
+    ///
+    /// Only a megamodule can fault: it is the only requester with a megamodule id for CPU_ID, and
+    /// a master's register write is not refused. The caller asks for User-mode writes only.
+    ///
+    /// MODE is recorded nonsecure (1, Table 8). The model has no secure mode - nothing in the
+    /// device can enter one - so every User-mode write is the nonsecure kind.
+    ///
+    /// UNCERTAIN: section 5.3 says the faulting writes are those "to the writable registers", and
+    /// SL2MPFSR.CLEAR is a writable bit. Only the four registers that sections 5.1, 5.2, 5.8
+    /// and 5.9 name as supervisor-only are treated as faulting, so a User-mode write to SL2MPFSR
+    /// is accepted. The atomic-access registers and SL2MPFAR are read-only and ignore writes.
+    pub(crate) fn refuse_user_write(&mut self, core: usize, address: u32) -> bool {
+        let word = address & !3;
+        let supervisor_only = matches!(word, SL2PFCPEN | SL2PFCFLUSH)
+            || (SL2PDSLEEP0..=SL2PDSLEEP5).contains(&word)
+            || (SL2PDWAKE0..=SL2PDWAKE5).contains(&word);
+        if supervisor_only {
+            self.fault_cpu_id = core as u32 & 7;
+            self.fault_nonsecure = true;
+            self.fault_address = address;
+            self.fault = true;
+        }
+        supervisor_only
     }
 
     /// True once for each write of 1 to SL2PFCFLUSH.FLUSH.
     ///
     /// Consumed by the memory path, which must invalidate the per-megamodule prefetch buffers of
     /// all six megamodules connected to the SMC (SPRUEG5D sections 2.3.6 and 5.2). The flush is
-    /// global, so one edge covers every core.
+    /// global, so one edge covers every core. The model holds no prefetch buffer, so the fabric
+    /// has nothing to discard and takes the edge only to keep the write one-shot.
     pub(crate) fn take_prefetch_flush(&mut self) -> bool {
         core::mem::take(&mut self.flush)
     }
 
-    /// Record a write to an SMC register made in a mode other than supervisor mode.
+    /// One request reaching SL2 RAM at `offset`, from a megamodule's L2 controller: the SMC wakes
+    /// the page it lands in and says which bank serves it and in how many wait states.
     ///
-    /// SPRUEG5D section 5.3: the SMC latches the accessing megamodule id in SL2MPFSR.CPU_ID, the
-    /// accessing mode in SL2MPFSR.MODE and the address in SL2MPFAR, and raises its exception. The
-    /// latest fault overwrites the previous one ("the SMC also needs to record the latest
-    /// exception status inside it", section 5.1).
+    /// SPRUEG5D section 4.3: the SMC wakes a page "in response to ... a C64x+ megamodule accesses
+    /// the sleeping/power-down SMC physical page(s)" and delays the acknowledgement until the page
+    /// is awake. The wake takes "the SL2 memory wrapper" and the chip's power controller, neither
+    /// of which the model has a duration for, so the access waits no longer for it. The page then
+    /// stays awake until the next SL2PDSLEEP or SL2PDWAKE write merges the cores' permissions
+    /// again; the guide does not say when a woken page may go back to sleep.
     ///
-    /// `nonsecure` is the documented MODE field of Table 8, not a supervisor flag: false records
-    /// MODE = 0 (secure, i.e. a secure user-mode write) and true records MODE = 1 (nonsecure, i.e.
-    /// a user-mode write). Only those two modes fault; a supervisor-mode write is accepted and
-    /// must not be reported here.
-    #[cfg(test)]
-    pub(crate) fn note_protection_fault(&mut self, core: usize, address: u32, nonsecure: bool) {
-        self.fault_cpu_id = core as u32 & 7;
-        self.fault_nonsecure = nonsecure;
-        self.fault_address = address;
-        self.fault = true;
+    /// UNCERTAIN: the guide never says which address bits select a bank. The banks are 256 bits
+    /// (32 bytes) wide (Figure 2) and the profiler decodes the bank from
+    /// megamodule_to_smc_addr[1:0] (Figure 17), so this module interleaves the four banks on
+    /// 256-bit granules and selects with address bits 6-5, the same bits the monitors use.
+    pub(crate) fn request(&mut self, offset: u32) -> Service {
+        self.asleep[page_of(offset)] = false;
+        Service {
+            bank: monitor_index(offset),
+            wait_states: READ_WAIT_STATES,
+        }
     }
 
     /// Level state of system event 63, SMCMPINT.
@@ -286,74 +339,59 @@ impl SharedMemory {
             && self.wake_request.iter().all(|wake| wake & bit == 0)
     }
 
-    /// Level state of a page's power: true while the page is asleep, which is what SL2PDSTAT
-    /// reports inverted (0 = sleep, 1 = awake; SPRUEG5D Table 10).
-    ///
-    /// The memory path reads this to decide whether an access has to wake a page and stall while
-    /// it wakes (SPRUEG5D section 4.3). Out-of-range pages are never asleep.
-    #[cfg(test)]
-    pub(crate) fn page_sleep_state(&self, page: usize) -> bool {
-        page_bit(page).is_some() && self.asleep[page]
-    }
-
-    /// LL, load-linked (SPRUEG5D section 3.1.1).
+    /// LL, load-linked (SPRUEG5D section 3.1.1), on the word at `offset` into SL2 RAM.
     ///
     /// "When the monitor sees an LL instruction from any of the C64x+ megamodules, the monitor logs
     /// the requester C64x+ megamodule id in the CPU_ID field, logs the address in LinkAdr field,
     /// set the LinkV flag to 1 and set the LinkdtV flag to 0, irrespective of the state of the
     /// monitor." The load itself is unaffected and is the memory path's business. LinkData is not
     /// documented as cleared, so it is left alone.
-    #[cfg(test)]
-    pub(crate) fn load_link(&mut self, core: usize, address: u32) {
-        let monitor = &mut self.monitor[monitor_index(address)];
+    pub(crate) fn load_link(&mut self, core: usize, offset: u32) {
+        let monitor = &mut self.monitor[monitor_index(offset)];
         monitor.cpu_id = core as u32 & 7;
-        monitor.address = address & AML_ADDR_MASK;
+        monitor.address = offset & !3;
         monitor.link_valid = true;
         monitor.data_valid = false;
     }
 
-    /// SL, store-linked (SPRUEG5D section 3.1.2, Table 3). Returns true when the monitor accepted
-    /// the data, i.e. it stored `data` in LinkData and set LinkdtV.
+    /// SL, store-linked (SPRUEG5D section 3.1.2, Table 3): `data` is the 32-bit datum the
+    /// megamodule stores at `offset`.
     ///
-    /// SL is a write to the monitor only, never to memory, so the memory path must not store
-    /// anything for it. Table 3, for the rows that do anything at all - all of which need LinkV
-    /// set and the megamodule id to match:
+    /// SL is a write to the monitor only, never to memory, so the memory path stores nothing for
+    /// it. Table 3, for the rows that do anything at all - all of which need LinkV set and the
+    /// megamodule id to match:
     ///
     /// * address mismatch: invalidate the link.
     /// * address match with LinkdtV clear: store the 32-bit datum and set LinkdtV.
     /// * address match with LinkdtV already set: invalidate the link.
     ///
     /// Every other combination discards the request.
-    #[cfg(test)]
-    pub(crate) fn link(&mut self, core: usize, address: u32, data: u32) -> bool {
-        let monitor = &mut self.monitor[monitor_index(address)];
+    pub(crate) fn store_link(&mut self, core: usize, offset: u32, data: u32) {
+        let monitor = &mut self.monitor[monitor_index(offset)];
         if !monitor.link_valid || monitor.cpu_id != core as u32 & 7 {
-            return false;
+            return;
         }
-        if monitor.address != address & AML_ADDR_MASK || monitor.data_valid {
+        if monitor.address != offset & !3 || monitor.data_valid {
             monitor.link_valid = false;
-            return false;
+            return;
         }
         monitor.data = data;
         monitor.data_valid = true;
-        true
     }
 
-    /// CMTL, commit-linked (SPRUEG5D section 3.1.3, Table 4).
+    /// CMTL, commit-linked (SPRUEG5D section 3.1.3, Table 4), on the word at `offset`.
     ///
-    /// Consumed exactly once by the memory path, which is the only caller: `Some(data)` means the
-    /// commit succeeded, so the memory path must write `data` to `address` and return 1 to the
-    /// requesting megamodule on each of the eight 32-bit lanes; `None` means the commit failed and
-    /// the megamodule gets 0. Either way the link is left invalid whenever the monitor belonged to
-    /// this core, which is what makes the commit single-shot.
-    #[cfg(test)]
-    pub(crate) fn take_link(&mut self, core: usize, address: u32) -> Option<u32> {
-        let monitor = &mut self.monitor[monitor_index(address)];
+    /// `Some(data)` means the commit succeeded, so the memory path writes `data` to the word and
+    /// the megamodule gets 1; `None` means the commit failed and the megamodule gets 0. Either
+    /// way the link is left invalid whenever the monitor belonged to this core, which is what
+    /// makes the commit single-shot.
+    pub(crate) fn commit_link(&mut self, core: usize, offset: u32) -> Option<u32> {
+        let monitor = &mut self.monitor[monitor_index(offset)];
         if !monitor.link_valid || monitor.cpu_id != core as u32 & 7 {
             return None;
         }
         monitor.link_valid = false;
-        if monitor.address != address & AML_ADDR_MASK || !monitor.data_valid {
+        if monitor.address != offset & !3 || !monitor.data_valid {
             return None;
         }
         Some(monitor.data)
@@ -399,6 +437,13 @@ const SL2AMLDATA3: u32 = SL2AMLDATA0 + 4 * (BANKS as u32 - 1);
 const SL2PDSLEEP5: u32 = SL2PDSLEEP0 + 4 * (CORES as u32 - 1);
 const SL2PDWAKE5: u32 = SL2PDWAKE0 + 4 * (CORES as u32 - 1);
 
+/// Whether `address` lies in the span the register file's registers are spread over, a filter
+/// the CPU path applies before it asks `refuse_user_write` about a User-mode write. The gaps
+/// between the arrays are inside it; `refuse_user_write` is what knows which words are registers.
+pub(crate) fn is_register(address: u32) -> bool {
+    address.wrapping_sub(BASE) < SL2PDWAKE5 + 4 - BASE
+}
+
 /// The register arrays are word-spaced, so the addresses between them are not registers.
 fn is_word(address: u32) -> bool {
     address % 4 == 0
@@ -413,16 +458,34 @@ fn page_bit(page: usize) -> Option<u32> {
     }
 }
 
-/// The atomic-access monitor an address belongs to: there is one per bank, and "accesses to
-/// distinct banks ... are guaranteed to never hit the same monitor address" (SPRUEG5D section 3).
+/// The atomic-access monitor, and the bank, an SL2 offset belongs to: there is one monitor per
+/// bank, and "accesses to distinct banks ... are guaranteed to never hit the same monitor
+/// address" (SPRUEG5D section 3). Which address bits select a bank is the UNCERTAIN choice
+/// `request` documents.
+fn monitor_index(offset: u32) -> usize {
+    ((offset >> 5) & (BANKS as u32 - 1)) as usize
+}
+
+/// The power-down page an SL2 offset lives in; see `PAGE0_BYTES`.
+fn page_of(offset: u32) -> usize {
+    usize::from(offset >= PAGE0_BYTES)
+}
+
+/// How many SYSCLK9 wait states the SMC serves a read request in: the 3 of a request that
+/// misses the prefetch buffers and is "serviced from the shared L2 memory as a 3-wait-state
+/// memory" (SPRUEG5D section 2.4, P-1 stage and Figure 3).
 ///
-/// UNCERTAIN: the guide never states which address bits select the bank. The banks are 256 bits
-/// (32 bytes) wide (SPRUEG5D Figure 2) and the profiler decodes the bank from
-/// megamodule_to_smc_addr[1:0] (Figure 17), so this module interleaves the four banks on 256-bit
-/// granules and selects with address bits 6-5.
-#[cfg(test)]
-fn monitor_index(address: u32) -> usize {
-    ((address >> 5) & (BANKS as u32 - 1)) as usize
+/// A prefetch hit would be 0, but nothing prefetches here, so every read is a miss. Arbitration
+/// against the other five megamodules and the wake of a sleeping page would add more; neither has
+/// a duration the model can state, so a read never waits longer than the documented minimum.
+pub(crate) const READ_WAIT_STATES: usize = 3;
+
+/// What the SMC answers for one request reaching SL2 RAM: the bank that serves it and the wait
+/// states the requester sees, which is what the profiler files the request under.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Service {
+    pub(crate) bank: usize,
+    pub(crate) wait_states: usize,
 }
 
 /// Base of the per-core SMC profiler register files, SPRS612G Table 2-2: SMCP0-5, 16K each, at
@@ -445,7 +508,6 @@ pub(crate) const WAIT_STATE_BINS: usize = 8;
 /// bin: "The maximum required value of counter/s is 7. When they reach the maximum value, the
 /// count remains at the maximum value" (SPRUEG5D section 7.1.3), and Table 15 describes count 7 as
 /// "Read request serviced in 0 or more wait state".
-#[cfg(test)]
 const MAX_WAIT_STATES: usize = WAIT_STATE_BINS - 1;
 
 /// SL2BNKMSK resets with all four bank bits set, i.e. accepting statistics events from every bank
@@ -455,15 +517,12 @@ const BNKMSK_RESET: u32 = (1 << BANKS) - 1;
 const PCMD_ENPROFILE: u32 = 1 << 1;
 /// SL2PCMD.CLEAR.
 const PCMD_CLEAR: u32 = 1 << 0;
-/// SL2PSTAT.PSAT, the SL2PFCCNT saturation bit (SPRUEG5D Table 22).
-const PSTAT_PSAT: u32 = 1 << 8;
 
 /// One core's SMC profiler (SPRUEG5D section 7): the statistics counters the profiler fills from
 /// the UMAP1 interface between that megamodule and the SMC.
 ///
-/// The profiler counts read requests the device model reports, so the device model must call
-/// `note_access` once per SMC read request serviced for this core and `note_prefetch` once per
-/// prefetch request the SMC generated for it. Nothing is counted while profiling is disabled.
+/// The profiler counts the read requests the memory path reports: `note_access` once per SMC
+/// read request serviced for this core. Nothing is counted while profiling is disabled.
 pub(crate) struct SharedMemoryProfiler {
     /// Start of this core's 16K window.
     base: u32,
@@ -471,8 +530,6 @@ pub(crate) struct SharedMemoryProfiler {
     bank_mask: u32,
     /// SL2PWSCNT0-7, reset 0, saturating (SPRUEG5D section 7.3.2).
     wait_state_count: [u32; WAIT_STATE_BINS],
-    /// SL2PFCCNT, reset 0, saturating (SPRUEG5D section 7.3.3).
-    prefetch_count: u32,
     /// SL2PCMD, reset 0: profiling disabled (SPRUEG5D section 7.3.4).
     command: u32,
     /// SL2STATMASK bits 7-0, reset 0: no statistics event is combined into the profiler event
@@ -489,7 +546,6 @@ impl SharedMemoryProfiler {
             base: PROFILER_BASE + PROFILER_STRIDE * core as u32,
             bank_mask: BNKMSK_RESET,
             wait_state_count: [0; WAIT_STATE_BINS],
-            prefetch_count: 0,
             command: 0,
             event_mask: 0,
             event: false,
@@ -505,7 +561,9 @@ impl SlavePort for SharedMemoryProfiler {
             offset @ PROFILER_PWSCNT0..=PROFILER_PWSCNT7 if offset % 4 == 0 => {
                 self.wait_state_count[((offset - PROFILER_PWSCNT0) / 4) as usize]
             }
-            PROFILER_PFCCNT => self.prefetch_count,
+            // SPRUEG5D section 7.3.3: SL2PFCCNT counts the prefetch requests the SMC generated.
+            // Nothing prefetches in this model (see the module documentation), so it never counts.
+            PROFILER_PFCCNT => 0,
             PROFILER_PCMD => self.command,
             PROFILER_PSTAT => self.saturation_status(),
             PROFILER_STATMASK => self.event_mask,
@@ -531,7 +589,6 @@ impl SlavePort for SharedMemoryProfiler {
                 self.command = value & (PCMD_ENPROFILE | PCMD_CLEAR);
                 if value & PCMD_CLEAR != 0 {
                     self.wait_state_count = [0; WAIT_STATE_BINS];
-                    self.prefetch_count = 0;
                 }
             }
             PROFILER_STATMASK => self.event_mask = value & 0xff,
@@ -549,7 +606,6 @@ impl SharedMemoryProfiler {
     /// request unless SL2BNKMSK accepts its bank, and the SSUL then bumps SL2PWSCNT[wait states]
     /// and drives the matching statistics event. Nothing happens while SL2PCMD.ENPROFILE is clear
     /// (section 7.3.4: "By default, the SMC profiler is disabled").
-    #[cfg(test)]
     pub(crate) fn note_access(&mut self, bank: usize, wait_states: usize) {
         if !self.enabled() || bank >= BANKS || self.bank_mask & (1 << bank) == 0 {
             return;
@@ -561,39 +617,20 @@ impl SharedMemoryProfiler {
         }
     }
 
-    /// Report one prefetch request the SMC generated for this core.
-    ///
-    /// SPRUEG5D section 7.1.5: the SSUL takes this event directly from the SMC and records it in
-    /// SL2PFCCNT, so it is not filtered by SL2BNKMSK and does not feed the event combiner. It is
-    /// counted only while profiling is enabled.
-    #[cfg(test)]
-    pub(crate) fn note_prefetch(&mut self) {
-        if !self.enabled() {
-            return;
-        }
-        self.prefetch_count = self.prefetch_count.saturating_add(1);
-    }
-
-    /// Level state of system event 64, SMCPEVT, for this core: a combined statistics event is
-    /// asserted and has not been consumed.
+    /// Consume the combined statistics event, so the interrupt controller sees exactly one event
+    /// per qualified read request.
     ///
     /// SPRUEG5D section 7.3.6: the profiler ORs the eight statistics events that SL2STATMASK
     /// admits into one event for the megamodule, which SPRS612G Table 7-10 lists as event 64,
     /// "SMC Profiler Consolidated Event". With SL2STATMASK at its reset value of 0 nothing is
     /// combined and the event never asserts.
-    #[cfg(test)]
-    pub(crate) fn event_pending(&self) -> bool {
-        self.event
-    }
-
-    /// Consume the combined statistics event, so the interrupt controller sees exactly one event
-    /// per qualified read request.
     pub(crate) fn take_event(&mut self) -> bool {
         core::mem::take(&mut self.event)
     }
 
     /// SL2PSTAT (SPRUEG5D section 7.3.5), derived from the counters: a counter that has reached its
-    /// maximum value has saturated and stopped advancing, so PSAT/SATn report it.
+    /// maximum value has saturated and stopped advancing, so SATn reports it. PSAT, the SL2PFCCNT
+    /// bit, stays 0 because that counter never advances.
     fn saturation_status(&self) -> u32 {
         let mut value = 0;
         for (bin, count) in self.wait_state_count.iter().enumerate() {
@@ -601,13 +638,9 @@ impl SharedMemoryProfiler {
                 value |= 1 << bin;
             }
         }
-        if self.prefetch_count == u32::MAX {
-            value |= PSTAT_PSAT;
-        }
         value
     }
 
-    #[cfg(test)]
     fn enabled(&self) -> bool {
         self.command & PCMD_ENPROFILE != 0
     }
@@ -627,7 +660,6 @@ mod tests {
         assert_eq!(smc.read(SL2MPFSR, TEST_CONTEXT), Some(NO_FAULT_CPU_ID << 2));
         assert_eq!(smc.read(SL2MPFAR, TEST_CONTEXT), Some(0));
         assert_eq!(smc.read(SL2PDSTAT, TEST_CONTEXT), Some(0));
-        assert!(smc.page_sleep_state(0) && smc.page_sleep_state(1));
         for bank in 0..BANKS as u32 {
             assert_eq!(smc.read(SL2AMLSTAT0 + 4 * bank, TEST_CONTEXT), Some(0));
             assert_eq!(smc.read(SL2AMLDATA0 + 4 * bank, TEST_CONTEXT), Some(0));
@@ -674,7 +706,6 @@ mod tests {
         let mut smc = SharedMemory::default();
         smc.write(SL2PFCPEN, 0x8000_0003, TEST_CONTEXT);
         assert_eq!(smc.read(SL2PFCPEN, TEST_CONTEXT), Some(0x8000_0003));
-        assert_eq!(smc.prefetchable_pages(), 0x8000_0003);
     }
 
     #[test]
@@ -696,19 +727,20 @@ mod tests {
     }
 
     #[test]
-    fn a_protection_fault_captures_the_core_and_mode_and_clears_on_write_one() {
-        // SPRUEG5D section 5.3: the SMC records the accessing megamodule id in CPU_ID and the mode
-        // in MODE, latches the address in SL2MPFAR, raises the common exception, and software
-        // clears both by writing 1 to CLEAR.
+    fn a_user_mode_write_to_a_supervisor_only_register_is_refused_and_latched_until_cleared() {
+        // SPRUEG5D sections 5.1, 5.2, 5.8 and 5.9 make SL2PFCPEN, SL2PFCFLUSH, SL2PDSLEEP0-5 and
+        // SL2PDWAKE0-5 supervisor-only; section 5.3: the SMC records the accessing megamodule id
+        // in CPU_ID and the mode in MODE, latches the address in SL2MPFAR, raises the common
+        // exception, and software clears both by writing 1 to CLEAR.
         let mut smc = SharedMemory::default();
-        smc.note_protection_fault(3, 0x0080_1234, true);
+        assert!(smc.refuse_user_write(3, SL2PFCPEN));
         assert_eq!(smc.read(SL2MPFSR, TEST_CONTEXT), Some((3 << 2) | (1 << 1)));
-        assert_eq!(smc.read(SL2MPFAR, TEST_CONTEXT), Some(0x0080_1234));
+        assert_eq!(smc.read(SL2MPFAR, TEST_CONTEXT), Some(SL2PFCPEN));
         assert!(smc.fault_pending());
         // The latest fault overwrites the previous one (section 5.1).
-        smc.note_protection_fault(5, 0x0080_0000, false);
-        assert_eq!(smc.read(SL2MPFSR, TEST_CONTEXT), Some(5 << 2));
-        assert_eq!(smc.read(SL2MPFAR, TEST_CONTEXT), Some(0x0080_0000));
+        assert!(smc.refuse_user_write(5, SL2PDWAKE0 + 0x14));
+        assert_eq!(smc.read(SL2MPFSR, TEST_CONTEXT), Some((5 << 2) | (1 << 1)));
+        assert_eq!(smc.read(SL2MPFAR, TEST_CONTEXT), Some(SL2PDWAKE0 + 0x14));
         // A write of 0 to CLEAR has no effect (Table 8).
         smc.write(SL2MPFSR, 0, TEST_CONTEXT);
         assert!(smc.fault_pending());
@@ -725,6 +757,34 @@ mod tests {
             PortWrite::Unhandled
         );
         assert_eq!(smc.read(SL2MPFAR, TEST_CONTEXT), Some(0));
+    }
+
+    #[test]
+    fn only_the_four_supervisor_only_register_families_refuse_a_user_mode_write() {
+        let mut smc = SharedMemory::default();
+        for core in 0..CORES as u32 {
+            assert!(smc.refuse_user_write(core as usize, SL2PDSLEEP0 + 4 * core));
+            assert!(smc.refuse_user_write(core as usize, SL2PDWAKE0 + 4 * core));
+        }
+        assert!(smc.refuse_user_write(0, SL2PFCFLUSH));
+        // Read-only registers, the clear-only status register and the gaps are not faults, and a
+        // refused write is the only thing that records one.
+        smc.write(SL2MPFSR, 1, TEST_CONTEXT);
+        for address in [
+            SL2MPFSR,
+            SL2MPFAR,
+            SL2PDSTAT,
+            SL2AMLSTAT0,
+            SL2AMLDATA0,
+            BASE + 0x014,
+            SL2PDSLEEP0 + 0x18,
+            SL2PDWAKE0 + 0x18,
+        ] {
+            assert!(!smc.refuse_user_write(1, address), "{address:#x}");
+        }
+        assert!(!smc.fault_pending());
+        assert!(is_register(SL2PFCPEN) && is_register(SL2PDWAKE0 + 0x14));
+        assert!(!is_register(BASE - 4) && !is_register(BASE + 0x238));
     }
 
     #[test]
@@ -746,7 +806,6 @@ mod tests {
         smc.write(SL2PDSLEEP0 + 4 * (CORES as u32 - 1), page1, TEST_CONTEXT);
         assert!(smc.page_may_sleep(1));
         assert!(!smc.page_may_sleep(0));
-        assert!(smc.page_sleep_state(1) && !smc.page_sleep_state(0));
         assert_eq!(smc.read(SL2PDSTAT, TEST_CONTEXT), Some(1 << 2));
         // One core withdrawing its permission wakes the page again.
         smc.write(SL2PDSLEEP0 + 4 * 2, 0, TEST_CONTEXT);
@@ -754,7 +813,44 @@ mod tests {
         assert_eq!(smc.read(SL2PDSTAT, TEST_CONTEXT), Some(PAGE_MASK));
         // There is no page 2 on this device (section 4.2: only two pages are RAM).
         assert!(!smc.page_may_sleep(2));
-        assert!(!smc.page_sleep_state(2));
+    }
+
+    #[test]
+    fn a_request_wakes_the_page_it_lands_in_until_the_permissions_are_merged_again() {
+        // SPRUEG5D section 4.3: the SMC wakes a sleeping page when a megamodule accesses it. Both
+        // pages come out of reset asleep (section 5.5), and the first two pages are laid out in
+        // address order: page 0 is the first 512 KB, page 1 the 256 KB after it (section 4.2).
+        let mut smc = SharedMemory::default();
+        assert_eq!(smc.read(SL2PDSTAT, TEST_CONTEXT), Some(0));
+        smc.request(PAGE0_BYTES - 4);
+        assert_eq!(smc.read(SL2PDSTAT, TEST_CONTEXT), Some(1 << 2));
+        smc.request(PAGE0_BYTES);
+        assert_eq!(smc.read(SL2PDSTAT, TEST_CONTEXT), Some(PAGE_MASK));
+        // Every core granting permission lets both sleep again, which is the one merge there is.
+        for core in 0..CORES as u32 {
+            smc.write(SL2PDSLEEP0 + 4 * core, PAGE_MASK, TEST_CONTEXT);
+        }
+        assert_eq!(smc.read(SL2PDSTAT, TEST_CONTEXT), Some(0));
+        smc.request(0);
+        assert_eq!(smc.read(SL2PDSTAT, TEST_CONTEXT), Some(1 << 2));
+    }
+
+    #[test]
+    fn a_request_is_served_by_the_bank_its_granule_selects_in_the_documented_wait_states() {
+        // SPRUEG5D section 2.4: a read that misses the prefetch buffers is "serviced from the
+        // share L2 memory as a 3-wait-state memory". The banks interleave on 256-bit granules.
+        let mut smc = SharedMemory::default();
+        for bank in 0..BANKS {
+            let service = smc.request(32 * bank as u32);
+            assert_eq!(service.bank, bank);
+            assert_eq!(service.wait_states, 3);
+        }
+        assert_eq!(smc.request(32 * BANKS as u32).bank, 0);
+        assert_eq!(
+            smc.request(0x1c).bank,
+            0,
+            "the word offset is inside one granule"
+        );
     }
 
     #[test]
@@ -786,74 +882,55 @@ mod tests {
         assert_eq!(smc.read(SL2PDSTAT, TEST_CONTEXT), Some(0));
     }
 
+    /// SL2AMLSTATn of the bank `offset` belongs to.
+    fn monitor_status(smc: &mut SharedMemory, offset: u32) -> u32 {
+        smc.read(SL2AMLSTAT0 + 4 * monitor_index(offset) as u32, TEST_CONTEXT)
+            .unwrap()
+    }
+
+    /// SL2AMLDATAn of the bank `offset` belongs to.
+    fn monitor_data(smc: &mut SharedMemory, offset: u32) -> u32 {
+        smc.read(SL2AMLDATA0 + 4 * monitor_index(offset) as u32, TEST_CONTEXT)
+            .unwrap()
+    }
+
+    const LINK_V: u32 = 1 << 1;
+    const LINKDT_V: u32 = 1;
+
     #[test]
     fn the_atomic_monitor_runs_the_documented_link_store_commit_sequence() {
         // SPRUEG5D sections 3.1.1 to 3.1.3: LL logs the core, address and LinkV; SL stores the
         // datum and sets LinkdtV; CMTL with all four conditions met clears LinkV, returns the
         // datum for the memory write and reports success.
         let mut smc = SharedMemory::default();
-        let address = 0x0080_0040;
-        smc.load_link(2, address);
+        let offset = 0x0001_0044;
+        smc.load_link(2, offset);
         assert_eq!(
-            smc.read(
-                SL2AMLSTAT0 + 4 * monitor_index(address) as u32,
-                TEST_CONTEXT
-            ),
-            Some((address & AML_ADDR_MASK) | (2 << 2) | (1 << 1))
+            monitor_status(&mut smc, offset),
+            (offset & AML_ADDR_MASK) | (2 << 2) | LINK_V
         );
-        assert!(smc.link(2, address, 0x1234_5678));
+        smc.store_link(2, offset, 0x1234_5678);
         assert_eq!(
-            smc.read(
-                SL2AMLSTAT0 + 4 * monitor_index(address) as u32,
-                TEST_CONTEXT
-            ),
-            Some((address & AML_ADDR_MASK) | (2 << 2) | (1 << 1) | 1)
+            monitor_status(&mut smc, offset),
+            (offset & AML_ADDR_MASK) | (2 << 2) | LINK_V | LINKDT_V
         );
-        assert_eq!(
-            smc.read(
-                SL2AMLDATA0 + 4 * monitor_index(address) as u32,
-                TEST_CONTEXT
-            ),
-            Some(0x1234_5678)
-        );
-        assert_eq!(smc.take_link(2, address), Some(0x1234_5678));
+        assert_eq!(monitor_data(&mut smc, offset), 0x1234_5678);
+        assert_eq!(smc.commit_link(2, offset), Some(0x1234_5678));
         // The commit invalidated the link, so it cannot be taken twice (Table 4).
-        assert_eq!(smc.take_link(2, address), None);
+        assert_eq!(smc.commit_link(2, offset), None);
         // Both status registers are read-only (Figures 11 and 12).
-        let status = smc.read(
-            SL2AMLSTAT0 + 4 * monitor_index(address) as u32,
-            TEST_CONTEXT,
-        );
+        let status = monitor_status(&mut smc, offset);
+        let bank = 4 * monitor_index(offset) as u32;
         assert_ne!(
-            smc.write(
-                SL2AMLSTAT0 + 4 * monitor_index(address) as u32,
-                0,
-                TEST_CONTEXT
-            ),
+            smc.write(SL2AMLSTAT0 + bank, 0, TEST_CONTEXT),
             PortWrite::Unhandled
         );
         assert_ne!(
-            smc.write(
-                SL2AMLDATA0 + 4 * monitor_index(address) as u32,
-                0,
-                TEST_CONTEXT
-            ),
+            smc.write(SL2AMLDATA0 + bank, 0, TEST_CONTEXT),
             PortWrite::Unhandled
         );
-        assert_eq!(
-            smc.read(
-                SL2AMLSTAT0 + 4 * monitor_index(address) as u32,
-                TEST_CONTEXT,
-            ),
-            status
-        );
-        assert_eq!(
-            smc.read(
-                SL2AMLDATA0 + 4 * monitor_index(address) as u32,
-                TEST_CONTEXT
-            ),
-            Some(0x1234_5678)
-        );
+        assert_eq!(monitor_status(&mut smc, offset), status);
+        assert_eq!(monitor_data(&mut smc, offset), 0x1234_5678);
     }
 
     #[test]
@@ -862,34 +939,47 @@ mod tests {
         // an SL to another address invalidates the link, and an SL that arrives with LinkdtV
         // already set invalidates it too.
         let mut smc = SharedMemory::default();
-        let address = 0x0080_0000;
-        smc.load_link(1, address);
-        assert!(!smc.link(4, address, 0xaaaa_aaaa));
-        assert_eq!(smc.take_link(4, address), None);
-        // Core 1 still owns a valid link with no data, so its commit fails but clears LinkV.
-        assert_eq!(smc.take_link(1, address), None);
-        assert_eq!(smc.take_link(1, address), None);
-        // An SL with no live link does nothing at all (Table 3, LinkV = 0 rows).
-        assert!(!smc.link(1, address, 0x5555_5555));
-        // A second SL after a successful one invalidates the link instead of storing again.
-        smc.load_link(1, address);
-        assert!(smc.link(1, address, 0x0000_0001));
-        assert!(!smc.link(1, address, 0x0000_0002));
-        assert_eq!(smc.take_link(1, address), None);
+        let offset = 0x0000_0100;
+        smc.load_link(1, offset);
+        smc.store_link(4, offset, 0xaaaa_aaaa);
         assert_eq!(
-            smc.read(
-                SL2AMLDATA0 + 4 * monitor_index(address) as u32,
-                TEST_CONTEXT
-            ),
-            Some(0x0000_0001)
+            monitor_data(&mut smc, offset),
+            0,
+            "a foreign SL stores nothing"
         );
+        assert_eq!(
+            monitor_status(&mut smc, offset) & (LINK_V | LINKDT_V),
+            LINK_V
+        );
+        assert_eq!(smc.commit_link(4, offset), None);
+        // Core 1 still owns a valid link with no data, so its commit fails but clears LinkV.
+        assert_eq!(monitor_status(&mut smc, offset) & LINK_V, LINK_V);
+        assert_eq!(smc.commit_link(1, offset), None);
+        assert_eq!(monitor_status(&mut smc, offset) & LINK_V, 0);
+        // An SL with no live link does nothing at all (Table 3, LinkV = 0 rows).
+        smc.store_link(1, offset, 0x5555_5555);
+        assert_eq!(monitor_data(&mut smc, offset), 0);
+        assert_eq!(monitor_status(&mut smc, offset) & LINKDT_V, 0);
+        // A second SL after a successful one invalidates the link instead of storing again.
+        smc.load_link(1, offset);
+        smc.store_link(1, offset, 0x0000_0001);
+        smc.store_link(1, offset, 0x0000_0002);
+        assert_eq!(monitor_status(&mut smc, offset) & LINK_V, 0);
+        assert_eq!(smc.commit_link(1, offset), None);
+        assert_eq!(monitor_data(&mut smc, offset), 0x0000_0001);
         // An SL to a different granule of the same bank invalidates the link (Table 3, row
         // LinkV = 1, id match, address mismatch).
-        smc.load_link(1, address);
-        let other = address + 4 * 32 * BANKS as u32;
-        assert_eq!(monitor_index(other), monitor_index(address));
-        assert!(!smc.link(1, other, 0x0000_0003));
-        assert_eq!(smc.take_link(1, address), None);
+        smc.load_link(1, offset);
+        let other = offset + 4 * 32 * BANKS as u32;
+        assert_eq!(monitor_index(other), monitor_index(offset));
+        smc.store_link(1, other, 0x0000_0003);
+        assert_eq!(monitor_status(&mut smc, offset) & LINK_V, 0);
+        assert_eq!(smc.commit_link(1, offset), None);
+        // A different word of the monitored granule is an address mismatch as well: CMTL writes
+        // LinkData to the linked word, which a granule could not name.
+        smc.load_link(1, offset);
+        smc.store_link(1, offset + 4, 0x0000_0004);
+        assert_eq!(monitor_status(&mut smc, offset) & LINK_V, 0);
     }
 
     #[test]
@@ -897,15 +987,15 @@ mod tests {
         // SPRUEG5D section 3: one monitor per per-BANK SMC logic, and accesses to distinct banks
         // never hit the same monitor address.
         let mut smc = SharedMemory::default();
-        let bank0 = 0x0080_0000;
+        let bank0 = 0x0000_0000;
         let bank1 = bank0 + 32;
         assert_ne!(monitor_index(bank0), monitor_index(bank1));
         smc.load_link(0, bank0);
         smc.load_link(1, bank1);
-        assert!(smc.link(0, bank0, 0xa));
-        assert!(smc.link(1, bank1, 0xb));
-        assert_eq!(smc.take_link(0, bank0), Some(0xa));
-        assert_eq!(smc.take_link(1, bank1), Some(0xb));
+        smc.store_link(0, bank0, 0xa);
+        smc.store_link(1, bank1, 0xb);
+        assert_eq!(smc.commit_link(0, bank0), Some(0xa));
+        assert_eq!(smc.commit_link(1, bank1), Some(0xb));
     }
 
     #[test]
@@ -932,7 +1022,6 @@ mod tests {
                 profiler.read(base + PROFILER_STATMASK, TEST_CONTEXT),
                 Some(0)
             );
-            assert!(!profiler.event_pending());
         }
     }
 
@@ -968,13 +1057,8 @@ mod tests {
         // enables it to gather statistics.
         let mut profiler = SharedMemoryProfiler::new(0);
         profiler.note_access(0, 3);
-        profiler.note_prefetch();
         assert_eq!(
             profiler.read(PROFILER_BASE + PROFILER_PWSCNT0 + 12, TEST_CONTEXT),
-            Some(0)
-        );
-        assert_eq!(
-            profiler.read(PROFILER_BASE + PROFILER_PFCCNT, TEST_CONTEXT),
             Some(0)
         );
         profiler.write(PROFILER_BASE + PROFILER_PCMD, PCMD_ENPROFILE, TEST_CONTEXT);
@@ -984,16 +1068,11 @@ mod tests {
         );
         profiler.note_access(0, 3);
         profiler.note_access(0, 3);
-        profiler.note_prefetch();
         assert_eq!(
             profiler.read(PROFILER_BASE + PROFILER_PWSCNT0 + 12, TEST_CONTEXT),
             Some(2)
         );
-        assert_eq!(
-            profiler.read(PROFILER_BASE + PROFILER_PFCCNT, TEST_CONTEXT),
-            Some(1)
-        );
-        // Writing 1 to CLEAR resets all the SL2PWSCNT registers and SL2PFCCNT (section 7.3.4).
+        // Writing 1 to CLEAR resets all the SL2PWSCNT registers (section 7.3.4).
         profiler.write(
             PROFILER_BASE + PROFILER_PCMD,
             PCMD_ENPROFILE | PCMD_CLEAR,
@@ -1001,10 +1080,6 @@ mod tests {
         );
         assert_eq!(
             profiler.read(PROFILER_BASE + PROFILER_PWSCNT0 + 12, TEST_CONTEXT),
-            Some(0)
-        );
-        assert_eq!(
-            profiler.read(PROFILER_BASE + PROFILER_PFCCNT, TEST_CONTEXT),
             Some(0)
         );
         // Disabling stops counting again.
@@ -1060,41 +1135,33 @@ mod tests {
             profiler.read(PROFILER_BASE + PROFILER_PWSCNT0, TEST_CONTEXT),
             Some(1)
         );
-        // A prefetch event comes straight from the SMC and is not filtered (section 7.1.5).
-        profiler.note_prefetch();
+        // SL2PFCCNT counts prefetches the SMC generated, and nothing prefetches here.
         assert_eq!(
             profiler.read(PROFILER_BASE + PROFILER_PFCCNT, TEST_CONTEXT),
-            Some(1)
+            Some(0)
         );
     }
 
     #[test]
     fn a_saturated_counter_stops_and_reports_itself_in_pstat() {
-        // SPRUEG5D section 7.3.5: SL2PSTAT reports the saturation of each SL2PWSCNT in SATn and of
-        // SL2PFCCNT in PSAT.
+        // SPRUEG5D section 7.3.5: SL2PSTAT reports the saturation of each SL2PWSCNT in SATn. PSAT,
+        // the SL2PFCCNT bit, has nothing to report: nothing prefetches, so that counter is 0.
         let mut profiler = SharedMemoryProfiler::new(0);
         profiler.write(PROFILER_BASE + PROFILER_PCMD, PCMD_ENPROFILE, TEST_CONTEXT);
         profiler.wait_state_count[5] = u32::MAX - 1;
-        profiler.prefetch_count = u32::MAX - 1;
         profiler.note_access(0, 5);
-        profiler.note_prefetch();
         assert_eq!(
             profiler.read(PROFILER_BASE + PROFILER_PWSCNT0 + 20, TEST_CONTEXT),
             Some(u32::MAX)
         );
         assert_eq!(
             profiler.read(PROFILER_BASE + PROFILER_PSTAT, TEST_CONTEXT),
-            Some(PSTAT_PSAT | (1 << 5))
+            Some(1 << 5)
         );
         // Saturated counters hold their maximum instead of wrapping.
         profiler.note_access(0, 5);
-        profiler.note_prefetch();
         assert_eq!(
             profiler.read(PROFILER_BASE + PROFILER_PWSCNT0 + 20, TEST_CONTEXT),
-            Some(u32::MAX)
-        );
-        assert_eq!(
-            profiler.read(PROFILER_BASE + PROFILER_PFCCNT, TEST_CONTEXT),
             Some(u32::MAX)
         );
         // SL2PSTAT is read-only and CLEAR takes the counters, and so the status, back to 0.
@@ -1104,7 +1171,7 @@ mod tests {
         );
         assert_eq!(
             profiler.read(PROFILER_BASE + PROFILER_PSTAT, TEST_CONTEXT),
-            Some(PSTAT_PSAT | (1 << 5))
+            Some(1 << 5)
         );
         profiler.write(
             PROFILER_BASE + PROFILER_PCMD,
@@ -1126,21 +1193,21 @@ mod tests {
         profiler.write(PROFILER_BASE + PROFILER_PCMD, PCMD_ENPROFILE, TEST_CONTEXT);
         // Nothing is combined at the reset mask of 0.
         profiler.note_access(0, 2);
-        assert!(!profiler.event_pending());
+        assert!(!profiler.event);
         profiler.write(PROFILER_BASE + PROFILER_STATMASK, 1 << 2, TEST_CONTEXT);
         assert_eq!(
             profiler.read(PROFILER_BASE + PROFILER_STATMASK, TEST_CONTEXT),
             Some(1 << 2)
         );
         profiler.note_access(0, 1);
-        assert!(!profiler.event_pending());
+        assert!(!profiler.event);
         profiler.note_access(0, 2);
-        assert!(profiler.event_pending());
+        assert!(profiler.event);
         assert!(profiler.take_event());
         assert!(!profiler.take_event());
         // A masked-off bank produces no event either, because the SBML drops the request first.
         profiler.write(PROFILER_BASE + PROFILER_BNKMSK, 1, TEST_CONTEXT);
         profiler.note_access(1, 2);
-        assert!(!profiler.event_pending());
+        assert!(!profiler.event);
     }
 }

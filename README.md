@@ -308,6 +308,7 @@ expectation in each is TI's code's rather than this project's.
 | `tests/firmware/bios_kernel/` | a SYS/BIOS kernel exerciser: three tasks on two semaphores, a Swi posted from an interrupt, and one interrupt nested inside another |
 | `tests/firmware/hpi_mailbox/` | firmware that serves a mailbox over the host port interface, taking DSPINT as a real interrupt |
 | `tests/firmware/c6472_multicore/` | firmware for the six-core device: core 0 gives cores 1-5 a start address, releases them through BOOT_COMPLETE_STAT, announces itself with an inter-processor interrupt, and meets all five in the shared L2 |
+| `tests/firmware/c6472_smc/` | firmware for the shared-memory controller: LL, SL, SL, CMTL on a word of the shared L2 (the commit must return 0 and change nothing), and a User-mode write to SL2PFCPEN that must raise system event 63 in all six cores |
 | `tests/tools/tcp_peer.py`, `tests/tools/tap_bridge.py` | a host TCP peer over the emulator's Unix-socket Ethernet backend, and a TAP relay |
 | `tests/tools/hpi_host.py` | a host process driving the HPI: writes DSP memory, raises DSPINT, waits for HINT |
 | `tests/tools/decode_sweep.py`, `tests/tools/dis6x_diff.py` | the two decoder differentials: binutils' whole vector corpus, and TI's own `dis6x` over every built image |

@@ -346,9 +346,6 @@ pub struct Cpu {
     /// device the pin is driven by another core through NMIGR (SPRS612G section 3.7.1).
     nmi_line: bool,
     nmi_pending: bool,
-    /// LL reservation (aligned address and observed write version) plus SL's buffered word.
-    linked_address: Option<(u32, u64)>,
-    linked_store: Option<(u32, u32)>,
     fault: Option<String>,
     /// The cause of the most recent internal exception the firmware was left to handle.
     last_exception_cause: Option<String>,
@@ -440,8 +437,6 @@ impl Cpu {
             interrupt_ready_since: None,
             nmi_line: false,
             nmi_pending: false,
-            linked_address: None,
-            linked_store: None,
             fault: None,
             last_exception_cause: None,
         }
@@ -2267,32 +2262,26 @@ impl Cpu {
             }
             Opcode::LoadLinked => {
                 let address = self.read_register(Bank::B, ((word >> 18) & 0x1f) as usize) & !3;
-                let value = self.read_u32(bus, address);
-                self.linked_address = Some((address, bus.track_memory_version(address)));
-                self.linked_store = None;
+                // LL is a load: it is recorded for the L1D timing and judged by the memory
+                // protection unit once, as `read_u32` does it. The bus reads the word and links it.
+                self.note_load(bus, address);
+                let user = self.user_mode;
+                let value = if bus.check_access(address, Permission::Read, user) {
+                    bus.load_link(address)
+                } else {
+                    0
+                };
                 self.schedule_load(Bank::B, ((word >> 23) & 0x1f) as usize, value, 4);
             }
             Opcode::StoreLinked => {
                 let address = self.read_register(Bank::B, ((word >> 18) & 0x1f) as usize) & !3;
                 let source = ((word >> 23) & 0x1f) as usize;
-                let valid = self.linked_address.is_some_and(|(linked, version)| {
-                    linked == address && bus.memory_version(address) == version
-                });
-                if valid {
-                    self.linked_store = Some((address, self.read_register(Bank::B, source)));
-                } else {
-                    self.linked_address = None;
-                    self.linked_store = None;
-                }
+                bus.store_link(address, self.read_register(Bank::B, source));
             }
             Opcode::CommitLinked => {
                 let address = self.read_register(Bank::B, ((word >> 18) & 0x1f) as usize) & !3;
-                let valid = self.linked_address.is_some_and(|(linked, version)| {
-                    linked == address && bus.memory_version(address) == version
-                });
-                let buffered = self.linked_store.filter(|(stored, _)| *stored == address);
-                let success = valid && buffered.is_some();
-                if let Some((_, value)) = buffered.filter(|_| success) {
+                let committed = bus.commit_link(address);
+                if let Some(value) = committed {
                     self.note_store(bus, address);
                     self.writeback.schedule_store(StoreWrite {
                         due: self.cycle,
@@ -2301,12 +2290,10 @@ impl Cpu {
                         value,
                     });
                 }
-                self.linked_address = None;
-                self.linked_store = None;
                 self.schedule_load(
                     Bank::B,
                     ((word >> 23) & 0x1f) as usize,
-                    u32::from(success),
+                    u32::from(committed.is_some()),
                     4,
                 );
             }

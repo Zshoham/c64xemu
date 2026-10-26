@@ -406,8 +406,9 @@ pub(crate) struct Backing {
     /// Everything with no dense home: external asynchronous memory, and addresses no memory
     /// answers at all.
     sparse: BTreeMap<u32, u8>,
-    /// The version stamp each written word carries, which the linked-atomic instructions
-    /// compare to detect an intervening store.
+    /// The version stamp each written word carries, which a core's `LinkReservation` compares to
+    /// detect an intervening store. Every master's write stamps it (`note_memory_write`), so the
+    /// stamps live with the bytes they describe, and only a word some core has linked is tracked.
     memory_versions: BTreeMap<u32, u64>,
     write_serial: u64,
 }
@@ -748,6 +749,64 @@ impl Backing {
     }
 }
 
+/// One core's load-linked reservation on memory the shared-memory controller does not monitor:
+/// everything but SL2, and every memory of a device that has no controller.
+///
+/// LL records the aligned word and the version stamp the backing store holds for it; SL buffers
+/// the word to store; CMTL succeeds, and yields the buffered word for the caller to store, only
+/// while the stamp is unchanged - so a store by any CPU, the IDMA, an EMAC or the debugger to the
+/// word breaks the link. The reservation is the core's, because a core has exactly one and it
+/// answers for that core's instructions; the stamps are the device's, because any master's write
+/// moves them. The fabric holds both and is what brings them together (`Fabric::load_link`).
+///
+/// SL2 does not come here. The controller's own monitors decide there (SPRUEG5D section 3.1),
+/// and they differ in what they answer - an ordinary store does not break a link, a second SL
+/// does.
+#[derive(Default)]
+pub(crate) struct LinkReservation {
+    /// LL's aligned word and the write version it observed.
+    linked: Option<(u32, u64)>,
+    /// SL's buffered word.
+    buffered: Option<(u32, u32)>,
+}
+
+impl LinkReservation {
+    /// LL: link `address`, observing `version`, and forget any word SL had buffered.
+    pub(crate) fn load(&mut self, address: u32, version: u64) {
+        self.linked = Some((address, version));
+        self.buffered = None;
+    }
+
+    /// SL: buffer `value` for `address` if the link is still the one LL made - the same word, not
+    /// written since (`version` is the stamp now) - and drop the link otherwise.
+    pub(crate) fn store(&mut self, address: u32, value: u32, version: u64) {
+        if self.holds(address, version) {
+            self.buffered = Some((address, value));
+        } else {
+            self.linked = None;
+            self.buffered = None;
+        }
+    }
+
+    /// CMTL: the word to store if the link is intact and SL buffered one for `address`. Either
+    /// way the link ends here.
+    pub(crate) fn commit(&mut self, address: u32, version: u64) -> Option<u32> {
+        let value = self
+            .buffered
+            .filter(|(stored, _)| *stored == address)
+            .filter(|_| self.holds(address, version))
+            .map(|(_, value)| value);
+        self.linked = None;
+        self.buffered = None;
+        value
+    }
+
+    fn holds(&self, address: u32, version: u64) -> bool {
+        self.linked
+            .is_some_and(|(linked, observed)| linked == address && observed == version)
+    }
+}
+
 /// The cache side of one megamodule: its three caches, its MAR bits and its cache
 /// configuration and maintenance registers.
 pub(crate) struct MemoryHierarchy {
@@ -954,6 +1013,21 @@ impl MemoryHierarchy {
         let victim_flush = std::mem::take(&mut self.l1d_victim_flush);
         let now = clock.wall() + u64::from(conflict);
         conflict + self.l1d_timing.miss_stalls(clock.cycle, now, victim_flush)
+    }
+    /// Whether this megamodule's own caches answer a data access to `address`, so that it never
+    /// reaches the memory behind them: L1D holds the line, or the L2 cache does. This is what
+    /// makes an access a request to the shared-memory controller at all (`Fabric::read32`), and
+    /// it must be asked before the access, which fills the line.
+    #[inline]
+    pub(crate) fn answers_data(&self, address: u32) -> bool {
+        (self.l1d.enabled() && self.l1_cacheable(address) && self.l1d.contains(address))
+            || (self.l2_cacheable(address) && self.l2.contains(address))
+    }
+    /// The same for a program fetch: L1P holds the line, or the L2 cache does.
+    #[inline]
+    pub(crate) fn answers_fetch(&self, address: u32) -> bool {
+        (self.l1p.enabled() && self.l1p_cacheable(address) && self.l1p.contains(address))
+            || (self.l2_cacheable(address) && self.l2.contains(address))
     }
     pub(crate) fn fetch_reusable(&self, address: u32) -> bool {
         self.l1p.enabled() && self.l1p_cacheable(address)

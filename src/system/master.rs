@@ -32,8 +32,9 @@
 //! this way, outside memory protection, as it does any register access.
 //!
 //! Every access passes three stages in `Fabric::read`/`write`: the route, `admit` - the one
-//! place a judge of master accesses sits, so a further one (the shared-memory controller's
-//! protection) is a second condition there rather than a second path - and the transfer.
+//! place a judge of master accesses sits - and the transfer. The shared-memory controller is not
+//! a judge: it has no protection of its own (SPRUEG5D section 1.2), so it sits in the transfer
+//! stage, where a transfer to the shared L2 becomes requests to it (`note_sl2_transfer`).
 //! CPU accesses cross the core bus instead, and the debug port crosses `host_read_bytes`.
 
 use super::{
@@ -41,6 +42,9 @@ use super::{
     MEGAMODULE_REGISTERS,
 };
 use crate::memory::is_memory;
+
+/// The width of an SMC bank, 256 bits (SPRUEG5D Figure 2): one master request.
+const BANK_WORD_BYTES: u32 = 32;
 
 /// Whom a master's access is made for: the PrivID and privilege mode memory protection judges
 /// it by. Not to be confused with `Requester`, which only picks the address view an access
@@ -361,6 +365,7 @@ impl Fabric {
     /// the line may be tagged with either the local or the global address, depending on which
     /// the core used, so both are looked for.
     fn memory_bytes(&mut self, address: u32, length: usize) -> Vec<u8> {
+        self.note_sl2_transfer(address, length, true);
         let mut data = self
             .shared
             .backing
@@ -378,6 +383,7 @@ impl Fabric {
     /// operation. Outside L2 SRAM the CPU keeps its stale line, and maintaining that is the
     /// firmware's job (SPRU862B sections 2.4 and 2.6).
     fn store_memory_bytes(&mut self, address: u32, bytes: &[u8]) {
+        self.note_sl2_transfer(address, bytes.len(), false);
         self.shared.backing.note_memory_write(address, bytes.len());
         self.shared
             .backing
@@ -387,6 +393,31 @@ impl Fabric {
             if local != address {
                 self.mm[core].memory.snoop_write(address, bytes);
             }
+        }
+    }
+
+    /// A master's transfer to the shared L2 is a series of requests to the shared-memory
+    /// controller, one per 256-bit bank word it touches (SPRUEG5D Figure 2), and there is no
+    /// cache in front of it to answer any: L1D is not snooped against SL2 (the snoop is of L2
+    /// SRAM only), so every word reaches the SMC.
+    ///
+    /// UNCERTAIN: the SMC has six ports, one per megamodule, and its guide says "all the accesses
+    /// to the SMC go through the L2 controller" (section 1.3) without saying which megamodule a
+    /// master's access enters through. The only address a master can use is a megamodule's global
+    /// alias of SL2 (`AddressMap::shared_ram_alias`), which names one, so the request is that
+    /// megamodule's: its profiler counts it. The first byte decides whether a transfer is SL2's;
+    /// the SMC never judges it, because "no memory protection support on SMC" (section 1.2) -
+    /// the L2 controller's `admit` has already.
+    fn note_sl2_transfer(&mut self, address: u32, length: usize, read: bool) {
+        let Some((core, offset)) = self.profile.map.shared_ram_alias(address) else {
+            return;
+        };
+        let end =
+            (u64::from(offset) + length as u64).min(u64::from(self.profile.map.shared_ram_bytes()));
+        let mut word = u64::from(offset & !(BANK_WORD_BYTES - 1));
+        while word < end {
+            self.shared.sl2_request(core, word as u32, read);
+            word += u64::from(BANK_WORD_BYTES);
         }
     }
 

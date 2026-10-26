@@ -26,9 +26,11 @@ core, the shared L2 RAM and ROM of a multicore device, the DDR2 window as 64 KiB
 on first touch, and a `BTreeMap` for everything sparse. A DDR2 page never touched reads as zero
 without allocating, and the local L2 window has a fast path of its own — `local_l2_run` is one
 subtraction and one bounds check — because that is where code, stacks and most buffers live.
-`Backing` also stamps a version on each written word (`note_memory_write`), which the
-linked-atomic instructions compare to detect an intervening store; that is
-[Execution and timing](execution.md)'s.
+`Backing` also stamps a version on each written word (`note_memory_write`), which each core's
+`LinkReservation` (held by its megamodule, asked through `Fabric::load_link`, `store_link` and
+`commit_link`) compares to detect an intervening store. The stamps are the device's because any
+master's write moves them; the reservation is the core's because a core has exactly one. Linked
+atomics on SL2 do not come here: the shared-memory controller's monitors judge them (below).
 
 ## The address map
 
@@ -87,6 +89,38 @@ Not every address is memory. `is_memory` excludes the configuration space,
 0180 0000h–03FF FFFFh, and the three peripheral data ports outside it: the UTOPIA cell queues at
 3C00 0000h and the two McBSP data buses at 3000 0000h and 3400 0000h (SPRS276M Tables 7-105,
 7-57 and 7-58). A DMA master reaches the [slave port](peripherals.md) rather than memory there.
+
+### The shared L2 and the shared-memory controller
+
+On a C6472 every access that names SL2 RAM - through the local window at 0020 0000h or any
+core's global alias of it - is a request to the shared-memory controller
+([SPRUEG5D](../reference/sprueg5d.pdf); `src/smc.rs`) unless the megamodule's own caches answer
+it first. `AddressMap::shared_ram_offset` turns the address into an offset into the RAM, which is
+the controller's whole view of it ("ADDR IN SMC", Table 11), so the two views of one word are one
+address to it. The fabric asks on every CPU load, store and program fetch
+(`Fabric::observe_sl2`: two subtractions and two compares for an address that is not SL2) and on
+every master transfer (`note_sl2_transfer`). What a request does:
+
+- It wakes the page it lands in (§4.3). Page 0 is the first 512 KB and page 1 the 256 KB after
+  it (§4.2); the guide never says which addresses a page covers, so this is the in-order reading.
+  The page stays awake until the next SL2PDSLEEP or SL2PDWAKE write merges the cores' permissions
+  again.
+- A read is served by the bank its 256-bit granule selects (address bits 6-5, the choice the guide
+  leaves open) in three wait states, the figure for a request that misses the prefetch buffers
+  (§2.4), and the requesting megamodule's profiler files it under both. A store is not a read
+  request and is not counted. A program fetch is one request per line the L1P fills; a load is
+  one per access the L1D and L2 caches do not answer, so a line fill is counted as the miss that
+  caused it.
+- A master has no port of its own on the SMC ("all the accesses to the SMC go through the L2
+  controller", §1.3), so a master's transfer is the request of the megamodule whose global alias
+  of SL2 it used, one per 256-bit bank word. That attribution is the model's reading.
+- LL, SL and CMTL are the monitors' (§3.1; `Fabric::load_link`, `store_link`, `commit_link`).
+  LL and CMTL are read requests whatever the caches hold; SL is a write to the monitor only and
+  never to memory. An ordinary store does not break a link, which is the one place SL2 and the
+  version-stamp reservation of the other memories differ.
+- The SMC does not judge the access: it has "no memory protection support" (§1.2), so
+  `admit` and the L2 controller's protection units decide first and a refused access never
+  reaches it.
 
 ## Cache geometry
 
@@ -528,3 +562,8 @@ cacheability bit nothing external would allocate at all. See
   word-count registers read as zero.
 - The privilege-level condition on write buffer merging.
 - An L2 freeze register.
+- The shared L2's prefetch buffers, per-bank arbitration and write token controller
+  ([SPRUEG5D](../reference/sprueg5d.pdf) §2.3 to §2.5), and every SL2 wait state beyond the
+  three a read that misses them is documented to take. Nothing prefetches, so SL2PFCPEN changes
+  no access and SL2PFCCNT never counts. A sleeping SL2 page wakes on the access that finds it,
+  and the access waits no longer for it.
