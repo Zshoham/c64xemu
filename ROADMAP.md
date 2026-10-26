@@ -960,6 +960,39 @@ all one hundred loop iterations. `sploop_timer_interrupt` checks the same contra
 compiler-generated code: a dot product that cl6x pipelines into an SPLOOP kernel at -O2 and -O3
 is interrupted repeatedly by TINTLO0 and still sums exactly one pass per iteration.
 
+**[ ] L1D stalls for packets the loop buffer replays.** *Observation from moving L1D timing into
+the memory hierarchy; measured, not yet settled by a quote.* A cycle that issues only from the
+SPLOOP buffer, with nothing coming from program memory (`Cpu::execute_sploop_replay`, reached when
+`LoopBuffer::replaying_alone` holds and from a multicycle NOP inside a loop), never asks the
+hierarchy for `data_stalls`: its loads are recorded and its stores still pay write-buffer-full
+stalls, but a bank conflict or an L1D read miss in that cycle costs nothing. In a software-pipelined
+loop every iteration after the first is such a cycle. A throwaway probe on `Cpu::new(0)` measured it,
+the same packets run as a straight-line sequence and as `SPLOOP 1` with ILC = 8 or 16:
+
+| Body | Straight line: cycles / L1D stall cycles | SPLOOP: cycles / L1D stall cycles |
+|---|---|---|
+| `LDW *A3 \|\| LDW *B3`, same bank, x8 | 16 / 8 | 17 / 1 |
+| the same pair, different banks, x8 | 8 / 0 | 16 / 0 |
+| `LDW *A3++[16]` from L2 SRAM, 32K L1D, x16 (16 line fills in both) | 74 / 58 | 37 / 13 |
+
+Only the first iteration, which issues from program memory while the buffer loads, pays. The
+SPLOOP cycle totals include the loop setup (`MVK`, `MVC` to ILC, `NOP 4`, `SPLOOP`), so the stall
+columns are the ones to compare. Nothing
+TI wrote says in so many words that a replayed packet pays the same stalls, but two passages point
+that way. SPRU732J §4.3.3 p.531 gives the memory stall no exception: "The memory stall causes all
+of the pipeline phases to lengthen beyond a single clock cycle". And §7.15.2 p.610 names the only
+stalls the loop buffer is exempt from, "The cross path register file read stall" and "The AMR use
+stall": "the CPU will not stall for instructions coming from the loop buffer that read/use values
+written on the previous cycle that require a stall for correct behavior". SPRU862B §3.2.1 p.47 and
+§3.2.2 p.49 cost the L1D stalls "per Execute Packet" without saying where the packet came from, and
+the §3.4.7 worked examples are a "PIPED LOOP" in C64x assembly rather than SPLOOP code, so
+they cannot settle it either. Read SPRU732J chapter 7 for a statement about memory stalls and the
+loop buffer before changing anything; if nothing contradicts the two passages, the cases are
+the three rows above as `timing:` vectors, with the SPLOOP column made equal to the straight-line
+stall count, plus a DSPLIB kernel the compiler emits as SPLOOP, checked for a cycle-count change.
+The same path leaves the cycle's access record uncleared, so it grows through a long replay-only
+run; nothing reads it, and a fix that charges the stalls clears it on the way.
+
 **[~] Contention stalls.** *Registers done, arbitration timing open.* CPUARB, IDMAARB, SDMAARB,
 UCARB and MDMAARB exist at every documented L1D/L2/EMC address with their reset values and
 writable fields; `memory:bandwidth-arbitration-registers` checks all twelve. IDMA advances in
