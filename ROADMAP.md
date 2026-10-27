@@ -1139,9 +1139,13 @@ completion interrupt routed to CPU interrupt 7.
 registers update line state, and L1PCC/L1DCC freeze modes continue servicing resident hits while
 blocking allocation and report the prior OPER state. IDMA snoops dirty sources and invalidates
 destinations; external DMA bypasses stale CPU lines. `cache:l1d-freeze-blocks-allocation` and
-the paired `cache:emac-*dirty-buffer` cases pin both contracts, and the `gpio_edma_cache`
-firmware drives them from C: dropping its L1D writeback makes the EDMA3 copy stale words and
-dropping its invalidate makes the CPU read cached zeros, so its checksum checks both. Large-region
+the paired `cache:emac-*dirty-buffer` cases pin both contracts. The `gpio_edma_cache` firmware no
+longer checks either from C: its buffers are in L2 SRAM, which the snoop protocol has kept
+coherent since that fix, so dropping its invalidate, or both operations, leaves the answer
+unchanged at every optimisation level. Dropping the writeback alone changes it only at -Os, where
+the locals live on the stack and the global L1DINV then discards their dirty lines; its comments
+and spec now say so. `ethernet_external_coherence` is the program that checks both against a DMA
+master. Large-region
 operation timing and simultaneous CPU/DMA arbitration remain timing-only gaps: the arbitration half
 is the timing item above, the other half is the item below.
 

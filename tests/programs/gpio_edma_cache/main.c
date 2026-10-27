@@ -1,18 +1,26 @@
-/* A GPIO edge that moves a block through the EDMA3, with the cache in the way.
+/* A GPIO edge that moves a block through the EDMA3, with L1D caching both buffers.
  *
  * Pin 0 is configured as an output with rising-edge detection, so a software toggle raises GPINT0
  * exactly as an external signal would; GPINT0 is EDMA3 synchronisation event 48 (SPRU966C
- * Table 2-6). L1D is switched to 32K cache first, and both cache operations a driver has to
- * perform are load-bearing here:
+ * Table 2-6). L1D is switched to 32K cache first, and the buffers are set up the way a driver's
+ * would be at the moment of a transfer:
  *
  *   - the source words are written, read (which allocates their lines) and written again, so the
- *     new values sit dirty in L1D while L2 still holds the first pass; without the writeback the
- *     EDMA3 would copy the stale words, because an external master reads memory rather than the
- *     CPU's cache;
- *   - the destination is read while it is still zero, which leaves clean zero lines in L1D;
- *     without the invalidate the CPU would read those zeros back instead of what the EDMA3 wrote.
+ *     new values sit dirty in L1D while L2 SRAM still holds the first pass;
+ *   - the destination is read while it is still zero, which leaves clean zero lines in L1D.
  *
- * So the checksum this returns is proof of the edge, the transfer and both cache operations.
+ * Both buffers are in L2 SRAM, which the hardware keeps coherent with L1D (SPRU862B section
+ * 2.4.2): the EDMA3's read of the source is served from the dirty L1D lines, and its write to the
+ * destination is forwarded into the cached zero lines. So the writeback and the invalidate below
+ * are what a driver written for any memory issues, not what this transfer needs - the checksum is
+ * the same without the invalidate, or without both. ethernet_external_coherence is the program
+ * where they are load-bearing, because its buffers are in DDR2, which nothing snoops.
+ *
+ * The invalidate is global, though, so the writeback in front of it protects the program's own
+ * dirty lines rather than the transfer: at -Os the compiler keeps `stale` and `zeros` on the stack,
+ * and without the writeback L1DINV discards them and the program returns -2.
+ *
+ * So the checksum this returns is proof of the edge and the transfer, with L1D enabled throughout.
  */
 
 #define REG(address) (*(volatile unsigned int *)(address))
@@ -85,7 +93,8 @@ int main(void)
     REG(EDMA_IESR) = 1u << TCC;
     REG(EDMA_EESRH) = 1u << (48u - 32u);
 
-    /* Hand the dirty source words to memory before the transfer reads them. */
+    /* Write every dirty L1D line back - the source, and the stack the invalidate below would
+       otherwise discard. The snoop would hand the EDMA3 the dirty source words regardless. */
     REG(L1DWB) = 1u;
 
     /* Pin 0 an output, its rising edge enabled, and the bank's interrupt enable set. */
@@ -109,7 +118,8 @@ int main(void)
     }
     REG(EDMA_ICR) = 1u << TCC;
 
-    /* Drop the cached zeros so the transfer's result is visible. */
+    /* Drop every L1D line. The snoop has already put the transfer's result into the cached zero
+       lines, so this changes nothing the loop below reads. */
     REG(L1DINV) = 1u;
 
     for (index = 0; index < WORDS; index++) {
