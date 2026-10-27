@@ -366,6 +366,7 @@ impl Fabric {
     /// the core used, so both are looked for.
     fn memory_bytes(&mut self, address: u32, length: usize) -> Vec<u8> {
         self.note_sl2_transfer(address, length, true);
+        self.note_coherence(address, length, false);
         let mut data = self
             .shared
             .backing
@@ -392,6 +393,51 @@ impl Fabric {
             self.mm[core].memory.snoop_write(local, bytes);
             if local != address {
                 self.mm[core].memory.snoop_write(address, bytes);
+            }
+        }
+        self.note_coherence(address, bytes.len(), true);
+    }
+
+    /// Hand a master's transfer to every core's coherence check, under each address that core
+    /// could have cached the bytes by: the one the master used, the core's local name for its
+    /// own memory behind a global alias, and - for the shared L2 - its local window and its alias
+    /// in every core's global block, since a core may cache it through any of them. The owner of
+    /// snooped L2 SRAM is the one core the hardware keeps coherent; for every other core the
+    /// same bytes are someone else's memory.
+    fn note_coherence(&mut self, address: u32, length: usize, write: bool) {
+        if !self.mm[0].memory.checks_coherence() {
+            return;
+        }
+        let map = self.profile.map;
+        let owner = self.snooped_l2(address).map(|(core, _)| core);
+        let local = map.local_of_global(address);
+        let mut common = vec![address];
+        if let Some((_, offset)) = map.shared_ram_alias(address) {
+            let shared = map.shared_ram_base() + offset;
+            common.push(shared);
+            common.extend(
+                (0..self.cores)
+                    .filter_map(|core| map.global_alias_base(core).map(|base| base + shared)),
+            );
+        }
+        let length = length as u32;
+        for core in 0..self.cores {
+            let snooped = owner == Some(core);
+            let mut tags = common.clone();
+            tags.extend(
+                local
+                    .filter(|(owner, _)| *owner == core)
+                    .map(|(_, offset)| offset),
+            );
+            tags.sort_unstable();
+            tags.dedup();
+            let memory = &mut self.mm[core].memory;
+            for tag in tags {
+                if write {
+                    memory.master_wrote(tag, length, snooped);
+                } else {
+                    memory.master_read(tag, length, snooped);
+                }
             }
         }
     }
@@ -466,7 +512,7 @@ impl MasterAccess for std::collections::BTreeMap<u32, u8> {
 mod tests {
     use super::*;
     use crate::device::{DeviceProfile, C6455, C6472};
-    use crate::memory::{L1DCFG, L2CFG, MAR_BASE};
+    use crate::memory::{CoherenceHazard, DataCache, L1DCFG, L2CFG, MAR_BASE};
     use std::collections::BTreeMap;
 
     const L2MPFAR: u32 = 0x0184_a000;
@@ -700,6 +746,248 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The coherence check names each of the three ways a program lets a master and the CPU
+    /// disagree about memory nothing snoops, at the access that goes wrong, and stays silent for
+    /// the cache operations SPRU862B Table 2-2 asks for.
+    #[test]
+    fn the_coherence_check_names_what_firmware_left_incoherent() {
+        const DDR: u32 = 0xe000_1000;
+        const L1D_LINE: u32 = 0x0184_4040; // L1DWBAR; L1DWWC, L1DIBAR, L1DIWC follow
+        let privilege = Privilege::ID0_SUPERVISOR;
+        let cached = || {
+            let mut fabric = Fabric::new(&C6455);
+            fabric.set_coherence_check(true);
+            fabric.write32(0, MAR_BASE + 224 * 4, 1);
+            fabric.write32(0, L1DCFG, 1);
+            assert_eq!(fabric.read32(0, DDR), 0);
+            fabric
+        };
+
+        // A buffer written into the cache and handed to a master unflushed.
+        let mut fabric = cached();
+        fabric.write32(0, DDR, 1);
+        fabric.read_word(privilege, DDR);
+        assert_eq!(
+            fabric.take_coherence_hazards(),
+            [(
+                0,
+                CoherenceHazard::UnflushedRead {
+                    cache: DataCache::L1d,
+                    line: DDR
+                }
+            )]
+        );
+        // Written back first, the same transfer is fine.
+        fabric.write32(0, L1D_LINE, DDR);
+        fabric.write32(0, L1D_LINE + 4, 1);
+        fabric.read_word(privilege, DDR);
+        assert_eq!(fabric.take_coherence_hazards(), []);
+
+        // A master's write read back through the line cached before it.
+        let mut fabric = cached();
+        fabric.write_word(privilege, DDR + 8, 7);
+        assert_eq!(fabric.take_coherence_hazards(), []);
+        assert_eq!(
+            fabric.read32(0, DDR + 4),
+            0,
+            "a byte the master did not write"
+        );
+        assert_eq!(fabric.take_coherence_hazards(), []);
+        assert_eq!(fabric.read32(0, DDR + 8), 0);
+        assert_eq!(
+            fabric.take_coherence_hazards(),
+            [(
+                0,
+                CoherenceHazard::StaleRead {
+                    cache: DataCache::L1d,
+                    address: DDR + 8
+                }
+            )]
+        );
+        // Invalidated after the transfer, the read is fresh and silent.
+        fabric.write32(0, L1D_LINE + 8, DDR);
+        fabric.write32(0, L1D_LINE + 12, 1);
+        assert_eq!(fabric.read32(0, DDR + 8), 7);
+        assert_eq!(fabric.take_coherence_hazards(), []);
+
+        // A dirty line written back over what a master wrote after it.
+        let mut fabric = cached();
+        fabric.write32(0, DDR, 1);
+        fabric.write_word(privilege, DDR + 8, 7);
+        fabric.write32(0, L1D_LINE, DDR);
+        fabric.write32(0, L1D_LINE + 4, 1);
+        assert_eq!(
+            fabric.take_coherence_hazards(),
+            [(
+                0,
+                CoherenceHazard::Clobber {
+                    cache: DataCache::L1d,
+                    line: DDR
+                }
+            )]
+        );
+        assert_eq!(
+            fabric.shared.backing.read_bytes(Requester::Dma, DDR + 8, 4),
+            [0; 4],
+            "the master's word was lost, which is what the report is about"
+        );
+    }
+
+    /// L2 SRAM is snooped against L1D and nothing else is: a master writing the owner's L2 SRAM
+    /// leaves its L1D coherent and its L1P stale, and another core caching the same SRAM through
+    /// the global alias, or the shared L2 through its local window, is not kept coherent at all.
+    #[test]
+    fn the_coherence_check_follows_what_the_snoop_covers() {
+        const L1PCFG: u32 = 0x0184_0020;
+        const SRAM: u32 = 0x0080_2000;
+        const SL2: u32 = 0x0020_1000;
+        let privilege = Privilege::ID0_SUPERVISOR;
+        let mut fabric = Fabric::new(&C6472);
+        fabric.set_coherence_check(true);
+        for core in 0..2 {
+            fabric.write32(core, L1PCFG, 1);
+            fabric.write32(core, L1DCFG, 1);
+        }
+        fabric.write32(1, MAR_BASE + 16 * 4, 1);
+        let global = 0x1000_0000 + SRAM;
+        assert_eq!(fabric.fetch32(0, SRAM), 0);
+        assert_eq!(fabric.read32(0, SRAM), 0);
+        assert_eq!(fabric.read32(1, global), 0);
+        assert_eq!(fabric.read32(1, SL2), 0);
+
+        fabric.write_word(privilege, global, 5);
+        fabric.write_word(privilege, 0x1100_0000 + SL2, 6);
+        assert_eq!(fabric.read32(0, SRAM), 5, "snooped into core 0's L1D");
+        assert_eq!(fabric.fetch32(0, SRAM), 0);
+        assert_eq!(fabric.read32(1, global), 0);
+        assert_eq!(fabric.read32(1, SL2), 0);
+        assert_eq!(
+            fabric.take_coherence_hazards(),
+            [
+                (0, CoherenceHazard::StaleFetch { address: SRAM }),
+                (
+                    1,
+                    CoherenceHazard::StaleRead {
+                        cache: DataCache::L1d,
+                        address: global
+                    }
+                ),
+                (
+                    1,
+                    CoherenceHazard::StaleRead {
+                        cache: DataCache::L1d,
+                        address: SL2
+                    }
+                ),
+            ]
+        );
+    }
+
+    /// The shared L2 has a global alias in every core's block, and a core may cache it through
+    /// any of them: a master writing through one alias leaves stale a line another alias tags.
+    #[test]
+    fn the_coherence_check_follows_every_alias_of_the_shared_l2() {
+        const OWN_ALIAS: u32 = 0x1020_1000;
+        const OTHER_ALIAS: u32 = 0x1120_1000;
+        let mut fabric = Fabric::new(&C6472);
+        fabric.set_coherence_check(true);
+        fabric.write32(0, L1DCFG, 1);
+        fabric.write32(0, MAR_BASE + 16 * 4, 1);
+        assert_eq!(fabric.read32(0, OWN_ALIAS), 0);
+
+        fabric.write_word(Privilege::ID0_SUPERVISOR, OTHER_ALIAS, 7);
+        assert_eq!(fabric.read32(0, OWN_ALIAS), 0);
+        assert_eq!(
+            fabric.take_coherence_hazards(),
+            [(
+                0,
+                CoherenceHazard::StaleRead {
+                    cache: DataCache::L1d,
+                    address: OWN_ALIAS
+                }
+            )]
+        );
+    }
+
+    /// A line filled from a stale L2 line inherits which of its bytes are stale: the fill is not
+    /// a CPU read and reports nothing, the CPU's read of an untouched byte reports nothing, and
+    /// its read of the byte the master wrote does.
+    #[test]
+    fn an_l1d_fill_carries_the_l2_lines_stale_bytes_without_reporting_them() {
+        const DDR: u32 = 0xe000_1000;
+        let mut fabric = Fabric::new(&C6455);
+        fabric.set_coherence_check(true);
+        fabric.write32(0, MAR_BASE + 224 * 4, 1);
+        fabric.write32(0, L2CFG, 1);
+        assert_eq!(fabric.read32(0, DDR), 0, "the line is now in L2 alone");
+        fabric.write32(0, L1DCFG, 1);
+
+        fabric.write_word(Privilege::ID0_SUPERVISOR, DDR + 8, 7);
+        assert_eq!(fabric.read32(0, DDR), 0);
+        assert_eq!(fabric.take_coherence_hazards(), [], "the fill reported");
+        assert_eq!(fabric.read32(0, DDR + 8), 0);
+        assert_eq!(
+            fabric.take_coherence_hazards(),
+            [(
+                0,
+                CoherenceHazard::StaleRead {
+                    cache: DataCache::L1d,
+                    address: DDR + 8
+                }
+            )]
+        );
+    }
+
+    /// Every stale line a cycle reads is reported, not only the first: an execute packet with
+    /// two loads from two buffers a master has overwritten names both.
+    #[test]
+    fn two_stale_reads_between_collections_are_both_reported() {
+        const FIRST: u32 = 0xe000_1000;
+        const SECOND: u32 = 0xe000_2000;
+        let mut fabric = Fabric::new(&C6455);
+        fabric.set_coherence_check(true);
+        fabric.write32(0, MAR_BASE + 224 * 4, 1);
+        fabric.write32(0, L1DCFG, 1);
+        assert_eq!(fabric.read32(0, FIRST), 0);
+        assert_eq!(fabric.read32(0, SECOND), 0);
+        fabric.write_word(Privilege::ID0_SUPERVISOR, FIRST, 1);
+        fabric.write_word(Privilege::ID0_SUPERVISOR, SECOND, 2);
+
+        assert_eq!(fabric.read32(0, FIRST), 0);
+        assert_eq!(fabric.read32(0, FIRST + 4), 0, "the same line again");
+        assert_eq!(fabric.read32(0, SECOND), 0);
+        let stale = |address| {
+            (
+                0,
+                CoherenceHazard::StaleRead {
+                    cache: DataCache::L1d,
+                    address,
+                },
+            )
+        };
+        assert_eq!(
+            fabric.take_coherence_hazards(),
+            [stale(FIRST), stale(SECOND)]
+        );
+    }
+
+    /// Cache statistics count byte lookups. A line fill a frozen L2 sends to memory looks up
+    /// every byte of the line and finds none of them, as the per-byte path it replaced counted.
+    #[test]
+    fn an_l1d_fill_past_a_frozen_l2_misses_on_every_byte() {
+        const DDR: u32 = 0xe000_1000;
+        let mut fabric = Fabric::new(&C6455);
+        fabric.write32(0, MAR_BASE + 224 * 4, 1);
+        fabric.write32(0, L2CFG, 1 | 1 << 3);
+        fabric.write32(0, L1DCFG, 1);
+        assert_eq!(fabric.read32(0, DDR), 0);
+        let [_, l1d, l2] = fabric.megamodule(0).cache_views();
+        assert_eq!(l1d.stats.line_fills, 1);
+        assert_eq!(l2.stats.read_misses, 64);
+        assert_eq!(l2.stats.read_hits, 0);
+        assert_eq!(l2.stats.line_fills, 0);
     }
 
     #[test]

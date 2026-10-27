@@ -127,14 +127,15 @@ Shared by `run` and `debug`.
 | `--trace-exceptions` | off | Print `exception at 0xADDR: CAUSE` on stderr for every internal exception left to the firmware. Note that it also opts the run out of the fast resume path described below. |
 | `--profile` | off | Keep the per-address packet histogram. Adds `profile` and `cache_stats` to the state report and feeds the debugger's hotspot views. |
 | `--cache` | off | Program every core's L1P, L1D and L2 to the largest configuration a C64x+ megamodule has — 32 KB, 32 KB and 256 KB — by writing mode 4 into `L1PCFG`, `L1DCFG` and `L2CFG` as firmware would ([SPRU871K](../reference/spru871k.pdf)). Nothing else changes: MAR cacheability stays at its reset values and the caches come up cold, so the program answers the same and takes more cycles doing it. See [Memory and caches](../internals/memory-and-caches.md). |
+| `--coherence-check` | off | Report on stderr, once per line, every DMA transfer that disagrees with what a core caches where the hardware keeps no coherence: a read or fetch of a line a master has since overwritten, a master reading past a dirty line, a dirty line written back over a master's data. Each report names the core, cycle, PC and the cache operation that was missing. What the program sees is unchanged. Opts the run out of the fast resume path. See [Memory and caches](../internals/memory-and-caches.md#the-coherence-check). |
 
 The trace and network options are covered in use by [Debugging](debugging.md) and
 [Networking and host I/O](networking-and-host-io.md).
 
-Two of these change the shape of the run loop. `Machine::resume` takes a fast path,
-`resume_budget`, when the only stop condition is a cycle budget and neither Ethernet history nor
-`--trace-exceptions` is active; `--trace-exceptions` therefore costs a per-cycle check even on
-cycles that raise nothing.
+Some of these change the shape of the run loop. `Machine::resume` takes a fast path,
+`resume_budget`, when the only stop condition is a cycle budget and neither Ethernet history,
+`--trace-exceptions` nor `--coherence-check` is active; those two therefore cost a per-cycle
+check even on cycles that raise nothing.
 
 ## Batch run options
 

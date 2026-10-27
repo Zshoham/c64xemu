@@ -819,6 +819,84 @@ impl LinkReservation {
     }
 }
 
+/// The cache a coherence hazard was found in.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub(crate) enum DataCache {
+    L1d,
+    L2,
+}
+
+impl std::fmt::Display for DataCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            DataCache::L1d => "L1D",
+            DataCache::L2 => "L2",
+        })
+    }
+}
+
+/// One way a program let a DMA master and the CPU disagree about memory the hardware does not
+/// keep coherent: everything but L2 SRAM against L1D, and L1P against everything (SPRU862B
+/// sections 2.4 and 2.6). Each is a firmware bug on silicon that the model reproduces
+/// faithfully, so the program sees the wrong data either way; the coherence check says when
+/// and where. Lines are named by the address the core cached them under.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub(crate) enum CoherenceHazard {
+    /// The CPU read bytes a master had written to memory after the line was filled: the line
+    /// should have been invalidated after the transfer.
+    StaleRead { cache: DataCache, address: u32 },
+    /// The CPU fetched code a master had written to memory after the L1P line was filled.
+    StaleFetch { address: u32 },
+    /// A master read memory while this core held newer bytes of it in a dirty line nothing
+    /// snoops: the line should have been written back before the transfer.
+    UnflushedRead { cache: DataCache, line: u32 },
+    /// A dirty line went back to memory over bytes a master had written since it was filled:
+    /// the line should have been invalidated before the transfer, not written back after it.
+    Clobber { cache: DataCache, line: u32 },
+}
+
+impl CoherenceHazard {
+    /// The line the hazard is about, which is what a report is deduplicated on.
+    pub(crate) fn line(self) -> u32 {
+        match self {
+            Self::StaleRead {
+                cache: DataCache::L1d,
+                address,
+            } => address & !63,
+            Self::StaleRead { address, .. } => address & !127,
+            Self::StaleFetch { address } => address & !31,
+            Self::UnflushedRead { line, .. } | Self::Clobber { line, .. } => line,
+        }
+    }
+}
+
+impl std::fmt::Display for CoherenceHazard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Self::StaleRead { cache, address } => write!(
+                f,
+                "read of {address:#010x} hit an {cache} line a DMA master has since overwritten \
+                 in memory; invalidate the range after the transfer"
+            ),
+            Self::StaleFetch { address } => write!(
+                f,
+                "fetch of {address:#010x} hit an L1P line a DMA master has since overwritten in \
+                 memory; invalidate L1P after the transfer"
+            ),
+            Self::UnflushedRead { cache, line } => write!(
+                f,
+                "a DMA master read memory the {cache} line at {line:#010x} holds dirty; write \
+                 the range back before the transfer"
+            ),
+            Self::Clobber { cache, line } => write!(
+                f,
+                "the dirty {cache} line at {line:#010x} was written back over bytes a DMA master \
+                 wrote; invalidate the range before the transfer, not write it back after"
+            ),
+        }
+    }
+}
+
 /// The cache side of one megamodule: its three caches, its MAR bits and its cache
 /// configuration and maintenance registers.
 pub(crate) struct MemoryHierarchy {
@@ -852,6 +930,9 @@ pub(crate) struct MemoryHierarchy {
     l1p: Cache,
     /// Invalidates the CPU's one-packet fetch buffer when software changes L1P state.
     l1p_epoch: u64,
+    /// Moves when the coherence check marks an L1P line stale, so the CPU reads a packet it holds
+    /// a copy of back through L1P and the read reports (`Cpu::step`).
+    l1p_stale_epoch: u64,
     /// The L1P line fills since the fetch path last drained them, each with where the line came
     /// from, which is what the per-packet miss stalls charge on.
     l1p_fills: Vec<LineFill>,
@@ -865,6 +946,10 @@ pub(crate) struct MemoryHierarchy {
     l2: Cache,
     /// The base addresses of the seven range cache operations.
     cache_bars: [u32; 7],
+    /// Whether DMA traffic is checked against what this core caches (`--coherence-check`).
+    coherence_check: bool,
+    /// What the check has found since the machine last collected.
+    hazards: Vec<CoherenceHazard>,
 }
 
 impl MemoryHierarchy {
@@ -896,6 +981,7 @@ impl MemoryHierarchy {
             l1p_cc: 0,
             l1d_cc: 0,
             l1p_epoch: 0,
+            l1p_stale_epoch: 0,
             // L1P is direct-mapped, L1D two-way LRU and L2 four-way (SPRU862B Table 1-2 and
             // section 1.8, SPRS276M section 4).
             l1p: Cache::new(32, 1),
@@ -910,6 +996,8 @@ impl MemoryHierarchy {
             l1d: Cache::new(64, 2),
             l2: Cache::new(128, 4),
             cache_bars: [0; 7],
+            coherence_check: false,
+            hazards: Vec::new(),
         }
     }
     #[inline]
@@ -1048,6 +1136,14 @@ impl MemoryHierarchy {
     }
     pub(crate) fn l1p_epoch(&self) -> u64 {
         self.l1p_epoch
+    }
+    /// Moves whenever the coherence check marks an L1P line stale (`master_wrote`).
+    pub(crate) fn l1p_stale_epoch(&self) -> u64 {
+        self.l1p_stale_epoch
+    }
+    /// Whether L1P holds the line `address` is in.
+    pub(crate) fn l1p_holds(&self, address: u32) -> bool {
+        self.l1p.contains(address)
     }
     /// Whether this address is this megamodule's own L1P or L1D memory, which none of its three
     /// caches may hold - see `own_l1` for the two sentences that say so. It covers the whole
@@ -1197,6 +1293,70 @@ impl MemoryHierarchy {
     pub(crate) fn mar_read(&self, address: u32) -> Option<u32> {
         mar_index(address).map(|index| self.mar[index])
     }
+    /// Turn the coherence check on or off for this megamodule.
+    pub(crate) fn set_coherence_check(&mut self, on: bool) {
+        self.coherence_check = on;
+    }
+    pub(crate) fn checks_coherence(&self) -> bool {
+        self.coherence_check
+    }
+    /// A master wrote `length` bytes of memory this core may hold under `tag`. L1P is never
+    /// snooped, so its copy is stale wherever the bytes were; L1D and L2 are stale unless the
+    /// bytes are this core's L2 SRAM, which the snoop has already written into L1D.
+    pub(crate) fn master_wrote(&mut self, tag: u32, length: u32, snooped: bool) {
+        if !self.coherence_check {
+            return;
+        }
+        // The CPU issues the rest of a fetch packet from its own copy without asking L1P again
+        // (`Cpu::packet_line`). Moving this epoch tells it to read its packet back through L1P if
+        // L1P holds it - the same bytes, so nothing it executes changes, but the read reports.
+        // A packet a frozen L1P let past is not held and stays buffered, as it does unchecked.
+        if self.l1p.mark_stale(tag, length) {
+            self.l1p_stale_epoch = self.l1p_stale_epoch.wrapping_add(1);
+        }
+        if !snooped {
+            self.l1d.mark_stale(tag, length);
+            self.l2.mark_stale(tag, length);
+        }
+    }
+    /// A master read `length` bytes of memory this core may hold under `tag`. Outside the
+    /// snooped L2 SRAM a dirty line is newer than what the master got.
+    pub(crate) fn master_read(&mut self, tag: u32, length: u32, snooped: bool) {
+        if snooped || !self.coherence_check {
+            return;
+        }
+        if let Some(line) = self.l1d.dirty_overlap(tag, length) {
+            self.hazards.push(CoherenceHazard::UnflushedRead {
+                cache: DataCache::L1d,
+                line,
+            });
+        }
+        if let Some(line) = self.l2.dirty_overlap(tag, length) {
+            self.hazards.push(CoherenceHazard::UnflushedRead {
+                cache: DataCache::L2,
+                line,
+            });
+        }
+    }
+    /// Everything the coherence check has found since the last call.
+    pub(crate) fn take_hazards(&mut self) -> Vec<CoherenceHazard> {
+        for address in self.l1p.take_stale_hits() {
+            self.hazards.push(CoherenceHazard::StaleFetch { address });
+        }
+        for address in self.l1d.take_stale_hits() {
+            self.hazards.push(CoherenceHazard::StaleRead {
+                cache: DataCache::L1d,
+                address,
+            });
+        }
+        for address in self.l2.take_stale_hits() {
+            self.hazards.push(CoherenceHazard::StaleRead {
+                cache: DataCache::L2,
+                address,
+            });
+        }
+        std::mem::take(&mut self.hazards)
+    }
     /// Write the MAR register at `address`. Only the cacheability bit is writable, and only
     /// for the external regions the cache controller actually consults (index >= 16); the
     /// on-chip regions are read-only and always cacheable.
@@ -1305,12 +1465,13 @@ impl BoundHierarchy<'_> {
         let line_size = self.hierarchy.l1p.line_size();
         let base = address & !(line_size - 1);
         let from_l2_cache = self.hierarchy.l2_cacheable(base);
-        let data = self.read_l2_bytes(base, line_size as usize);
+        let (data, stale) = self.fill_line(base, line_size);
         self.hierarchy.l1p_fills.push(LineFill {
             line: base,
             from_l2_cache,
         });
         self.hierarchy.l1p.insert(base, data);
+        self.hierarchy.l1p.carry_stale(base, stale);
         self.hierarchy.l1p.read_filled_bytes(address).unwrap()
     }
     fn read_data_bytes<const N: usize>(&mut self, address: u32) -> [u8; N] {
@@ -1329,11 +1490,12 @@ impl BoundHierarchy<'_> {
             return bytes;
         }
         let base = address & !(line_size - 1);
-        let data = self.read_l2_bytes(base, line_size as usize);
+        let (data, stale) = self.fill_line(base, line_size);
         if let Some(evicted) = self.hierarchy.l1d.insert(base, data) {
             self.hierarchy.l1d_victim_flush |= evicted.dirty;
             self.write_l1_line(evicted);
         }
+        self.hierarchy.l1d.carry_stale(base, stale);
         self.hierarchy.l1d.read_filled_bytes(address).unwrap()
     }
     fn write_data_bytes<const N: usize>(&mut self, address: u32, bytes: [u8; N]) {
@@ -1368,11 +1530,12 @@ impl BoundHierarchy<'_> {
         }
         let line_size = self.hierarchy.l1d.line_size();
         let base = address & !(line_size - 1);
-        let data = self.read_l2_bytes(base, line_size as usize);
+        let (data, stale) = self.fill_line(base, line_size);
         if let Some(evicted) = self.hierarchy.l1d.insert(base, data) {
             self.hierarchy.l1d_victim_flush |= evicted.dirty;
             self.write_l1_line(evicted);
         }
+        self.hierarchy.l1d.carry_stale(base, stale);
         self.hierarchy.l1d.read_filled_byte(address).unwrap()
     }
     fn write_data_byte(&mut self, address: u32, value: u8) {
@@ -1385,15 +1548,38 @@ impl BoundHierarchy<'_> {
         }
         self.write_l2_byte(address, value);
     }
-    fn read_l2_bytes(&mut self, address: u32, length: usize) -> Vec<u8> {
-        if !self.hierarchy.l2_cacheable(address) {
-            self.backing
-                .read_bytes(self.hierarchy.requester(), address, length)
-        } else {
-            (0..length)
-                .map(|offset| self.read_l2_byte(address.wrapping_add(offset as u32)))
-                .collect()
+    /// An L1P or L1D line fill: the bytes the level below holds, and which of them a master has
+    /// overwritten since L2 cached them (bit 0 is `base`). A fill is not a CPU read, so nothing is
+    /// reported here: the mask goes into the new line, and the CPU's own read of a stale byte is
+    /// what reports it. An L1 line never straddles an L2 line, so the fill is one L2 line's span.
+    fn fill_line(&mut self, base: u32, length: u32) -> (Vec<u8>, u128) {
+        let requester = self.hierarchy.requester();
+        if !self.hierarchy.l2_cacheable(base) {
+            return (self.backing.read_bytes(requester, base, length as usize), 0);
         }
+        if let Some(found) = self.hierarchy.l2.read_span(base, length) {
+            return found;
+        }
+        // A frozen L2 sends the miss to memory without allocating (SPRU871K section 4.3.5). Each
+        // byte of the span is a lookup that missed, and `read_span` has counted only the first.
+        if self.hierarchy.l2.frozen() {
+            self.hierarchy
+                .l2
+                .count_read_misses(length.saturating_sub(1));
+            return (self.backing.read_bytes(requester, base, length as usize), 0);
+        }
+        let line_size = self.hierarchy.l2.line_size();
+        let l2_base = base & !(line_size - 1);
+        let data = self
+            .backing
+            .read_bytes(requester, l2_base, line_size as usize);
+        if let Some(evicted) = self.hierarchy.l2.insert(l2_base, data) {
+            self.write_l2_line(evicted);
+        }
+        self.hierarchy
+            .l2
+            .read_filled_span(base, length)
+            .expect("the line was just filled")
     }
     fn read_l2_byte(&mut self, address: u32) -> u8 {
         if !self.hierarchy.l2_cacheable(address) {
@@ -1643,6 +1829,12 @@ impl BoundHierarchy<'_> {
         if !line.dirty {
             return;
         }
+        if line.stale {
+            self.hierarchy.hazards.push(CoherenceHazard::Clobber {
+                cache: DataCache::L1d,
+                line: line.address,
+            });
+        }
         if !self.hierarchy.l2_cacheable(line.address)
             || !self.hierarchy.l2.write_victim(line.address, &line.data)
         {
@@ -1657,6 +1849,12 @@ impl BoundHierarchy<'_> {
     }
     fn write_l2_line(&mut self, line: EvictedLine) {
         if line.dirty {
+            if line.stale {
+                self.hierarchy.hazards.push(CoherenceHazard::Clobber {
+                    cache: DataCache::L2,
+                    line: line.address,
+                });
+            }
             self.backing
                 .write_bytes(self.hierarchy.requester(), line.address, &line.data);
         }

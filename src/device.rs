@@ -13,6 +13,7 @@ use crate::cache::CacheView;
 use crate::cpu::Cpu;
 use crate::events::{EventMap, C6455_EVENTS, C6472_EVENTS};
 use crate::hpi::HPI_BOOT_ENTRY;
+use crate::memory::CoherenceHazard;
 use crate::space::{AddressMap, C6455_MAP, C6472_MAP};
 use crate::system::{Endian, Fabric};
 use crate::utopia::{UtopiaProfile, C6455_UTOPIA, C6472_UTOPIA};
@@ -392,6 +393,16 @@ impl Device {
     /// L1PCFG, L1DCFG and L2CFG), rather than by reaching into the model.
     pub(crate) fn configure_caches(&mut self, l1p: u32, l1d: u32, l2: u32) {
         self.fabric().configure_caches(l1p, l1d, l2);
+    }
+
+    /// Check DMA masters' traffic against every core's caches, reporting through
+    /// `take_coherence_hazards`.
+    pub(crate) fn set_coherence_check(&mut self, on: bool) {
+        self.fabric().set_coherence_check(on);
+    }
+
+    pub(crate) fn take_coherence_hazards(&mut self) -> Vec<(usize, CoherenceHazard)> {
+        self.fabric().take_coherence_hazards()
     }
 
     /// Place image bytes in memory the way the ELF loader does: behind the caches, once.

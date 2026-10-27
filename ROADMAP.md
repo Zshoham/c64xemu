@@ -10,7 +10,7 @@ prints each result for several inputs localises a mismatch in two runs; the manu
 examples make good unit tests; a host build of the same C source is the strongest oracle for
 anything the compiler can express.
 
-Current state: 1992 collected pytest cases and 781 native tests, including 390 component vectors.
+Current state: 1994 collected pytest cases and 880 native tests, including 402 component vectors.
 Three differentials against TI's own tools run inside every suite pass: all 2195 instruction
 words in binutils' tic6x vectors, and 436813 instructions
 across the firmware and program images compared with `dis6x` on seven dimensions - mnemonic,
@@ -509,6 +509,56 @@ subsystem's global range, `l2_cacheable` admits an SL2 address through any core'
 SPRUEG5D section 2.8 says SL2 "cannot be configured as cache" and "is cacheable by any of the L1
 Data and Program Caches", which reads as the L2CFG carve rather than as a statement about the L2
 cache, and SPRS612G is silent. No document settles it.
+
+**[x] A coherence check.** *Done.* The model reproduces a missing cache operation faithfully, so
+the program gets the wrong data it would get on silicon and nothing says why. `--coherence-check`
+says why: every master transfer is checked against every core's caches under each tag the core
+could hold the bytes by, and four things are reported once per core and line with the cycle and
+PC - a CPU read or an L1P fetch that hits bytes a master has overwritten since the line was
+filled, a master reading past a dirty line nothing snoops, and a dirty line written back over
+bytes a master wrote. The snoop rule decides what counts: L2 SRAM is coherent for its owner's L1D
+and for nothing else, and L1P never is. What the program sees does not change. Two native tests
+pin the four kinds, the silence after the operations SPRU862B Table 2-2 asks for, and the tags
+(`the_coherence_check_names_what_firmware_left_incoherent`,
+`the_coherence_check_follows_what_the_snoop_covers`). Swept over every program with `--cache`, it
+names exactly the two that break coherence on purpose, `idma_l1p_stale_code` and
+`ethernet_external_coherence`, and in the second also the dirty L2 line that is the reason its
+spec carries `cache_rerun: false`; the NDK firmware's first five million cycles, start-up and its
+first transmitted frame, are silent. Deleting
+the L1D writeback from `ethernet_external_coherence` adds the unflushed transmit buffer at the
+cycle the EMAC reads it. Coherence between two CPUs is left out: no master transfer carries it.
+Plumbing the flag found one unrelated defect: a reload dropped `--cache`, because the caches were
+programmed by the first load alone, so the debugger's `reset` came back with every cache off.
+`Machine::configure_memory` now ends every load and reload, after any boot table is processed.
+
+A review then found three ways the check missed or misplaced a report, each reproduced red
+first. The CPU issues the rest of a fetch packet from its own copy, so an instruction a master
+overwrote after the packet was fetched issued unreported; marking an L1P line stale now moves the
+L1P epoch, which makes the CPU read the packet back through the line
+(`cpu::tests::a_stale_instruction_in_the_buffered_fetch_packet_is_reported`). The shared L2 has a
+global alias in every core's block and the check looked under only the one the master used and
+the local window, so a core caching SL2 through its own alias missed a write through another's;
+every alias is a tag now (`the_coherence_check_follows_every_alias_of_the_shared_l2`). And an L1
+fill from a stale L2 line read the whole line through the path that reports a CPU read, so a
+load of an untouched byte reported its neighbour, while the new L1 line came in with no stale
+bytes and the load of the neighbour itself went unreported. A fill now reads L2 without
+reporting and hands its stale bytes to the new line, so only the CPU's own read of a stale byte
+reports (`an_l1d_fill_carries_the_l2_lines_stale_bytes_without_reporting_them`). The program sweep
+and the NDK run report what they did before.
+
+A second review found two more and a counting slip. The first fix had moved the L1P epoch, which
+also discards a packet a frozen L1P let past; that packet is not resident, so the CPU fetched it
+again from memory, and a master's write to it after the first fetch changed what executed - with
+the check on and not off. The check now moves an epoch of its own, and the CPU reads a held
+packet back only if L1P holds its line, where the bytes are the same
+(`cpu::tests::the_coherence_check_leaves_a_packet_fetched_past_a_frozen_l1p_alone`). Each cache
+also reported only the first stale line read between collections, so the second load of a
+parallel pair was never named; every stale line is recorded now
+(`two_stale_reads_between_collections_are_both_reported`). And the fill path's frozen-L2 branch
+counted one miss for a span where the per-byte path it replaced counted one per byte, which every
+run's statistics saw, check or no check (`an_l1d_fill_past_a_frozen_l2_misses_on_every_byte`).
+The program sweep now compares each program's registers, cycle count and transmitted frames with
+and without the check, uncached and with `--cache`, and finds no difference.
 
 ## CPU core
 

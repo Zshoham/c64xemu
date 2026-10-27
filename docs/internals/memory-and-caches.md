@@ -269,7 +269,9 @@ unchanged (SPRU871K section 3.3.4), so the first conflicting fill after unfreezi
 same line it would have before the frozen hits. L2CFG.L2CC freezes L2 the same way: SPRU871K
 section 4.3.5 sends read and write misses "directly to external memory, as if L2 cache were not
 present", so a frozen L2 miss neither fills nor allocates on a write
-(`system::tests::a_frozen_l2_serves_hits_and_sends_misses_to_external_memory`).
+(`system::tests::a_frozen_l2_serves_hits_and_sends_misses_to_external_memory`). Cache statistics
+count byte lookups, so an L1 line fill a frozen L2 sends to memory counts a miss for every byte
+of the span (`an_l1d_fill_past_a_frozen_l2_misses_on_every_byte`).
 
 L2CFG is three registers in one (SPRU871K Table 4-11), and an L2 mode change is narrower than the
 L1 ones. "Changing L2's mode does not affect the contents of either L1 cache" (section 4.3.4) and
@@ -376,6 +378,60 @@ dirty status as needed." So `write_l1_line` goes through `Cache::write_victim`, 
 the dirty bit while leaving the replacement clock alone
 (`cache::tests::a_victim_writeback_neither_allocates_nor_promotes_the_line_it_lands_in`,
 `system::tests::an_l1d_victim_that_misses_l2_does_not_allocate_a_line_there`).
+
+### The coherence check
+
+The model reproduces a missing cache operation faithfully, so a program that forgets one gets
+the same wrong data it would on silicon - and nothing says why. `--coherence-check` (see
+[Command line](../guide/command-line.md)) says why. `note_coherence` in `src/system/master.rs`
+hands every master transfer to every core's `MemoryHierarchy`, under each tag that core could
+have cached the bytes by: the address the master used, the core's local name for its own memory
+behind a global alias, and for the shared L2 its local window and its alias in every core's
+global block, since a core may cache SL2 through any of them. Only the core that owns snooped L2
+SRAM counts as snooped; to every other core the same bytes are someone else's memory.
+
+- A master write marks the bytes stale in every line that holds them (`Cache::mark_stale`, one
+  bit per byte in `CacheLine::stale`): in L1P always, in L1D and L2 unless snooped. A CPU read or
+  fetch that hits a stale byte is a `StaleRead` or `StaleFetch` - the line should have been
+  invalidated after the transfer. Every stale line read between two collections is recorded, the
+  first address per line (`Cache::stale_hits`), so the second load of a parallel pair reports as
+  well as the first. A CPU write to the byte clears it, because the CPU's value is then the
+  newest.
+- Stale bytes are a property of the data, so they travel with it. An L1P or L1D line filled from
+  a stale L2 line inherits the L2 line's stale bytes (`BoundHierarchy::fill_line`,
+  `Cache::read_span`, `Cache::carry_stale`), and the fill itself reports nothing: it is not a CPU
+  read. The CPU's own read of the filled line is what reports, and only for the bytes it reads,
+  so a load of an untouched byte beside a stale one is silent and the load of the stale byte is
+  not.
+- The CPU issues the rest of a fetch packet from its own copy (`Cpu::packet_line`) without
+  asking L1P again. A master write that marks an L1P line stale therefore moves
+  `l1p_stale_epoch`, and at its next packet the CPU reads its copy back through L1P - but only if
+  L1P holds that line, which makes the bytes the same and the read a report and nothing else. A
+  packet a frozen L1P let past is not held, so it stays buffered and issues exactly what it would
+  with the check off; moving the ordinary `l1p_epoch` instead would have refetched it from memory
+  and could execute a different instruction.
+- A dirty line leaving L1D or L2 with stale bytes in it is a `Clobber`
+  (`BoundHierarchy::write_l1_line`, `write_l2_line`): it puts older data over the master's, so
+  the line should have been invalidated before the transfer rather than written back after.
+- A master read that a dirty, unsnooped line overlaps is an `UnflushedRead` - the line should
+  have been written back first (`MemoryHierarchy::master_read`, `Cache::dirty_overlap`).
+
+The machine collects them every cycle and prints each (core, kind, line) once on stderr, with
+the core's cycle and PC; the check therefore turns the fast resume path off. Nothing changes what
+the program sees: over the program suite, with and without `--cache`, each program ends in the
+same registers, cycle count and transmitted frames with the check as without it. With `--cache`,
+it reports exactly the two programs that
+break coherence on purpose - `idma_l1p_stale_code`'s stale fetch and
+`ethernet_external_coherence`'s read before its invalidate - plus, in the latter, the dirty L2
+line its L1D-only writeback leaves behind, which is the reason that program carries
+`cache_rerun: false`. Coherence between two CPUs is outside it: only master traffic is checked
+(`the_coherence_check_names_what_firmware_left_incoherent`,
+`the_coherence_check_follows_what_the_snoop_covers`,
+`the_coherence_check_follows_every_alias_of_the_shared_l2`,
+`an_l1d_fill_carries_the_l2_lines_stale_bytes_without_reporting_them`,
+`cpu::tests::a_stale_instruction_in_the_buffered_fetch_packet_is_reported`,
+`cpu::tests::the_coherence_check_leaves_a_packet_fetched_past_a_frozen_l1p_alone`,
+`two_stale_reads_between_collections_are_both_reported`).
 
 ## Memory protection
 

@@ -17,13 +17,14 @@ use crate::cpu::{CpuSnapshot, StatsCounters};
 use crate::device::{Device, DeviceProfile};
 use crate::elf::{Image, Segment};
 use crate::host::{Endpoint, HostConnections, Wiring};
+use crate::memory::CoherenceHazard;
 use crate::netio::{hex, EthernetFiles};
 use crate::system::{Endian, Fabric};
 use crate::trace::Trace;
 use crate::view::{SploopDump, UnitIssue};
 use clap::{Args, ValueEnum};
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -152,6 +153,12 @@ pub struct MachineArgs {
     /// 256 KB of L2, the most a C64x+ megamodule has
     #[arg(long)]
     pub cache: bool,
+    /// Report every DMA transfer that disagrees with what a core caches where the hardware keeps
+    /// no coherence - a stale line read or fetched, a dirty line a master read past, a dirty line
+    /// written back over a master's data - at the cycle it happens, which runs the device cycle
+    /// by cycle
+    #[arg(long)]
+    pub coherence_check: bool,
 }
 
 #[derive(Clone, Copy, Default, PartialEq, ValueEnum)]
@@ -230,6 +237,12 @@ pub struct Machine {
     /// The Ethernet backend, the HPI host and the ATM master the device is attached to.
     host: HostConnections,
     trace_exceptions: bool,
+    /// `--cache`, kept so a reload programs the caches again.
+    caches: bool,
+    /// `--coherence-check`, and the hazards already reported, by core, kind and line, so a
+    /// stale line read in a loop is reported once.
+    coherence_check: bool,
+    reported_hazards: HashSet<(usize, std::mem::Discriminant<CoherenceHazard>, u32)>,
     profiling: bool,
     trace: Option<(PathBuf, bool, Option<usize>, u64)>,
     /// Where the program ends: `--stop-pc`, or C$$EXIT, or abort.
@@ -364,6 +377,9 @@ impl Machine {
                 }),
             })?,
             trace_exceptions: args.trace_exceptions,
+            caches: args.cache,
+            coherence_check: args.coherence_check,
+            reported_hazards: HashSet::new(),
             profiling: args.profile,
             trace: args.trace.as_ref().map(|path| {
                 (
@@ -387,9 +403,7 @@ impl Machine {
             machine.entry = entry;
         }
         machine.install()?;
-        if args.cache {
-            machine.enable_caches();
-        }
+        machine.configure_memory();
         machine.stop = match &args.stop_pc {
             Some(token) => Some(machine.resolve(token)?),
             None => machine
@@ -417,6 +431,21 @@ impl Machine {
         self.device.configure_caches(4, 4, 4);
     }
 
+    /// Print what the coherence check found this cycle that has not been reported before.
+    fn report_coherence_hazards(&mut self) {
+        for (core, hazard) in self.device.take_coherence_hazards() {
+            let key = (core, std::mem::discriminant(&hazard), hazard.line());
+            if self.reported_hazards.insert(key) {
+                let cpu = self.device.core(core);
+                eprintln!(
+                    "coherence: core {core} cycle {} pc {:#010x}: {hazard}",
+                    cpu.cycles(),
+                    cpu.pc()
+                );
+            }
+        }
+    }
+
     /// A machine with no image behind it, used by native tests that write instructions directly
     /// into memory before driving a debugger session.
     #[cfg(test)]
@@ -432,6 +461,9 @@ impl Machine {
             cio_output: Vec::new(),
             host: HostConnections::offline(),
             trace_exceptions: false,
+            caches: false,
+            coherence_check: false,
+            reported_hazards: HashSet::new(),
             profiling: false,
             trace: None,
             stop: None,
@@ -466,6 +498,9 @@ impl Machine {
         self.with_host(HostConnections::retire);
         // Rebuilding the device also rebuilds its CPUs, including their fetch-halt sets.
         let result = self.install();
+        if result.is_ok() {
+            self.configure_memory();
+        }
         self.install_halt(false);
         // A reinstalled trace keeps writing to the same file rather than truncating it.
         if trace.enabled() {
@@ -515,6 +550,17 @@ impl Machine {
         Ok(())
     }
 
+    /// What the command line asks of the memory system once the image is in place: `--cache`,
+    /// and `--coherence-check` with nothing reported yet. Every load and reload ends here, after
+    /// any boot table has been processed, so the caches never sit between the loader and memory.
+    fn configure_memory(&mut self) {
+        if self.caches {
+            self.enable_caches();
+        }
+        self.device.set_coherence_check(self.coherence_check);
+        self.reported_hazards.clear();
+    }
+
     fn step(&mut self) -> Result<(), String> {
         self.service_host()?;
         // Every core out of reset runs this cycle, and the shared peripherals advance once.
@@ -524,6 +570,9 @@ impl Machine {
             if let Some(cause) = self.device.cpu_mut().take_exception_cause() {
                 eprintln!("exception at {:#010x}: {cause}", self.device.cpu_mut().pc());
             }
+        }
+        if self.coherence_check {
+            self.report_coherence_hazards();
         }
         Ok(())
     }
@@ -682,7 +731,7 @@ impl Machine {
     fn run_until_stop(&mut self, conditions: &mut [StopCondition]) -> Result<StopReason, String> {
         let start_cycles = self.run_clock();
         let start_packets = self.device.cpu_mut().packets_executed();
-        if !self.host.history_enabled() && !self.trace_exceptions {
+        if !self.host.history_enabled() && !self.trace_exceptions && !self.coherence_check {
             if let [StopCondition::Budget(budget)] = conditions {
                 return self.resume_budget(start_cycles, *budget);
             }

@@ -178,6 +178,18 @@ wherever it eventually dies.
 isolation; if the emulator and TI's `dis6x` disagree the differential in
 [Running the tests](testing.md) is the place to settle it.
 
+**A DMA buffer holds the wrong data.** `--coherence-check` reports, once per cache line, each
+transfer the caches got wrong for want of a cache operation, with the core, cycle and PC:
+
+```console
+$ c64xemu run --coherence-check IMAGE
+coherence: core 0 cycle 40765 pc 0x00803a30: a DMA master read memory the L1D line at 0xe0003000 holds dirty; write the range back before the transfer
+```
+
+The same run without the writeback transmits whatever memory held, exactly as silicon would; the
+report is what says why. The three kinds and the rule behind each are in
+[Memory and caches](../internals/memory-and-caches.md#the-coherence-check).
+
 **The cycle count is too high.** `--perf` attributes the cycles to stall classes, and `cache` in
 the REPL shows what is resident. The costs each class charges, and the manual rule behind each,
 are in [Execution and timing](../internals/execution.md).

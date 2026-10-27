@@ -40,6 +40,9 @@ pub struct EvictedLine {
     pub address: u32,
     pub data: Vec<u8>,
     pub dirty: bool,
+    /// The line held bytes a master had written to memory since it was filled, so writing it
+    /// back puts older data over the master's.
+    pub stale: bool,
 }
 
 struct CacheLine {
@@ -47,6 +50,21 @@ struct CacheLine {
     data: Vec<u8>,
     dirty: bool,
     used: u64,
+    /// One bit per byte of the line that a master has written in memory since the line was
+    /// filled and that the CPU has not written since - the bytes this copy has wrong. Only the
+    /// coherence check sets it (`mark_stale`); with the check off it stays zero.
+    stale: u128,
+}
+
+/// The bit mask of `length` bytes from `offset` within a line of at most 128 bytes.
+#[inline(always)]
+fn byte_mask(offset: u32, length: u32) -> u128 {
+    let bits = if length >= 128 {
+        u128::MAX
+    } else {
+        (1u128 << length) - 1
+    };
+    bits << offset
 }
 
 const EMPTY_SLOT: usize = usize::MAX;
@@ -67,6 +85,9 @@ pub struct Cache {
     lines: Vec<CacheLine>,
     set_indices: Vec<[usize; 4]>,
     stats: CacheStats,
+    /// The CPU reads that hit stale bytes since the coherence check last asked, the first per
+    /// line: a cycle may read several stale lines, and each is a separate report.
+    stale_hits: Vec<u32>,
 }
 
 impl Cache {
@@ -84,6 +105,7 @@ impl Cache {
             lines: Vec::new(),
             set_indices: Vec::new(),
             stats: CacheStats::default(),
+            stale_hits: Vec::new(),
         }
     }
 
@@ -160,9 +182,41 @@ impl Cache {
             self.clock = self.clock.wrapping_add(N as u64);
             self.lines[index].used = self.clock;
         }
+        self.check_stale(index, address, offset as u32, N as u32);
         let mut bytes = [0; N];
         bytes.copy_from_slice(&self.lines[index].data[offset..offset + N]);
         Some(bytes)
+    }
+
+    /// Record a CPU read that hit bytes a master has overwritten in memory since the line was
+    /// filled, for the coherence check to collect. A line nothing marked costs one test.
+    #[inline(always)]
+    fn check_stale(&mut self, index: usize, address: u32, offset: u32, length: u32) {
+        if self.lines[index].stale != 0 && self.lines[index].stale & byte_mask(offset, length) != 0
+        {
+            self.record_stale_hit(address);
+        }
+    }
+
+    #[cold]
+    fn record_stale_hit(&mut self, address: u32) {
+        let line = self.line_base(address);
+        if !self
+            .stale_hits
+            .iter()
+            .any(|&hit| self.line_base(hit) == line)
+        {
+            self.stale_hits.push(address);
+        }
+    }
+
+    /// The CPU's own write makes those bytes the newest copy again.
+    #[inline(always)]
+    fn clear_stale(&mut self, index: usize, offset: u32, length: u32) {
+        let line = &mut self.lines[index];
+        if line.stale != 0 {
+            line.stale &= !byte_mask(offset, length);
+        }
     }
 
     /// The direct-mapped variant of `read_bytes`: the L1P cache is always one way, so the
@@ -180,6 +234,7 @@ impl Cache {
         self.stats.read_hits = self.stats.read_hits.wrapping_add(N as u64);
         self.clock = self.clock.wrapping_add(N as u64);
         self.lines[index].used = self.clock;
+        self.check_stale(index, address, offset as u32, N as u32);
         let mut bytes = [0; N];
         bytes.copy_from_slice(&self.lines[index].data[offset..offset + N]);
         Some(bytes)
@@ -187,6 +242,7 @@ impl Cache {
 
     /// Finish a multi-byte access after insertion. The first byte caused the miss and the
     /// insertion itself advanced LRU; the remaining bytes are the hits the old byte loop saw.
+    /// The CPU consumes these bytes, so a stale one the fill carried in is reported here.
     pub fn read_filled_bytes<const N: usize>(&mut self, address: u32) -> Option<[u8; N]> {
         let base = self.line_base(address);
         let offset = (address - base) as usize;
@@ -195,9 +251,58 @@ impl Cache {
         self.stats.read_hits = self.stats.read_hits.wrapping_add(following);
         self.clock = self.clock.wrapping_add(following);
         self.lines[index].used = self.clock;
+        self.check_stale(index, address, offset as u32, N as u32);
         let mut bytes = [0; N];
         bytes.copy_from_slice(&self.lines[index].data[offset..offset + N]);
         Some(bytes)
+    }
+
+    /// Part of a line, read to fill the level above rather than by the CPU: the bytes, and which
+    /// of them a master has overwritten since this line was filled (bit 0 is `address`). Hits
+    /// and replacement order are counted as `read_bytes` counts them, but nothing is reported -
+    /// the stale bytes travel with the fill, and the CPU's own read of one is what reports it.
+    pub fn read_span(&mut self, address: u32, length: u32) -> Option<(Vec<u8>, u128)> {
+        let base = self.line_base(address);
+        let Some(index) = self.find_index(base) else {
+            self.stats.read_misses = self.stats.read_misses.wrapping_add(1);
+            return None;
+        };
+        self.stats.read_hits = self.stats.read_hits.wrapping_add(u64::from(length));
+        if !self.frozen {
+            self.clock = self.clock.wrapping_add(u64::from(length));
+            self.lines[index].used = self.clock;
+        }
+        Some(self.span(index, address - base, length))
+    }
+
+    /// `read_span` for the line a miss has just inserted, counted as `read_filled_bytes` is.
+    pub fn read_filled_span(&mut self, address: u32, length: u32) -> Option<(Vec<u8>, u128)> {
+        let base = self.line_base(address);
+        let index = self.find_index(base)?;
+        let following = u64::from(length.saturating_sub(1));
+        self.stats.read_hits = self.stats.read_hits.wrapping_add(following);
+        self.clock = self.clock.wrapping_add(following);
+        self.lines[index].used = self.clock;
+        Some(self.span(index, address - base, length))
+    }
+
+    fn span(&self, index: usize, offset: u32, length: u32) -> (Vec<u8>, u128) {
+        let line = &self.lines[index];
+        let data = line.data[offset as usize..(offset + length) as usize].to_vec();
+        let stale = (line.stale & byte_mask(offset, length)) >> offset;
+        (data, stale)
+    }
+
+    /// Give the line holding `address` the stale bytes the fill that brought it in carried from
+    /// the level below (bit 0 is the line's first byte). A frozen cache that declined the fill
+    /// holds no line, and nothing happens.
+    pub fn carry_stale(&mut self, address: u32, stale: u128) {
+        if stale == 0 {
+            return;
+        }
+        if let Some(index) = self.find_index(self.line_base(address)) {
+            self.lines[index].stale |= stale;
+        }
     }
     pub fn read_byte(&mut self, address: u32) -> Option<u8> {
         let base = self.line_base(address);
@@ -211,6 +316,7 @@ impl Cache {
             self.clock = self.clock.wrapping_add(1);
             self.lines[index].used = self.clock;
         }
+        self.check_stale(index, address, address - base, 1);
         Some(self.lines[index].data[(address - base) as usize])
     }
 
@@ -225,6 +331,7 @@ impl Cache {
             self.clock = self.clock.wrapping_add(1);
             self.lines[index].used = self.clock;
         }
+        self.clear_stale(index, address - base, 1);
         let line = &mut self.lines[index];
         line.data[(address - base) as usize] = value;
         line.dirty = true;
@@ -246,6 +353,7 @@ impl Cache {
             self.clock = self.clock.wrapping_add(N as u64);
             self.lines[index].used = self.clock;
         }
+        self.clear_stale(index, offset as u32, N as u32);
         let line = &mut self.lines[index];
         line.data[offset..offset + N].copy_from_slice(&bytes);
         line.dirty = true;
@@ -253,11 +361,13 @@ impl Cache {
     }
 
     /// Complete the logical access which caused a fill without recording a second hit. Insertion
-    /// already updates replacement order; these helpers only read or modify the new line.
-    pub fn read_filled_byte(&self, address: u32) -> Option<u8> {
+    /// already updates replacement order; these helpers only read or modify the new line. The
+    /// read is the CPU's, so a stale byte the fill carried in is reported.
+    pub fn read_filled_byte(&mut self, address: u32) -> Option<u8> {
         let base = self.line_base(address);
-        self.find_index(base)
-            .map(|index| self.lines[index].data[(address - base) as usize])
+        let index = self.find_index(base)?;
+        self.check_stale(index, address, address - base, 1);
+        Some(self.lines[index].data[(address - base) as usize])
     }
 
     pub fn write_filled_byte(&mut self, address: u32, value: u8) -> bool {
@@ -288,6 +398,7 @@ impl Cache {
             return false;
         };
         self.stats.write_hits = self.stats.write_hits.wrapping_add(bytes.len() as u64);
+        self.clear_stale(index, offset as u32, bytes.len() as u32);
         let line = &mut self.lines[index];
         line.data[offset..offset + bytes.len()].copy_from_slice(bytes);
         line.dirty = true;
@@ -339,6 +450,51 @@ impl Cache {
         }
     }
 
+    /// Mark the bytes a master has just written in memory as wrong in every line here that
+    /// holds them: nothing snooped them into the cache, so the CPU's copy is now older than
+    /// memory's. The coherence check alone calls this. Answers whether any line held them.
+    pub fn mark_stale(&mut self, address: u32, length: u32) -> bool {
+        let end = u64::from(address) + u64::from(length);
+        let mut marked = false;
+        for line in &mut self.lines {
+            let line_end = u64::from(line.address) + u64::from(self.line_size);
+            if line_end <= u64::from(address) || u64::from(line.address) >= end {
+                continue;
+            }
+            let start = u64::from(line.address);
+            let from = u64::from(address).max(start);
+            let to = end.min(line_end);
+            line.stale |= byte_mask((from - start) as u32, (to - from) as u32);
+            marked = true;
+        }
+        marked
+    }
+
+    /// The first dirty line here holding any of these bytes, which a master reading memory
+    /// would miss because nothing snoops it.
+    pub fn dirty_overlap(&self, address: u32, length: u32) -> Option<u32> {
+        let end = u64::from(address) + u64::from(length);
+        self.lines
+            .iter()
+            .filter(|line| {
+                line.dirty
+                    && u64::from(line.address) + u64::from(self.line_size) > u64::from(address)
+                    && u64::from(line.address) < end
+            })
+            .map(|line| line.address)
+            .min()
+    }
+
+    /// Every line a CPU read found stale since the last call, by the first address read in it.
+    pub fn take_stale_hits(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.stale_hits)
+    }
+
+    /// Byte lookups a caller served past this cache without asking it each time.
+    pub fn count_read_misses(&mut self, bytes: u32) {
+        self.stats.read_misses = self.stats.read_misses.wrapping_add(u64::from(bytes));
+    }
+
     pub fn insert(&mut self, address: u32, data: Vec<u8>) -> Option<EvictedLine> {
         if self.capacity == 0 {
             return None;
@@ -353,6 +509,7 @@ impl Cache {
                 data,
                 dirty: false,
                 used: self.clock,
+                stale: 0,
             };
             return None;
         }
@@ -381,6 +538,7 @@ impl Cache {
             data,
             dirty: false,
             used: self.clock,
+            stale: 0,
         });
         evicted
     }
@@ -396,6 +554,7 @@ impl Cache {
                 address: line.address,
                 data: line.data.clone(),
                 dirty: true,
+                stale: std::mem::take(&mut line.stale) != 0,
             });
         }
         self.stats.writebacks = self.stats.writebacks.wrapping_add(written.len() as u64);
@@ -412,6 +571,7 @@ impl Cache {
                     address: line.address,
                     data: line.data,
                     dirty: true,
+                    stale: line.stale != 0,
                 });
             }
         }
@@ -432,6 +592,7 @@ impl Cache {
                 address: line.address,
                 data: line.data.clone(),
                 dirty: true,
+                stale: std::mem::take(&mut line.stale) != 0,
             });
         }
         self.stats.writebacks = self.stats.writebacks.wrapping_add(written.len() as u64);
@@ -454,11 +615,7 @@ impl Cache {
                 let line = self.remove(index);
                 invalidated = invalidated.wrapping_add(1);
                 if writeback && line.dirty {
-                    removed.push(EvictedLine {
-                        address: line.address,
-                        data: line.data,
-                        dirty: true,
-                    });
+                    removed.push(line);
                 }
             } else {
                 index += 1;
@@ -557,6 +714,7 @@ impl Cache {
             address: line.address,
             data: line.data,
             dirty: line.dirty,
+            stale: line.stale != 0,
         }
     }
 

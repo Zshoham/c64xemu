@@ -174,6 +174,11 @@ impl AddressMap {
         self.shared_ram.bytes
     }
 
+    /// Where the shared L2 RAM sits in every core's local window.
+    pub(crate) const fn shared_ram_base(&self) -> u32 {
+        self.shared_ram.base
+    }
+
     pub(crate) const fn shared_rom_bytes(&self) -> u32 {
         self.shared_rom.bytes
     }

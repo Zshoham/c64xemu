@@ -416,7 +416,10 @@ an address or a symbol),
 `--hpi-unix`/`--hpi-peer`/`--hpi-poll` for the host port, the `--trace*` family,
 `--trace-exceptions`, `--profile` and `--cache`, which programs every core's caches before the
 image runs - 32 KB of L1P, 32 KB of L1D and 256 KB of L2, the most a C64x+ megamodule has -
-through the same configuration registers firmware writes, leaving the MAR bits alone.
+through the same configuration registers firmware writes, leaving the MAR bits alone, and
+`--coherence-check`, which reports each DMA transfer a missing cache operation left the caches
+disagreeing with - a stale line read, a dirty line a master read past, a dirty line written back
+over a master's data.
 `run` adds what only a batch run can mean: `--max-cycles`
 as a whole-run budget, `--state-out`, `--dump ADDR:LEN`, `--pc-trail N` and `--trap-oob`. A run
 that booted over Ethernet also reports an `ethernet_boot` object in `--state-out`: the frames the

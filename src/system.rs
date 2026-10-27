@@ -34,7 +34,9 @@ use crate::i2c::I2c;
 use crate::idma::{Idma, Source as IdmaSource};
 use crate::mcbsp::Mcbsp;
 use crate::mdio::Mdio;
-use crate::memory::{Backing, BoundHierarchy, DataClock, LinkReservation, MemoryHierarchy};
+use crate::memory::{
+    Backing, BoundHierarchy, CoherenceHazard, DataClock, LinkReservation, MemoryHierarchy,
+};
 use crate::pdma::{Pdma, MAX_BURST_WORDS};
 use crate::pll::{Pll, Pll2};
 use crate::port::{PortContext, PortWrite, SlavePort};
@@ -1221,6 +1223,28 @@ impl Fabric {
             self.write32(core, crate::memory::L1DCFG, l1d);
             self.write32(core, crate::memory::L2CFG, l2);
         }
+    }
+
+    /// Check every DMA master's traffic against what each core caches (`--coherence-check`).
+    pub(crate) fn set_coherence_check(&mut self, on: bool) {
+        for megamodule in &mut self.mm {
+            megamodule.memory.set_coherence_check(on);
+        }
+    }
+
+    /// What the coherence check has found on every core since the last call.
+    pub(crate) fn take_coherence_hazards(&mut self) -> Vec<(usize, CoherenceHazard)> {
+        self.mm
+            .iter_mut()
+            .enumerate()
+            .flat_map(|(core, megamodule)| {
+                megamodule
+                    .memory
+                    .take_hazards()
+                    .into_iter()
+                    .map(move |hazard| (core, hazard))
+            })
+            .collect()
     }
 
     /// A view of the fabric from one core, which is what the CPU holds while it runs.
@@ -2812,6 +2836,15 @@ impl<'a> CoreBus<'a> {
     #[inline(always)]
     pub(crate) fn l1p_epoch(&self) -> u64 {
         self.fabric.mm[self.core].memory.l1p_epoch()
+    }
+
+    #[inline(always)]
+    pub(crate) fn l1p_stale_epoch(&self) -> u64 {
+        self.fabric.mm[self.core].memory.l1p_stale_epoch()
+    }
+
+    pub(crate) fn l1p_holds(&self, address: u32) -> bool {
+        self.fabric.mm[self.core].memory.l1p_holds(address)
     }
 
     /// LL: read the word at `address` and link it. See `Fabric::load_link`.

@@ -308,6 +308,8 @@ pub struct Cpu {
     /// avoids repeating a cache lookup and copy for every execute packet within the same line.
     packet_line: Option<FetchLine>,
     packet_line_epoch: u64,
+    /// The L1P stale epoch the buffered packet was last checked against (see `Cpu::step`).
+    packet_line_stale_epoch: u64,
     packet_line_reusable: bool,
     /// Set while the program-memory packet of a PROT fetch packet executes, and latched when
     /// such a packet actually performs a load.
@@ -417,6 +419,7 @@ impl Cpu {
             pending_stalls: 0,
             packet_line: None,
             packet_line_epoch: 0,
+            packet_line_stale_epoch: 0,
             packet_line_reusable: false,
             prot_packet: false,
             prot_load: false,
@@ -910,6 +913,20 @@ impl Cpu {
         if self.packet_line_epoch != epoch || !self.packet_line_reusable {
             self.packet_line = None;
             self.packet_line_epoch = epoch;
+        }
+        // The coherence check marked an L1P line stale. A packet L1P holds is read back through
+        // it - the same bytes, so this changes nothing that executes - so the read can report;
+        // one a frozen L1P let past is not held, and stays buffered exactly as it would unchecked.
+        let stale_epoch = bus.l1p_stale_epoch();
+        if self.packet_line_stale_epoch != stale_epoch {
+            self.packet_line_stale_epoch = stale_epoch;
+            if self
+                .packet_line
+                .as_ref()
+                .is_some_and(|line| bus.l1p_holds(line.base))
+            {
+                self.packet_line = None;
+            }
         }
         let mut packet_storage = [std::mem::MaybeUninit::<Fetched>::uninit(); 8];
         let mut length = 0usize;
@@ -5506,6 +5523,62 @@ mod tests {
         0x032c_5745, // STDW .D1T1 A7:A6,*A11++[2]
         0x0230_57c6, // || STDW .D2T2 B5:B4,*B12++[2]
     ];
+
+    /// The CPU keeps the fetch packet it last read from L1P and issues the rest of it without
+    /// asking again. A master overwriting an instruction in that packet makes the buffered copy as
+    /// stale as the L1P line, so the coherence check must see the next instruction issue from it.
+    #[test]
+    fn a_stale_instruction_in_the_buffered_fetch_packet_is_reported() {
+        use crate::memory::CoherenceHazard;
+        use crate::system::{MasterAccess, Privilege};
+        const CODE: u32 = 0x0080_1000;
+        let mut cpu = Cpu::new(0);
+        cpu.bus_mut().write32(0x0184_0020, 1);
+        cpu.write_words(CODE, &[0; 8]);
+        cpu.fabric_mut().set_coherence_check(true);
+        cpu.set_pc(CODE);
+        cpu.step_cycle();
+        assert_eq!(cpu.pc(), CODE + 4, "one serial NOP issued from the packet");
+        cpu.fabric_mut()
+            .write_word(Privilege::ID0_SUPERVISOR, CODE + 4, 0);
+        assert_eq!(cpu.fabric_mut().take_coherence_hazards(), []);
+        // The fill's stall cycles pass first; then the overwritten NOP issues.
+        cycles_to_reach(&mut cpu, CODE + 8, 50);
+        assert_eq!(
+            cpu.fabric_mut().take_coherence_hazards(),
+            [(0, CoherenceHazard::StaleFetch { address: CODE })]
+        );
+    }
+
+    /// The check observes; it never changes what executes. A packet fetched past a frozen L1P is
+    /// not resident, so a master's write to some other, resident L1P line must not make the CPU
+    /// fetch it again: the instruction it issues next is the one it buffered, check or no check.
+    #[test]
+    fn the_coherence_check_leaves_a_packet_fetched_past_a_frozen_l1p_alone() {
+        use crate::system::{MasterAccess, Privilege};
+        const RESIDENT: u32 = 0x0080_1000;
+        const BYPASSED: u32 = 0x0080_1100;
+        const MVK_5_A3: u32 = 0x0180_02a8;
+        let run = |check: bool| {
+            let mut cpu = Cpu::new(0);
+            cpu.bus_mut().write32(0x0184_0020, 1);
+            cpu.write_words(RESIDENT, &[0; 8]);
+            cpu.write_words(BYPASSED, &[0; 8]);
+            cpu.fabric_mut().set_coherence_check(check);
+            cpu.set_pc(RESIDENT);
+            cycles_to_reach(&mut cpu, RESIDENT + 4, 50);
+            cpu.bus_mut().write32(0x0184_0024, 1);
+            cpu.set_pc(BYPASSED);
+            cycles_to_reach(&mut cpu, BYPASSED + 4, 50);
+            let master = Privilege::ID0_SUPERVISOR;
+            cpu.fabric_mut().write_word(master, BYPASSED + 4, MVK_5_A3);
+            cpu.fabric_mut().write_word(master, RESIDENT + 8, 0);
+            cycles_to_reach(&mut cpu, BYPASSED + 8, 50);
+            cpu.register('A', 3)
+        };
+        assert_eq!(run(false), 0, "the buffered NOP issues");
+        assert_eq!(run(true), run(false));
+    }
 
     #[test]
     fn the_manuals_dotprod_read_miss_total() {
