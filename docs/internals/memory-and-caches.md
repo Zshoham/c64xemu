@@ -313,7 +313,12 @@ rule, then the queue:
   `timing:write-buffer-drains-at-six-cycles-an-entry-into-l2-cache`).
 
 The read side is `data_stalls`: a read miss waits for the buffer to drain completely
-before its own line fill starts (`timing:read-miss-waits-for-the-write-buffer`). Two of section
+before its own line fill starts (`timing:read-miss-waits-for-the-write-buffer`). So does a read
+of a memory-mapped register, which SPRU862B section 2.6 says "is treated as a read miss that
+always causes the write buffer to be completely drained" - the reason polling a cache operation's
+word count guarantees the write misses before it have landed
+(`timing:polling-a-cache-word-count-drains-the-write-buffer`). The register's own access time
+is not documented, so the drain is all such a read costs. Two of section
 3.5.3's remaining conditions are deliberately unmodelled. "The first write has not yet been
 presented to the L2 controller" is the drained-entry sweep; "both writes have the same privilege
 level" is not distinguished, because this model carries no privilege level per buffered write.

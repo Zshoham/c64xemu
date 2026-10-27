@@ -490,6 +490,26 @@ core with L2MODE, L2CC, IP and ID set as well, so the new fields are shown not t
 writable ones - and `memory.rs`'s `cache_register_read` is where the fields go, from the core index
 the hierarchy already holds and a core count it does not hold yet.
 
+**[x] Polling a register drains the write buffer.** *Fixed defect, same pass.* SPRU862B section
+2.6: "Waiting for completion is done by polling the word count (xxWC) registers. This
+automatically ensures that any L1D write misses have drained from the write buffer. This is
+because polling a memory-mapped register is treated as a read miss that always causes the write
+buffer to be completely drained." The write buffer's drain-before-read-miss rule and the
+word-count registers were each pinned; a register read cost nothing. A load from configuration
+space or a peripheral data port now waits out the buffer the way a read miss does, and nothing
+more, because no document gives the register's own access time.
+`timing:polling-a-cache-word-count-drains-the-write-buffer` is
+`timing:write-buffer-drains-at-two-cycles-an-entry`'s program with its final load aimed at
+L1DWWC: that vector's 21 or 22 cycles less the 12 or 13 its read miss costs, so 9, where the model
+said 5.
+
+**[-] Whether the L2 cache may hold the C6472's shared L2 through a global alias.** Found by the
+same pass and not a candidate. With MAR16-21 set, which SPRS612G gives as controlling each
+subsystem's global range, `l2_cacheable` admits an SL2 address through any core's alias.
+SPRUEG5D section 2.8 says SL2 "cannot be configured as cache" and "is cacheable by any of the L1
+Data and Program Caches", which reads as the L2CFG carve rather than as a statement about the L2
+cache, and SPRS612G is silent. No document settles it.
+
 ## CPU core
 
 **[x] Two writes landing on one register in one cycle.** *Fixed.* SPRUFE8B section 3.8.8 says the
@@ -2398,6 +2418,14 @@ came from these methods, in this order of what they have actually paid.
    and became the item *The SMC is a register file nothing drives*, since closed. Scouts sketch
    tests and predict verdicts; each defect was settled by writing its test red first, and the
    scouts' predictions held in all eight.
+
+   A third pass, cache domain only and three scouts, took three candidates and all three were
+   defects: an L2 mode change flushed both L1 caches where two manuals say it touches neither;
+   L2CFG's IP and ID bits were dropped, so an ID write flushed L2 as well as L1D; and reading a
+   memory-mapped register did not drain the write buffer, which is the one thing SPRU862B
+   section 2.6 says polling a word count is for. Reading the register table the second came from
+   found a fourth, the L2 freeze bit L2CC, which nothing modelled. One more candidate, the L2
+   cache holding SL2 through a global alias, was rejected for want of a document.
 2. **Reading a manual closely enough to solve it rather than quote it.** The L1P and L1D miss
    numbers came out of a table of averages that one occupancy explains; the cache aperture
    geometry came out of a figure. The same reading is what refuted an item this list used to

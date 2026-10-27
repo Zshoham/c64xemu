@@ -197,6 +197,9 @@ struct L1dTiming {
     /// not serviced until the buffer is empty (SPRU871 §3.5.3, SPRU862B Table 3-2). Each entry
     /// is its quad-word address and the wall-clock cycle it finishes draining.
     write_buffer: Vec<(u32, u64)>,
+    /// This cycle read a memory-mapped register, which drains the write buffer as a read miss
+    /// does (SPRU862B section 2.6).
+    register_read: bool,
     /// The last execute cycle that took an L1D read miss, for miss pipelining.
     last_miss_cycle: Option<u64>,
     last_miss_count: u32,
@@ -317,7 +320,16 @@ impl L1dTiming {
         }
         let miss_count = misses as u32;
         if miss_count == 0 {
-            return 0;
+            // "Polling a memory-mapped register is treated as a read miss that always causes
+            // the write buffer to be completely drained" (SPRU862B section 2.6) - which is how
+            // polling a cache operation's word count ensures the write misses before it have
+            // landed. The register's own access time is documented nowhere, so the drain is
+            // all it costs.
+            return if self.register_read {
+                self.drain_write_buffer(now)
+            } else {
+                0
+            };
         }
         let (single, pipelined_cost, parallel) = if from_l2_cache {
             (14, 7, 8)
@@ -962,12 +974,14 @@ impl MemoryHierarchy {
     #[inline]
     pub(crate) fn begin_data_cycle(&mut self) {
         self.l1d_timing.accesses.clear();
+        self.l1d_timing.register_read = false;
     }
     /// Record a data load this cycle made.
     #[inline]
     pub(crate) fn note_load(&mut self, address: u32) {
         let timing = self.access_timing(address);
         self.l1d_timing.accesses.push(Access { address, timing });
+        self.l1d_timing.register_read |= !is_memory(address);
     }
     /// Record a data store this cycle made, answering the stall cycles it costs on the spot:
     /// a store that misses L1D goes into the write buffer, which holds the CPU until its oldest
