@@ -17,8 +17,10 @@ across the firmware and program images compared with `dis6x` on seven dimensions
 functional unit, cross-path marking, predicate, memory data path, every memory access's address
 operand, and every operand list the model reads, 285856 of them.
 
-No `[ ]` item is open. The last one booted TI's IBL itself on the C6472, built from TI's source,
-through the ROM, its own I2C driver, BOOTP and TFTP to a program in DDR2, and running TI's
+One `[ ]` item is open, *L2CFG's NUM MM and MMID fields* under *Caches*. The last one closed
+charged L1D stalls to the packets the SPLOOP buffer replays. The one before it booted TI's IBL
+itself on the C6472, built from TI's source, through the ROM, its own I2C driver, BOOTP and TFTP
+to a program in DDR2, and running TI's
 firmware found four defects the suite's own fixtures had agreed with: a repeat-mode I2C STOP
 that never happened, an inverted CSR.EN, byte-reversed EMAC address registers, and big-endian
 doubleword accesses pairing their words the little-endian way. The items before it had found the
@@ -446,6 +448,47 @@ forbids defined as well, one array linked into it, and five printed phases - all
 is all SRAM, none once the cache has taken them, none after a store, none when the cache is
 released, all 64 after a store then. Its spec carries `cache_rerun: false`, because a program that
 observes the transition has to start from the reset configuration.
+
+**[x] An L2 mode change flushed both L1 caches.** *Fixed defect, from the third deliberate pass.*
+`configure_l2` wrote back and invalidated L1D and invalidated L1P before resizing L2, where two
+documents say it must not touch them: SPRU871K section 4.3.4, "Changing L2's mode does not affect
+the contents of either L1 cache", and SPRU862B section 2.7.2, "changing of the L2 cache size will
+not cause any evictions from L1P or L1D cache". Both halves were pinned - the L2 resize by
+`cache_size_registers_follow_the_c6455_encodings`, L1 residency by `l1d_invalidate_discards_stale_dma_view`
+and `idma_l1p_stale_code` - and nothing changed L2MODE with lines in L1.
+`system::tests::an_l2_mode_change_leaves_both_l1_caches_alone` holds a dirty L1D line and a
+resident L1P line across the change: before the fix the dirty line reached memory.
+**[INFERENCE]** The L2 flush now runs only when a write changes the L2MODE field. Section 4.3.4
+describes it as what L2 does "when a program writes a new cache mode" and no manual says what a
+write that keeps the mode does; the model reads "new" as "different from the field's value", so
+rewriting the same mode does not flush and moving between two encodings of 256 KB does.
+`l2cfg_ip_and_id_invalidate_only_the_l1_cache_they_name` pins the no-flush half. The reasoning is in
+`docs/internals/memory-and-caches.md`.
+
+**[x] L2CFG's IP, ID and L2CC bits.** *Fixed defect, same pass.* The model kept L2CFG's three mode
+bits and dropped the rest, so every write took the mode-change path whatever else it said.
+SPRU871K Table 4-11 gives three more writable fields: IP and ID, the legacy global invalidates -
+"All L1P lines are invalidated", "All L1D lines are invalidated" - and L2CC, the L2 freeze bit.
+An ID write therefore wrote dirty L1D lines back and flushed the L2 cache, where it should only
+discard L1D. `l2cfg_ip_and_id_invalidate_only_the_l1_cache_they_name` pins each bit against the
+other cache and a dirty L2 line. L2 freeze is section 4.3.5: "The L2 cache responds to read and
+write hits normally when in freeze mode. L2 sends read and write misses directly to external
+memory, as if L2 cache were not present. The L2 never allocates a new cache line while frozen."
+`a_frozen_l2_serves_hits_and_sends_misses_to_external_memory` checks the readback, a held line
+still shadowing memory in both directions, a miss leaving no line in either, and allocation
+resuming once unfrozen. The NUM MM and MMID fields the same table lists are the item below.
+
+**[ ] L2CFG's NUM MM and MMID fields.** *Planned; found with the item above.* SPRU871K Table 4-11
+gives L2CFG two read-only fields set by the device: NUM MM in bits 27-24, "Number of megamodules
+minus 1", and MMID in bits 19-16, "Contains the megamodule ID number". The model reads both as
+zero on every core. That is right for the C6455, which has one megamodule, and wrong on the C6472,
+which has six and so should report NUM MM = 5 on every core. The expectation for NUM MM is the
+table and the device profile's core count. **[INFERENCE]** MMID is the same number DNUM reports
+(`Control::dnum`, 0 to 5 on the C6472): no document in this set says so in as many words, and
+none gives the two separate numbers. The case is a register-read vector per device - L2CFG on each
+core with L2MODE, L2CC, IP and ID set as well, so the new fields are shown not to disturb the
+writable ones - and `memory.rs`'s `cache_register_read` is where the fields go, from the core index
+the hierarchy already holds and a core count it does not hold yet.
 
 ## CPU core
 

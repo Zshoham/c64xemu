@@ -4094,6 +4094,133 @@ mod tests {
         assert_eq!(fabric.read_u8(0, BUFFER), 2);
     }
 
+    /// SPRU871K 4.3.4: "Changing L2's mode does not affect the contents of either L1 cache",
+    /// and SPRU862B 2.7.2: "changing of the L2 cache size will not cause any evictions from L1P
+    /// or L1D cache". A dirty L1D line and a resident L1P line both outlive the change.
+    #[test]
+    fn an_l2_mode_change_leaves_both_l1_caches_alone() {
+        const DATA: u32 = 0x0080_1000;
+        const CODE: u32 = 0x0080_2000;
+        let mut fabric = Fabric::default();
+        fabric.load_bytes(0, DATA, &[1]);
+        fabric.load_bytes(0, CODE, &[0x11, 0, 0, 0]);
+        fabric.write32(0, L1PCFG, 1);
+        fabric.write32(0, L1DCFG, 1);
+        assert_eq!(fabric.read_u8(0, DATA), 1);
+        fabric.write_u8(0, DATA, 0xaa);
+        assert_eq!(fabric.fetch32(0, CODE), 0x11);
+        fabric.shared.backing.write_byte(Requester::Dma, CODE, 0x22);
+
+        fabric.write32(0, L2CFG, 1);
+
+        assert_eq!(
+            fabric.shared.backing.read_byte(Requester::Dma, DATA),
+            Some(1),
+            "the dirty L1D line was written back"
+        );
+        assert_eq!(fabric.read_u8(0, DATA), 0xaa);
+        assert_eq!(
+            fabric.fetch32(0, CODE),
+            0x11,
+            "the L1P line was invalidated"
+        );
+    }
+
+    /// L2CFG's IP and ID bits are the legacy global invalidates, one per L1 cache (SPRU871K
+    /// Table 4-11): IP invalidates every L1P line, ID every L1D line, and neither touches the
+    /// other cache or the L2 cache's mode. ID invalidates without writing back, as L1DINV does.
+    #[test]
+    fn l2cfg_ip_and_id_invalidate_only_the_l1_cache_they_name() {
+        const DATA: u32 = 0x0080_1000;
+        const CODE: u32 = 0x0080_2000;
+        const DDR: u32 = 0xe000_1000;
+        let mut fabric = Fabric::default();
+        fabric.load_bytes(0, DATA, &[1]);
+        fabric.load_bytes(0, CODE, &[0x11, 0, 0, 0]);
+        fabric.load_bytes(0, DDR, &[0]);
+        fabric.write32(0, MAR_BASE + 224 * 4, 1);
+        fabric.write32(0, L2CFG, 1);
+        fabric.write32(0, L1PCFG, 1);
+        fabric.write32(0, L1DCFG, 1);
+        // A dirty L2 cache line: L1D does not allocate on a write, so this lands in L2.
+        fabric.write_u8(0, DDR, 0xdd);
+        assert_eq!(fabric.read_u8(0, DATA), 1);
+        fabric.write_u8(0, DATA, 0xaa);
+        assert_eq!(fabric.fetch32(0, CODE), 0x11);
+        fabric.shared.backing.write_byte(Requester::Dma, CODE, 0x22);
+
+        fabric.write32(0, L2CFG, 1 | 1 << 9);
+        assert_eq!(fabric.fetch32(0, CODE), 0x22, "IP left L1P valid");
+        assert_eq!(fabric.read_u8(0, DATA), 0xaa, "IP touched L1D");
+
+        fabric.write32(0, L2CFG, 1 | 1 << 8);
+        assert_eq!(
+            fabric.read_u8(0, DATA),
+            1,
+            "ID left L1D valid or wrote it back"
+        );
+        assert_eq!(
+            fabric.shared.backing.read_byte(Requester::Dma, DATA),
+            Some(1)
+        );
+        assert_eq!(
+            fabric.shared.backing.read_byte(Requester::Dma, DDR),
+            Some(0),
+            "an IP or ID write flushed the L2 cache"
+        );
+        assert_eq!(fabric.read_u8(0, DDR), 0xdd);
+        assert_eq!(fabric.read32(0, L2CFG), 1, "IP and ID are write-only");
+    }
+
+    /// L2CFG.L2CC freezes the L2 cache (SPRU871K 4.3.5): "The L2 cache responds to read and
+    /// write hits normally when in freeze mode. L2 sends read and write misses directly to
+    /// external memory, as if L2 cache were not present. The L2 never allocates a new cache
+    /// line while frozen."
+    #[test]
+    fn a_frozen_l2_serves_hits_and_sends_misses_to_external_memory() {
+        const HELD: u32 = 0xe000_1000;
+        const OTHER: u32 = 0xe000_2000;
+        let mut fabric = Fabric::default();
+        fabric.load_bytes(0, HELD, &[1]);
+        fabric.load_bytes(0, OTHER, &[2]);
+        fabric.write32(0, MAR_BASE + 224 * 4, 1);
+        fabric.write32(0, L2CFG, 1);
+        assert_eq!(fabric.read_u8(0, HELD), 1);
+
+        fabric.write32(0, L2CFG, 1 | 1 << 3);
+        assert_eq!(fabric.read32(0, L2CFG), 1 | 1 << 3);
+
+        // A hit is served from the line, which therefore still shadows memory.
+        fabric.shared.backing.write_byte(Requester::Dma, HELD, 0x11);
+        assert_eq!(fabric.read_u8(0, HELD), 1);
+        fabric.write_u8(0, HELD, 0x33);
+        assert_eq!(
+            fabric.shared.backing.read_byte(Requester::Dma, HELD),
+            Some(0x11)
+        );
+        // A miss goes to memory and leaves nothing behind, in either direction.
+        assert_eq!(fabric.read_u8(0, OTHER), 2);
+        fabric
+            .shared
+            .backing
+            .write_byte(Requester::Dma, OTHER, 0x22);
+        assert_eq!(fabric.read_u8(0, OTHER), 0x22);
+        fabric.write_u8(0, OTHER, 0x44);
+        assert_eq!(
+            fabric.shared.backing.read_byte(Requester::Dma, OTHER),
+            Some(0x44)
+        );
+
+        // Unfrozen, a miss allocates again.
+        fabric.write32(0, L2CFG, 1);
+        assert_eq!(fabric.read_u8(0, OTHER), 0x44);
+        fabric
+            .shared
+            .backing
+            .write_byte(Requester::Dma, OTHER, 0x55);
+        assert_eq!(fabric.read_u8(0, OTHER), 0x44);
+    }
+
     #[test]
     fn l2_range_writeback_flushes_l1d_and_l2_without_invalidating() {
         const DDR: u32 = 0xe000_1000;

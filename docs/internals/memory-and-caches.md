@@ -241,7 +241,8 @@ permitted. These CPU checks do not restrict DMA, EMAC or HPI configuration acces
 
 | Register | Address | Effect of a write |
 |---|---|---|
-| L2CFG / L1PCFG / L1DCFG | 0184 0000h / 0020h / 0040h | flush as required, resize, re-report the SRAM remainder |
+| L1PCFG / L1DCFG | 0184 0020h / 0040h | flush the cache, resize, re-report the SRAM remainder |
+| L2CFG | 0184 0000h | a new L2MODE writes back and invalidates L2 only, resizes it and re-reports the remainder; bit 3 (L2CC) freezes L2; bits 9 and 8 (IP, ID) invalidate all of L1P or L1D |
 | L1PCC / L1DCC | 0184 0024h / 0044h | bit 0 freezes; the previous state reads back in bit 16 |
 | L2WBAR / L2WWC | 0184 4000h / 4004h | writeback range: L1D then L2 |
 | L2WIBAR / L2WIWC | 0184 4010h / 4014h | writeback-invalidate range: L1D, L1P, L2 |
@@ -265,7 +266,31 @@ cache still serves hits and still updates a line it already holds, but `insert` 
 nothing, so a miss is served from the level below and leaves no line
 (`cache:l1d-freeze-blocks-allocation`). Frozen L1D read and write hits leave replacement order
 unchanged (SPRU871K section 3.3.4), so the first conflicting fill after unfreezing evicts the
-same line it would have before the frozen hits. L2 has no freeze register in this model.
+same line it would have before the frozen hits. L2CFG.L2CC freezes L2 the same way: SPRU871K
+section 4.3.5 sends read and write misses "directly to external memory, as if L2 cache were not
+present", so a frozen L2 miss neither fills nor allocates on a write
+(`system::tests::a_frozen_l2_serves_hits_and_sends_misses_to_external_memory`).
+
+L2CFG is three registers in one (SPRU871K Table 4-11), and an L2 mode change is narrower than the
+L1 ones. "Changing L2's mode does not affect the contents of either L1 cache" (section 4.3.4) and
+"changing of the L2 cache size will not cause any evictions from L1P or L1D cache" (SPRU862B
+section 2.7.2), so `configure_l2` writes back and invalidates the L2 cache alone. The write-only IP
+and ID bits are the legacy global invalidates of L1P and L1D: each invalidates its own cache and
+nothing else, ID without writing anything back
+(`system::tests::an_l2_mode_change_leaves_both_l1_caches_alone`,
+`l2cfg_ip_and_id_invalidate_only_the_l1_cache_they_name`).
+
+**[INFERENCE]** The L2 flush runs only when a write changes the L2MODE field. No manual says what
+an L2CFG write that leaves L2MODE as it was does to the L2 cache: section 4.3.4 describes the
+writeback-invalidate as what L2 does "when a program writes a new cache mode", and Table 4-5 only
+covers switching to more or less cache. The model reads "new" as "different from the field's
+current value", so a write that only sets IP, ID or L2CC leaves the L2 cache's contents alone -
+which `l2cfg_ip_and_id_invalidate_only_the_l1_cache_they_name` pins by checking that a dirty L2
+line is still unwritten afterwards. Two consequences follow from reading the field rather than the
+size: rewriting the same mode does not flush, and moving between encodings that mean the same
+256 KB - 4 to 7, say - does. Silicon could equally flush on every L2MODE write; a program would see
+the difference only in whether its L2 lines survive such a write - when a dirty one reaches memory,
+and whether a clean one is fetched again.
 
 ## The write buffer
 

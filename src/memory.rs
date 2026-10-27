@@ -1140,7 +1140,7 @@ impl MemoryHierarchy {
     }
     pub(crate) fn cache_register_read(&self, address: u32) -> Option<u32> {
         let value = match address {
-            L2CFG => self.l2_cfg,
+            L2CFG => self.l2_cfg | u32::from(self.l2.frozen()) << 3,
             L1PCFG => self.l1p_cfg,
             L1DCFG => self.l1d_cfg,
             L1PCC => self.l1p_cc,
@@ -1391,6 +1391,14 @@ impl BoundHierarchy<'_> {
         if let Some(value) = self.hierarchy.l2.read_byte(address) {
             return value;
         }
+        // A frozen L2 sends a miss "directly to external memory, as if L2 cache were not
+        // present" (SPRU871K section 4.3.5).
+        if self.hierarchy.l2.frozen() {
+            return self
+                .backing
+                .read_byte(self.hierarchy.requester(), address)
+                .unwrap_or(0);
+        }
         let line_size = self.hierarchy.l2.line_size();
         let base = address & !(line_size - 1);
         let data = self
@@ -1408,6 +1416,11 @@ impl BoundHierarchy<'_> {
             return;
         }
         if !self.hierarchy.l2.write_byte(address, value) {
+            if self.hierarchy.l2.frozen() {
+                self.backing
+                    .write_byte(self.hierarchy.requester(), address, value);
+                return;
+            }
             let line_size = self.hierarchy.l2.line_size();
             let base = address & !(line_size - 1);
             let data =
@@ -1495,15 +1508,34 @@ impl BoundHierarchy<'_> {
             .configure(l1_capacity(self.hierarchy.l1d_cfg));
         self.report_sram();
     }
+    /// L2CFG carries three things besides the mode (SPRU871K Table 4-11): L2CC, the L2 freeze
+    /// bit; and IP and ID, the write-only legacy global invalidates of L1P and L1D, which
+    /// invalidate those caches and nothing else - ID without a writeback, as L1DINV does.
+    ///
+    /// A new mode writes back and invalidates the L2 cache and resizes it, and leaves both L1
+    /// caches alone: "Changing L2's mode does not affect the contents of either L1 cache"
+    /// (SPRU871K section 4.3.4), and "changing of the L2 cache size will not cause any
+    /// evictions from L1P or L1D cache" (SPRU862B section 2.7.2).
+    ///
+    /// INFERENCE: the flush runs only when the mode field changes. Section 4.3.4 describes it as
+    /// what the L2 does "when a program writes a new cache mode" and nothing says what a write
+    /// that keeps the mode does, so one that only sets IP, ID or L2CC leaves L2 alone, and so does
+    /// rewriting the same mode (docs/internals/memory-and-caches.md).
     fn configure_l2(&mut self, value: u32) {
-        self.flush_l1d(true);
-        self.hierarchy.l1p.invalidate_all(false);
-        self.flush_l2(true);
-        self.hierarchy.l2_cfg = value & 7;
-        self.hierarchy
-            .l2
-            .configure(l2_capacity(self.hierarchy.l2_cfg));
-        self.report_sram();
+        if value & 1 << 9 != 0 {
+            self.hierarchy.l1p.invalidate_all(false);
+        }
+        if value & 1 << 8 != 0 {
+            self.hierarchy.l1d.invalidate_all(false);
+        }
+        self.hierarchy.l2.freeze(value & 1 << 3 != 0);
+        let mode = value & 7;
+        if mode != self.hierarchy.l2_cfg {
+            self.flush_l2(true);
+            self.hierarchy.l2_cfg = mode;
+            self.hierarchy.l2.configure(l2_capacity(mode));
+            self.report_sram();
+        }
     }
     /// Tell the storage how much of this megamodule's three windows is still SRAM, which is
     /// what a cache size change decides besides the cache's own capacity. The cache is carved
