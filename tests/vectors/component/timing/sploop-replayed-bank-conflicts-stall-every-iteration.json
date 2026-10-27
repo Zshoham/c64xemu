@@ -1,0 +1,31 @@
+{
+  "domain": "timing",
+  "expected": {
+    "cycles": 18,
+    "fault": null,
+    "reached_stop": true
+  },
+  "request": {
+    "action": "execute",
+    "controls": {
+      "13": 8
+    },
+    "cycles": 200,
+    "endian": "little",
+    "id": "timing:sploop-replayed-bank-conflicts-stall-every-iteration",
+    "memory": [],
+    "pc": 14680064,
+    "registers": {
+      "A3": 15728640,
+      "B3": 15728672
+    },
+    "stop_pc": 14680080,
+    "words": [
+      229376,
+      34341477,
+      34341606,
+      212992,
+      32768
+    ]
+  }
+}

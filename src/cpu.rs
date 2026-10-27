@@ -1200,8 +1200,14 @@ impl Cpu {
         }
     }
 
+    /// A cycle that issues from the loop buffer alone. Its loads and stores reach L1D like any
+    /// other packet's, so it pays the same bank-conflict and read-miss stalls: SPRU732J §4.3.3
+    /// gives the memory stall no exception, and §7.15.2 names the only two stalls the loop
+    /// buffer is exempt from - the cross path read and the AMR use. What the buffer saves is
+    /// program fetch (SPRU862B §3.4.3.1), not data access.
     fn execute_sploop_replay(&mut self, bus: &mut CoreBus<'_>) {
         let offset = self.current_loop_offset().unwrap();
+        bus.begin_data_cycle();
         self.begin_loop_cycle(offset);
         let replay_packets = self.take_replay_packets(offset, 0);
         if let Err((error, cause)) = validate_packets(replay_packets.packets()) {
@@ -1235,6 +1241,8 @@ impl Cpu {
             self.execute_fetched(bus, replay);
         }
         self.return_replay_packets(replay_packets);
+        let clock = self.data_clock();
+        self.pending_stalls += bus.data_stalls(clock);
         self.cycle_boundary(bus, CycleEnd::LoopStage(offset));
     }
 

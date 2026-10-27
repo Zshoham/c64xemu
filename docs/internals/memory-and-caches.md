@@ -438,7 +438,11 @@ caches it times, and the CPU's whole part is to say what it accessed and when: `
 `DataClock` — the execute cycle, which stall cycles do not advance and which "the cycle right
 after another miss" is counted in, and the wall clock, which they do and which the write buffer
 drains on — so the hierarchy never reaches back into the CPU. The stall cycles come back as
-numbers and the CPU adds them to `pending_stalls`.
+numbers and the CPU adds them to `pending_stalls`. A cycle that issues from the SPLOOP buffer
+alone asks exactly as a program-memory cycle does: the buffer spares the program fetch
+(SPRU862B §3.4.3.1), not the data access, and SPRU732J §7.15.2 exempts only the cross path and
+AMR use stalls from it (`timing:sploop-replayed-bank-conflicts-stall-every-iteration`,
+`timing:sploop-replayed-read-misses-cost-what-straight-line-ones-do`).
 
 `MemoryHierarchy::access_timing` answers all three facts one data access tells the timing model
 at once — resident, read-miss, and whether the fill's line comes from the L2 cache — for the
