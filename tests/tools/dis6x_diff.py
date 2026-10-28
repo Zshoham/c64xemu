@@ -29,7 +29,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent.parent
-DIS6X = ROOT / "tests/build/ti-cgt-c6000_8.5.0.LTS/bin/dis6x"
+DIS6X = ROOT / "tests/build/ti-cgt-c6000_8.3.15/bin/dis6x"
 EMULATOR = ROOT / "target/release/c64xemu"
 
 # dis6x prints the pseudo-operation TI's assembler accepted; the decoder prints what the bits

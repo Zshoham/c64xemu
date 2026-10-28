@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import shlex
+import struct
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -11,10 +12,10 @@ from typing import Any
 import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
-CL6X = ROOT / "tests/build/ti-cgt-c6000_8.5.0.LTS/bin/cl6x"
-HEX6X = ROOT / "tests/build/ti-cgt-c6000_8.5.0.LTS/bin/hex6x"
-RTS_LIB_DIR = ROOT / "tests/build/ti-cgt-c6000_8.5.0.LTS/lib"
-RTS_INCLUDE_DIR = ROOT / "tests/build/ti-cgt-c6000_8.5.0.LTS/include"
+CL6X = ROOT / "tests/build/ti-cgt-c6000_8.3.15/bin/cl6x"
+HEX6X = ROOT / "tests/build/ti-cgt-c6000_8.3.15/bin/hex6x"
+RTS_LIB_DIR = ROOT / "tests/build/ti-cgt-c6000_8.3.15/lib"
+RTS_INCLUDE_DIR = ROOT / "tests/build/ti-cgt-c6000_8.3.15/include"
 DEFAULT_OPT_LEVELS = ("-O0", "-O1", "-O2", "-O3", "-Os")
 NDK_IMAGE = ROOT / "tests/firmware/ndk_tcp/build/ndk_tcp.out"
 BIOS_IMAGE = ROOT / "tests/firmware/bios_kernel/build/bios_kernel.out"
@@ -55,6 +56,49 @@ def run_tool(
             file=sys.stderr,
         )
     return completed
+
+def symbol_address(
+    image: Path, names: tuple[str, ...], kinds: tuple[int, ...] = (2,)
+) -> int | None:
+    """The value of the first symbol in `names` whose ELF type is in `kinds`, from a TI EABI
+    ELF32 image.
+
+    `kinds` holds STT_ values: the default 2 is STT_FUNC; TI's linker types a global variable
+    1 (STT_OBJECT) or, when it is uninitialised, 5 (STT_COMMON). The images are
+    linked with `--symdebug:none`, so there is no DWARF; the symbol table is the only place
+    to learn where `main` or a result variable lives, which moves with the compiler's layout.
+    """
+    data = image.read_bytes()
+    (_, _, _, _, _, _, e_shoff, _, _, _, _, e_shentsize, e_shnum, _) = struct.unpack_from(
+        "<16sHHIIIIIHHHHHH", data, 0
+    )
+    sections = [
+        struct.unpack_from("<IIIIIIIIII", data, e_shoff + index * e_shentsize)
+        for index in range(e_shnum)
+    ]
+    strtabs = {
+        index: data[sh_offset : sh_offset + sh_size]
+        for index, (_, sh_type, _, _, sh_offset, sh_size, _, _, _, _) in enumerate(sections)
+        if sh_type == 3  # SHT_STRTAB
+    }
+    for (_, sh_type, _, _, sh_offset, sh_size, sh_link, _, _, _) in sections:
+        if sh_type != 2:  # SHT_SYMTAB
+            continue
+        strings = strtabs.get(sh_link)
+        if strings is None:
+            continue
+        for entry in range(sh_size // 16):
+            st_name, st_value, _, st_info, _, _ = struct.unpack_from(
+                "<IIIBBH", data, sh_offset + entry * 16
+            )
+            if st_info & 0xF not in kinds:
+                continue
+            end = strings.find(b"\0", st_name)
+            if end < 0:
+                continue
+            if strings[st_name:end].decode("ascii", "replace") in names:
+                return st_value
+    return None
 
 def matches(expected: Any, actual: Any) -> bool:
     if isinstance(expected, dict):

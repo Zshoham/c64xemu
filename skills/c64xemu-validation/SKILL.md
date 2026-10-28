@@ -12,12 +12,12 @@ inspection. Fortunately this target has unusually good oracles available locally
 
 ## The local toolchain works — this is the primary oracle
 
-TI CGT 8.5.0 is in `compiler/bin/`. Verified working invocations:
+TI CGT 8.3.15 is in `compiler/bin/`. Verified working invocations:
 
 ```sh
-export PATH=\$PWD/tests/build/ti-cgt-c6000_8.5.0.LTS/bin:$PATH
-INC=\$PWD/tests/build/ti-cgt-c6000_8.5.0.LTS/include
-LIB=\$PWD/tests/build/ti-cgt-c6000_8.5.0.LTS/lib
+export PATH=\$PWD/tests/build/ti-cgt-c6000_8.3.15/bin:$PATH
+INC=\$PWD/tests/build/ti-cgt-c6000_8.3.15/include
+LIB=\$PWD/tests/build/ti-cgt-c6000_8.3.15/lib
 
 # compile only
 cl6x -mv6400+ --abi=eabi -O2 -I$INC -c t.c

@@ -167,12 +167,12 @@ provisions itself before the suites that need them run.
 
 ### TI C6000 code generation tools
 
-- `tests/build/ti-cgt-c6000_8.5.0.LTS/bin/` — **`cl6x`, `asm6x`, `dis6x`, `ofd6x`, `hex6x`, `nm6x`.** `dis6x` prints
+- `tests/build/ti-cgt-c6000_8.3.15/bin/` — **`cl6x`, `asm6x`, `dis6x`, `ofd6x`, `hex6x`, `nm6x`.** `dis6x` prints
   `address  hexword  mnemonic` and is the ideal oracle for differential decoder testing.
   Verified working: `cl6x -mv6400+ --abi=eabi -O2 -c t.c` then `dis6x t.obj`.
-- `tests/build/ti-cgt-c6000_8.5.0.LTS/lib/src/` — RTS sources. `trgcio.h`, `trgmsg.c`, `host*.c` fully specify the
+- `tests/build/ti-cgt-c6000_8.3.15/lib/src/` — RTS sources. `trgcio.h`, `trgmsg.c`, `host*.c` fully specify the
   **CIO host-I/O protocol** used by `printf` in compiled test programs.
-- `tests/build/ti-cgt-c6000_8.5.0.LTS/include/c6x.h` — intrinsic → instruction mapping, useful as a semantics cross-check.
+- `tests/build/ti-cgt-c6000_8.3.15/include/c6x.h` — intrinsic → instruction mapping, useful as a semantics cross-check.
 
 ### Third-party trees the suite reads as input
 

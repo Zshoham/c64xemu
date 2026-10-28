@@ -23,7 +23,7 @@ fi
 xdc="$tp/xdctools_3_32_01_22_core"
 bios="$tp/bios_6_42_03_35"
 ndk="$tp/ndk_2_22_02_16"
-cgt="$tp/ti-cgt-c6000_8.5.0.LTS"
+cgt="$tp/ti-cgt-c6000_8.3.15"
 target=ti.targets.elf.C64P
 platform=ti.platforms.dsk6455
 

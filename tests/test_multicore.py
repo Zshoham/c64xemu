@@ -23,7 +23,7 @@ from pathlib import Path
 
 import pytest
 
-from common import ROOT
+from common import ROOT, symbol_address
 from target_programs import Program, build_target_program, load_programs
 
 FIRMWARE = ROOT / "tests/firmware/c6472_multicore"
@@ -315,6 +315,18 @@ def dumped(stderr: str, address: int) -> list[int]:
     return words
 
 
+# STT_OBJECT and STT_COMMON: how TI's linker types an initialised and an uninitialised global.
+VARIABLE_SYMBOLS = (1, 5)
+
+
+def result_addresses(image: Path) -> tuple[int, int]:
+    """Where the firmware left `answered` and `total`, which the compiler's layout decides."""
+    answered = symbol_address(image, ("answered",), kinds=VARIABLE_SYMBOLS)
+    total = symbol_address(image, ("total",), kinds=VARIABLE_SYMBOLS)
+    assert answered is not None and total is not None, "result variables missing from the image"
+    return answered, total
+
+
 def test_c6472_firmware_releases_the_other_cores_and_meets_them(
     candidate_binary: Path, multicore_firmware: Path
 ) -> None:
@@ -327,6 +339,7 @@ def test_c6472_firmware_releases_the_other_cores_and_meets_them(
     and tallies the result: 0+1+2+3+4+5 = 15, plus 0x100 for each of the five cores that saw
     the interrupt source, is 0x50F.
     """
+    answered_at, total_at = result_addresses(multicore_firmware)
     completed = subprocess.run(
         [
             str(candidate_binary),
@@ -340,7 +353,9 @@ def test_c6472_firmware_releases_the_other_cores_and_meets_them(
             "--max-cycles",
             "5000000",
             "--dump",
-            "0x008004ec:8",
+            f"{answered_at:#010x}:4",
+            "--dump",
+            f"{total_at:#010x}:4",
             "--dump",
             "0x00200000:24",
         ],
@@ -351,7 +366,8 @@ def test_c6472_firmware_releases_the_other_cores_and_meets_them(
     )
     # The firmware returns its tally from main, so the process exit status is the program's;
     # the values it left in memory are the result.
-    answered, total = dumped(completed.stderr, 0x0080_04EC)
+    (answered,) = dumped(completed.stderr, answered_at)
+    (total,) = dumped(completed.stderr, total_at)
     assert answered == CORES, "every core reported in"
     assert total == 0x50F, f"tally {total:#x}"
     signatures = dumped(completed.stderr, 0x0020_0000)
@@ -368,6 +384,7 @@ def test_c6472_firmware_leaves_cores_held_without_a_release(
     counts one core. That is the control for the case above - the six-core result comes from
     the boot controller doing its job, not from the cores having been running all along.
     """
+    answered_at, total_at = result_addresses(multicore_firmware)
     completed = subprocess.run(
         [
             str(candidate_binary),
@@ -378,14 +395,17 @@ def test_c6472_firmware_leaves_cores_held_without_a_release(
             "--max-cycles",
             "20000000",
             "--dump",
-            "0x008004ec:8",
+            f"{answered_at:#010x}:4",
+            "--dump",
+            f"{total_at:#010x}:4",
         ],
         cwd=ROOT,
         capture_output=True,
         text=True,
         timeout=300,
     )
-    answered, total = dumped(completed.stderr, 0x0080_04EC)
+    (answered,) = dumped(completed.stderr, answered_at)
+    (total,) = dumped(completed.stderr, total_at)
     assert answered == 1, "only core 0 ever reported"
     assert total == 0, "no other core's index was added"
 

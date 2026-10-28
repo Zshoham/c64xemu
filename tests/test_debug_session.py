@@ -13,7 +13,6 @@ import os
 import re
 import select
 import socket
-import struct
 import subprocess
 import time
 from dataclasses import dataclass
@@ -21,52 +20,13 @@ from pathlib import Path
 
 import pytest
 
-from common import ROOT, run_tool
+from common import ROOT, run_tool, symbol_address
 from target_programs import build_target_program, load_programs
 
 # The program the session runs: small, deterministic, no peripherals, exits through
 # C$$EXIT with A4 = 55 (the hand-derived sum of 1..10).
 PROGRAM = "sum_loop"
 EXPECTED_EXIT_CODE = 55
-
-
-def symbol_address(image: Path, names: tuple[str, ...]) -> int | None:
-    """The value of the first function symbol in `names`, from a TI EABI ELF32 image.
-
-    The images are linked with `--symdebug:none`, so there is no DWARF; the symbol
-    table is the only place a debugger can learn where `main` lives.
-    """
-    data = image.read_bytes()
-    (_, _, _, _, _, _, e_shoff, _, _, _, _, e_shentsize, e_shnum, _) = struct.unpack_from(
-        "<16sHHIIIIIHHHHHH", data, 0
-    )
-    sections = [
-        struct.unpack_from("<IIIIIIIIII", data, e_shoff + index * e_shentsize)
-        for index in range(e_shnum)
-    ]
-    strtabs = {
-        index: data[sh_offset : sh_offset + sh_size]
-        for index, (_, sh_type, _, _, sh_offset, sh_size, _, _, _, _) in enumerate(sections)
-        if sh_type == 3  # SHT_STRTAB
-    }
-    for (_, sh_type, _, _, sh_offset, sh_size, sh_link, _, _, _) in sections:
-        if sh_type != 2:  # SHT_SYMTAB
-            continue
-        strings = strtabs.get(sh_link)
-        if strings is None:
-            continue
-        for entry in range(sh_size // 16):
-            st_name, st_value, _, st_info, _, _ = struct.unpack_from(
-                "<IIIBBH", data, sh_offset + entry * 16
-            )
-            if st_info & 0xF != 2:  # STT_FUNC
-                continue
-            end = strings.find(b"\0", st_name)
-            if end < 0:
-                continue
-            if strings[st_name:end].decode("ascii", "replace") in names:
-                return st_value
-    return None
 
 
 @dataclass(frozen=True)

@@ -56,7 +56,7 @@ The first fetch packet of `__TI_printfi` in `tests/firmware/bios_kernel/build/bi
 as TI's own disassembler prints it:
 
 ```
-$ tests/build/ti-cgt-c6000_8.5.0.LTS/bin/dis6x -q tests/firmware/bios_kernel/build/bios_kernel.out
+$ tests/build/ti-cgt-c6000_8.3.15/bin/dis6x -q tests/firmware/bios_kernel/build/bios_kernel.out
 ...
 00800000   10294810           CALLP.S1      __push_rts (PC+84544 = 0x00814a40),A3
 00800004   07fee053           ADDK.S2       -576,B15

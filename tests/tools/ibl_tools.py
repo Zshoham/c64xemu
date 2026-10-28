@@ -26,7 +26,7 @@ import subprocess
 ROOT = Path(__file__).resolve().parent.parent.parent
 IBL = ROOT / "tests/build/ibl"
 TOOLS = ROOT / "tests/build/ibl-tools"
-HEX6X = ROOT / "tests/build/ti-cgt-c6000_8.5.0.LTS/bin/hex6x"
+HEX6X = ROOT / "tests/build/ti-cgt-c6000_8.3.15/bin/hex6x"
 LEGACY_C = ["-std=gnu89", "-w", "-include", "stdlib.h", "-include", "string.h"]
 
 

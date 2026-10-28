@@ -29,7 +29,7 @@ def test_dependencies() -> None:
     # an earlier fetch_deps.sh could leave a bare repository there.
     trees = [ROOT / "tests/build" / name for name in
              ("xdctools_3_32_01_22_core", "bios_6_42_03_35", "ndk_2_22_02_16",
-              "ti-cgt-c6000_8.5.0.LTS", "dsplib-c64plus", "binutils-tic6x-vectors",
+              "ti-cgt-c6000_8.3.15", "dsplib-c64plus", "binutils-tic6x-vectors",
               "ibl/src/util/romparse/romparse.c")]
     if not all(tree.exists() for tree in trees):
         print("provisioning build/ with tests/tools/fetch_deps.sh", file=sys.stderr)

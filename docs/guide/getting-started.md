@@ -36,7 +36,7 @@ missing it builds them.
 
 | Tree under `tests/build/` | What it is |
 |---|---|
-| `ti-cgt-c6000_8.5.0.LTS` | TI's C6000 code generation tools: `cl6x`, `asm6x`, `dis6x`, `ofd6x`, `hex6x`, `nm6x` |
+| `ti-cgt-c6000_8.3.15` | TI's C6000 code generation tools: `cl6x`, `asm6x`, `dis6x`, `ofd6x`, `hex6x`, `nm6x` |
 | `xdctools_3_32_01_22_core`, `bios_6_42_03_35`, `ndk_2_22_02_16` | XDCtools, SYS/BIOS 6.42 and the NDK 2.22, which the two firmware images are built from |
 | `dsplib-c64plus` | DSPLIB 3.4.0.0, whose natural-C kernels 23 target-program specs compile |
 | `binutils-tic6x-vectors` | the 231 tic6x vector files from the binutils 2.44 release that the decoder differential sweeps |

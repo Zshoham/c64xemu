@@ -38,7 +38,7 @@ zip_archives=(
 # `--mode unattended --prefix <parent-of-name>`.
 installers_under_prefix=(
     "bios_6_42_03_35|$base/bios/sysbios/6_42_03_35/exports/bios_setuplinux_6_42_03_35.bin"
-    "ti-cgt-c6000_8.5.0.LTS|https://dr-download.ti.com/software-development/ide-configuration-compiler-or-debugger/MD-vqU2jj6ibH/8.5.0.LTS/ti_cgt_c6000_8.5.0.LTS_linux-x64_installer.bin"
+    "ti-cgt-c6000_8.3.15|https://dr-download.ti.com/software-development/ide-configuration-compiler-or-debugger/MD-vqU2jj6ibH/8.3.15/ti_cgt_c6000_8.3.15_linux-x64_installer.bin"
 )
 # Installers that unpack straight into the prefix, so the prefix has to be `name` itself. TI
 # packaged this one with a different installer toolkit from the two above: it takes

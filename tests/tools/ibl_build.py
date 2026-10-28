@@ -37,7 +37,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from ibl_tools import IBL, LEGACY_C, IblToolError, _run, build_tools  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent.parent
-CGT = ROOT / "tests/build/ti-cgt-c6000_8.5.0.LTS"
+CGT = ROOT / "tests/build/ti-cgt-c6000_8.3.15"
 OUT = ROOT / "tests/build/ibl-c6472"
 SRC = IBL / "src"
 
