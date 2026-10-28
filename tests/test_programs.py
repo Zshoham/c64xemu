@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
@@ -18,6 +19,8 @@ from target_programs import (
     run_target_program,
     split_weight,
 )
+
+OPT_FLAG = re.compile(r"-O[0-3s]")
 
 def program_cases(
     candidate: Path | None,
@@ -47,7 +50,10 @@ def program_cases(
             checks.append("cached")
         level_weights = split_weight(program.weight, len(program.opt_levels))
         for level, level_weight in zip(program.opt_levels, level_weights):
-            variant = replace(program, cflags=program.cflags + (level,))
+            # The level under test replaces any -O a spec carries; left in place the compiler
+            # honoured the spec's and ignored the level, so every variant was the same build.
+            flags = tuple(flag for flag in program.cflags if not OPT_FLAG.fullmatch(flag))
+            variant = replace(program, cflags=flags + (level,))
             workdir = workroot / program.name / level.lstrip("-")
             if candidate is not None:
                 workdir.mkdir(parents=True, exist_ok=True)
