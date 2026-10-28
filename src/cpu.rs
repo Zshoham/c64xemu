@@ -311,8 +311,8 @@ pub struct Cpu {
     /// The L1P stale epoch the buffered packet was last checked against (see `Cpu::step`).
     packet_line_stale_epoch: u64,
     packet_line_reusable: bool,
-    /// Set while the program-memory packet of a PROT fetch packet executes, and latched when
-    /// such a packet actually performs a load.
+    /// Set while an instruction from a PROT fetch packet executes, and `prot_load` latched when
+    /// such an instruction actually performs a load.
     prot_packet: bool,
     prot_load: bool,
     /// The SPLOOP packet address of a loop that drained for a pending interrupt, consumed
@@ -930,11 +930,9 @@ impl Cpu {
         }
         let mut packet_storage = [std::mem::MaybeUninit::<Fetched>::uninit(); 8];
         let mut length = 0usize;
-        // Two questions about the whole packet are answered while it is fetched rather than by
-        // walking it again: the first SPMASK it carries, and whether any of its fetch packets
-        // set PROT.
+        // One question about the whole packet is answered while it is fetched rather than by
+        // walking it again: the first SPMASK it carries.
         let mut spmask = None;
-        let mut prot_packet = false;
         loop {
             // SAFETY: the slot is within the local array and uninitialised; `fetch` writes it
             // exactly once before the prefix is read as a slice below.
@@ -945,7 +943,6 @@ impl Cpu {
             if spmask.is_none() {
                 spmask = spmask_bits(fetched);
             }
-            prot_packet |= fetched.prot;
             self.pc = next;
             length += 1;
             if !parallel || length == packet_storage.len() {
@@ -1059,11 +1056,12 @@ impl Cpu {
         if loop_offset.is_some() {
             self.return_replay_packets(replay_packets);
         }
-        // A fetch packet whose header sets PROT follows every load in it with four NOP
-        // cycles, which is how a short loop body absorbs the load latency without NOPs. The
-        // loads are recognised by the ones that actually execute, so every compact and wide
-        // addressing form is covered.
-        self.prot_packet = prot_packet;
+        // A load in a fetch packet whose header sets PROT is followed by four NOP cycles,
+        // which is how a short loop body absorbs the load latency without NOPs. An execute
+        // packet can span fetch packets (SPRU732J §3.9.2.2: the header describes its own
+        // fetch packet), so `execute_fetched` decides per instruction, from the fetch packet
+        // it came out of, and the loads are recognised by the ones that actually execute, so
+        // every compact and wide addressing form is covered.
         self.prot_load = false;
         // While piping up after an interrupt, the instructions in parallel with the SPLOOP and
         // the SPMASKed instructions coming from program memory execute like NOPs: the prolog
@@ -1090,7 +1088,6 @@ impl Cpu {
         } else {
             self.execute_fetched(bus, packet);
         }
-        self.prot_packet = false;
         if self.prot_load {
             self.stall_cycles = self.stall_cycles.max(4);
         }
@@ -1176,6 +1173,7 @@ impl Cpu {
         // end of this packet rather than simply the next instruction word.
         let packet_next = packet.last().map_or(0, |fetched| fetched.next);
         for fetched in packet {
+            self.prot_packet = fetched.prot;
             match (fetched.inst.encoding, fetched.inst.decoded()) {
                 (Encoding::Wide(word), Some(DecodedOpcode::Wide(opcode))) => {
                     if self.predicate_holds(word, opcode) {
@@ -1215,6 +1213,7 @@ impl Cpu {
                 _ => unreachable!("encoding and cached opcode disagree"),
             }
         }
+        self.prot_packet = false;
     }
 
     /// A cycle that issues from the loop buffer alone. Its loads and stores reach L1D like any
@@ -6310,6 +6309,28 @@ mod tests {
     }
 
     #[test]
+    fn an_execute_packet_spanning_fetch_packets_protects_only_the_loads_of_the_protected_one() {
+        // SPRU732J §3.9.2.2: the header's PROT bit describes its own fetch packet. The first
+        // fetch packet here is PROTected and ends in a compact NOP whose header p-bit (slot 13) chains it to the
+        // `LDW.D1T1 *A6++[1],A3` at the start of the second, whose header is plain - so that
+        // load keeps its four delay slots and the next packet's `MV.L1 A3,A4` still sees the
+        // old A3. This is the shape TI's 8.3.15 compiler emits for `[B0] BNOP loop,2 ||
+        // [B0] LDW` kernels, where the load's delay slots are counted against the branch.
+        let mut words = [0x0c6e_0c6eu32; 16];
+        words[7] = 0xe000_0000 | 0x0fe0_0000 | (1 << 20) | (1 << 13);
+        words[8] = 0x81c6_0d3c;
+        words[15] = 0xe000_0000 | 0x0fe0_0000;
+        let mut cpu = Cpu::new(0);
+        cpu.set_register("A6", 0x1000).unwrap();
+        cpu.write_bytes(0x1000, &0x4433_2211u32.to_le_bytes());
+        cpu.write_words(0, &words);
+        cpu.run(30);
+        assert_eq!(cpu.register('A', 3), 0x4433_2211, "the load still lands");
+        assert_eq!(cpu.register('A', 4), 0, "no PROT NOP cycles follow it");
+        assert_eq!(cpu.fault(), None);
+    }
+
+    #[test]
     fn predicated_off_bnop_still_idles_its_nop_cycles() {
         // `[B0] BNOP bnp,1` with B0 == 0 does not branch, but its NOP cycle is generated in
         // decode, so the following MV runs two cycles after the MPY and sees the product.
@@ -6335,8 +6356,10 @@ mod tests {
 
     #[test]
     fn sploopw_exits_when_its_predicate_goes_false() {
-        // `[B1] SPLOOPW 2` is a do-while: ILC is unused and the loop stops at the first
-        // stage boundary where B1 reads zero, so the body runs exactly three times.
+        // `[B1] SPLOOPW 2` is a do-while: ILC is unused. The predicate B1 is decremented in the
+        // first stage, so it reads zero from cycle 5. Termination is the predicate as it stood
+        // three cycles before a stage boundary (SPRU732J 7.10.2): the boundary at cycle 8 sees
+        // cycle 5, so the iteration that starts at cycle 6 runs and the body runs four times.
         let mut cpu = Cpu::new(0);
         cpu.write_words(
             0,
@@ -6355,8 +6378,9 @@ mod tests {
             ],
         );
         cpu.run(24);
-        assert_eq!(cpu.register('A', 4), 3);
-        assert_eq!(cpu.register('B', 1), 0);
+        assert_eq!(cpu.register('A', 4), 4);
+        // The iteration that starts at cycle 6 decrements B1 once more: zero becomes -1.
+        assert_eq!(cpu.register('B', 1), 0xffff_ffff);
         assert_eq!(cpu.fault(), None);
     }
 

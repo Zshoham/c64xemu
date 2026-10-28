@@ -86,8 +86,9 @@ pub(crate) struct LoopStart {
     /// internal down-counter is loaded four cycles later - the ILC load latency.
     pub(crate) delayed: bool,
     /// `SPLOOPW` is a do-while: its predicate is the loop-exit test and ILC is unused. The
-    /// register is re-read at every stage boundary; when the test fails the loop exits abruptly
-    /// and iterations already started simply do not finish.
+    /// register is read on every cycle of the loop, but a stage boundary terminates on the
+    /// predicate as it evaluated three cycles before the boundary (SPRU732J 7.10.2); when that
+    /// test fails the loop exits abruptly and iterations already started simply do not finish.
     pub(crate) while_test: Option<TestRegister>,
     /// A predicated `SPLOOP(D)` marks a nested loop, and the register its would-be predicate
     /// field names is the reload selector: `SPMASKR`/`SPKERNELR` reloads ILC from RILC and
@@ -135,6 +136,9 @@ struct Active<F> {
     awaiting_reload: bool,
     counter: Option<u32>,
     started: u32,
+    /// `SPLOOPW` only: bit `k` holds whether the predicate failed `k` cycles ago, so bit 3 is
+    /// the termination condition for the boundary reached this cycle (SPRU732J 7.10.2).
+    while_failures: u32,
     total: Option<u32>,
     start_address: u32,
     /// Set when the loop is draining because an interrupt is pending: no new iterations start and
@@ -269,6 +273,7 @@ impl<F: Copy> LoopBuffer<F> {
             awaiting_reload: false,
             counter: None,
             started: 0,
+            while_failures: 0,
             total: None,
             start_address: start.start_address,
             draining_for_interrupt: false,
@@ -332,6 +337,8 @@ impl<F: Copy> LoopBuffer<F> {
     ///
     /// `while_value` is the do-while register's value, which the caller reads because the
     /// register file is the CPU's; `ilc` is the counter's current value for the same reason.
+    /// The caller passes it on every loop cycle, because a do-while decides each boundary from
+    /// the value three cycles earlier.
     pub(crate) fn begin_stage(
         &mut self,
         offset: u32,
@@ -341,16 +348,25 @@ impl<F: Copy> LoopBuffer<F> {
         let Some(state) = &mut self.state else {
             return StageOutcome::default();
         };
-        if offset % state.ii != 0 {
-            return StageOutcome::default();
-        }
         if let Some((_, _, zero)) = state.while_test {
-            if (while_value.unwrap_or(0) == 0) == zero {
+            // SPRU732J 7.10.2: the boundary's termination condition is the predicate as it
+            // evaluated three cycles earlier. Shifting every cycle's result in makes bit 3 that
+            // result; before the first cycle of the loop every bit is clear, so the first three
+            // cycles never terminate.
+            let passes = (while_value.unwrap_or(0) == 0) == zero;
+            state.while_failures = (state.while_failures << 1) | u32::from(!passes);
+            if offset % state.ii != 0 {
+                return StageOutcome::default();
+            }
+            if (state.while_failures >> 3) & 1 == 0 {
                 state.started += 1;
             } else {
                 // The do-while condition failed: no epilog, the buffer stops immediately.
                 self.state = None;
             }
+            return StageOutcome::default();
+        }
+        if offset % state.ii != 0 {
             return StageOutcome::default();
         }
         // Once the loop is draining - either because ILC ran out or because an interrupt is
@@ -669,8 +685,9 @@ mod tests {
         assert_eq!(buffer.summary().unwrap().3, Some(3));
     }
 
-    /// A do-while loop tests its register at every stage boundary and exits abruptly when the
-    /// test fails: no epilog, iterations already started simply do not finish.
+    /// A do-while loop tests its register every cycle and exits abruptly when the test failed
+    /// three cycles before a stage boundary: no epilog, iterations already started simply do not
+    /// finish. The boundary's own value is not what decides it (SPRU732J 7.10.2).
     #[test]
     fn a_do_while_loop_exits_at_the_boundary_without_an_epilog() {
         let mut buffer = LoopBuffer::<Slot>::default();
@@ -684,14 +701,41 @@ mod tests {
             nested: false,
         });
         load_body(&mut buffer, 4);
-        // The test passes while the register is non-zero, and ILC is not consulted at all.
+        // The register is 0 only on cycle 1, so boundary 4 - three cycles on - terminates.
+        // Boundary 0 has nothing sampled before it, and boundary 2 sees cycle -1, so both run.
         buffer.begin_stage(0, 0, Some(1));
         assert!(buffer.active());
         assert_eq!(buffer.summary().unwrap().2, 1);
+        buffer.begin_stage(1, 0, Some(0));
         buffer.begin_stage(2, 0, Some(1));
         assert_eq!(buffer.summary().unwrap().2, 2);
-        // It fails: the buffer goes idle at once rather than draining.
-        buffer.begin_stage(4, 0, Some(0));
+        buffer.begin_stage(3, 0, Some(1));
+        // The value at the boundary itself is ignored: it passes here, but cycle 1 failed.
+        buffer.begin_stage(4, 0, Some(1));
+        assert!(!buffer.active());
+    }
+
+    /// A predicate that fails from the first cycle cannot stop the loop in its first three
+    /// cycles: the first boundary it can terminate is the one three cycles after cycle 0.
+    #[test]
+    fn a_do_while_loop_cannot_terminate_in_its_first_three_cycles() {
+        let mut buffer = LoopBuffer::<Slot>::default();
+        buffer.start(LoopStart {
+            ii: 1,
+            start_cycle: 0,
+            start_address: 0x100,
+            delayed: false,
+            while_test: Some((Bank::B, 0, false)),
+            reload_test: None,
+            nested: false,
+        });
+        load_body(&mut buffer, 4);
+        for offset in 0..3 {
+            buffer.begin_stage(offset, 0, Some(0));
+            assert!(buffer.active(), "cycle {offset} is within the first three");
+        }
+        // Cycle 0 failed, so boundary 3 terminates.
+        buffer.begin_stage(3, 0, Some(0));
         assert!(!buffer.active());
     }
 

@@ -39,9 +39,11 @@ write-backs scheduled by earlier packets still land.
 ## Fetch and issue
 
 The fetch loop reads words through `fetch` until it meets one whose parallel bit is clear, or
-until eight instructions have been taken — the maximum an execute packet can hold. Two questions
-about the whole packet are answered during the fetch rather than by walking it a second time: the
-first `SPMASK` it carries, and whether any of its fetch packets set PROT.
+until eight instructions have been taken — the maximum an execute packet can hold. One question
+about the whole packet is answered during the fetch rather than by walking it a second time: the
+first `SPMASK` it carries. PROT is not one of them: an execute packet can span fetch packets, so
+each `Fetched` carries the PROT bit of the fetch packet it came from and only a load from a
+protected one is followed by the four NOP cycles.
 
 The packet is built in a `MaybeUninit<[Fetched; 8]>` on the stack. That is the hot loop of the
 emulator; the `unsafe` blocks are commented with the invariant that makes each sound.
