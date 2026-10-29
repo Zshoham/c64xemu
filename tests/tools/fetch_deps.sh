@@ -186,7 +186,17 @@ checkout() { # name repository commit
     local staging="$target/.$name.partial"
     rm -rf "$staging"
     git init -q "$staging"
-    git -C "$staging" fetch -q --depth 1 "$repository" "$commit"
+    # curl retries its own transfers; git does not, and a CI runner's DNS can fail for a moment.
+    local attempt
+    for attempt in 1 2 3 4; do
+        git -C "$staging" fetch -q --depth 1 "$repository" "$commit" && break
+        if [ "$attempt" = 4 ]; then
+            echo "error: could not fetch $name from $repository" >&2
+            exit 1
+        fi
+        echo "== fetch failed, retrying in $((attempt * 5))s" >&2
+        sleep $((attempt * 5))
+    done
     git -C "$staging" checkout -q FETCH_HEAD
     if [ "$(git -C "$staging" rev-parse HEAD)" != "$commit" ]; then
         echo "error: $name is not at $commit" >&2
