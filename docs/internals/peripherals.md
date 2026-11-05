@@ -259,9 +259,9 @@ programmable divider, D1, which generates SYSCLK1 for the EMAC.
 
 ## DDR2 and EMIFA
 
-`src/ddr2.rs` at `7800 0000h` ([SPRU970G](../reference/spru970g.pdf) §4) and `src/emifa.rs` at
-`7000 0000h` ([SPRU971E](../reference/spru971e.pdf) §12, C6455 only — the C6472 has no
-asynchronous EMIF, DDR2 is its only external memory).
+`src/ddr2.rs` at `7800 0000h` implements the device-specific C6455 ([SPRU970G](../reference/spru970g.pdf)
+§4) and C6472 ([SPRU894J](../reference/spru894j.pdf) §4) register contracts. `src/emifa.rs` at
+`7000 0000h` is C6455 only — the C6472 has no asynchronous EMIF, DDR2 is its only external memory.
 
 Both are register contracts, not data paths: the memory behind them is plain backing store, and
 DDR2 latency, refresh and EMIFA strobe timing are deliberately not simulated. What is modelled is
@@ -271,6 +271,12 @@ floor the controller substitutes when software programs one that is too small. E
 burst priority, four chip-enable configuration registers, the asynchronous wait configuration and
 the time-out interrupt; with no external device to hold ARDY the time-out has no injectable
 source, but the mask registers and their write-one-to-clear pairing are exactly as documented.
+
+The two DDR2 profiles share an address window, not register values. C6455 remains the default
+profile; C6472 selects its own MIDR and reset values, and its SDCFG includes EBANK at bit 3 plus
+BOOT_UNLOCK-gated DDR2 fields. C6472 DMCCTL exposes RL in bits 2:0; its other bits retain the
+documented reset value. These are functional register semantics only. The C6472 DDR2 data path,
+reset initialization progress and interface-ready transition are not yet cycle-modeled.
 
 ## Device configuration
 

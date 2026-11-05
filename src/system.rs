@@ -1098,7 +1098,11 @@ impl Shared {
                 TransferController::new(3, 0x02a3_8000),
             ],
             hpi: Hpi::new(hpi_boot),
-            ddr2: Ddr2::default(),
+            ddr2: if profile.name == "c6472" {
+                Ddr2::c6472()
+            } else {
+                Ddr2::default()
+            },
             emifa: profile.has_emifa.then(Emifa::default),
             utopia: profile
                 .utopia
@@ -3741,6 +3745,20 @@ mod tests {
                 "C6472 {address:#010x}"
             );
         }
+    }
+
+    #[test]
+    fn each_device_selects_its_own_ddr2_register_profile() {
+        let mut c6455 = Fabric::new(&crate::device::C6455);
+        let mut c6472 = Fabric::new(&crate::device::C6472);
+        // Both devices route 0x7800_0000 to the DDR2 block, but the register contract is
+        // device-specific: C6455/SPRU970G versus C6472/SPRU894J.
+        assert_eq!(c6455.read32(0, 0x7800_0000), 0x0031_030f);
+        assert_eq!(c6472.read32(0, 0x7800_0000), 0x0034_0b1f);
+        assert_eq!(c6455.read32(0, 0x7800_0008), 0x0053_0a20);
+        assert_eq!(c6472.read32(0, 0x7800_0008), 0x0028_0420);
+        assert_eq!(c6455.read32(0, 0x7800_000c), 0x0753);
+        assert_eq!(c6472.read32(0, 0x7800_000c), 0x1388);
     }
 
     /// The identification registers are profile data, not something derived from a capability.
