@@ -504,3 +504,28 @@ count changes when they are on.
 
 See [ROADMAP.md](ROADMAP.md) for what is deliberately not modelled yet and what the next
 experiments would be.
+
+### LLVM profile-guided builds
+
+Use Python 3.11+ and an llvm-profdata matching rustc's LLVM major version:
+
+```sh
+just pgo path/to/guest.out                   # train for up to 100M cycles into target/pgo
+just pgo path/to/guest.out --cycles 3000000 --llvm-profdata /usr/bin/llvm-profdata
+just pgo-build target/pgo/training.profdata  # reuse a profile; builds into target/pgo-build
+```
+
+Both recipes wrap `tools/build_pgo.py` (`train` and `build`), which takes any output
+directory with `--output-dir`. Tool discovery uses the explicit option,
+then `LLVM_PROFDATA`, then rustc's sysroot, then PATH. Build mode can work without
+llvm-profdata. Each training run replaces raw profiles, logs, state, and merged
+profile after preflight validation succeeds. Training and build modes each refuse
+directories containing the other mode's artifacts; use separate output directories.
+Training writes `pgo-build-receipt.json`;
+build mode writes `pgo-build-from-profile-receipt.json`. Both use receipt schema v2.
+The output directory must be outside the repository or gitignored.
+The receipt records source identity, tool versions, flags, CPU, and artifacts.
+`release_profile_manifest` contains only explicit Cargo.toml release settings;
+the recorded Cargo version determines defaults. Unexpected
+source changes during a build fail the run. Release profile environment overrides
+are refused. In build mode, `--elf` is an informational note only.

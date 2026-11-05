@@ -53,3 +53,12 @@ ci: fmt-check lint test
 # Remove Cargo build artifacts.
 clean:
     cargo clean
+
+# Extra arguments go to tools/build_pgo.py and override these defaults (e.g. --cycles).
+# Train on one run of a guest ELF and build a profile-guided binary in target/pgo.
+pgo elf *args:
+    python3 tools/build_pgo.py train --elf "{{elf}}" --cycles 100000000 --output-dir target/pgo {{args}}
+
+# Build a profile-guided binary in target/pgo-build from an existing merged profile.
+pgo-build profile *args:
+    python3 tools/build_pgo.py build --profile "{{profile}}" --output-dir target/pgo-build {{args}}
