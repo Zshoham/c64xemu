@@ -3756,7 +3756,7 @@ mod tests {
         assert_eq!(c6455.read32(0, 0x7800_0000), 0x0031_030f);
         assert_eq!(c6472.read32(0, 0x7800_0000), 0x0034_0b1f);
         assert_eq!(c6455.read32(0, 0x7800_0008), 0x0053_0a20);
-        assert_eq!(c6472.read32(0, 0x7800_0008), 0x0028_0420);
+        assert_eq!(c6472.read32(0, 0x7800_0008), 0x0020_0420);
         assert_eq!(c6455.read32(0, 0x7800_000c), 0x0753);
         assert_eq!(c6472.read32(0, 0x7800_000c), 0x1388);
     }

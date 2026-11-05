@@ -62,7 +62,7 @@ const REFRESH_FLOOR: u32 = 0x0100;
 
 /// C6472/TCI648x reset values from SPRU894J Figures 19-26. Its reset configuration differs
 /// materially from the C6455 values, including the NM/CL/IBANK/PAGESIZE fields and EBANK support.
-const C6472_SDCFG_RESET: u32 = (1 << 21) | (1 << 19) | (2 << 9) | (2 << 4);
+const C6472_SDCFG_RESET: u32 = (1 << 21) | (2 << 9) | (2 << 4);
 const C6472_SDRFC_RESET: u32 = 0x1388;
 const C6472_SDTIM1_RESET: u32 = (0x2a << 25)
     | (0x4 << 22)
@@ -176,7 +176,14 @@ impl SlavePort for Ddr2 {
                     // SPRU894J Table 20 adds EBANK at bit 3 and DDR2_TERM[1] at bit 27.
                     writable |= 1 << 3;
                 }
-                if value & SDCFG_BOOT_UNLOCK != 0 {
+                let boot_unlocked = match self.device {
+                    // C6455's documented write semantics unlock the fields in the same write.
+                    DeviceKind::C6455 => value & SDCFG_BOOT_UNLOCK != 0,
+                    // C6472 firmware first sets BOOT_UNLOCK, then writes the configuration
+                    // while clearing it (SPRU894J section 2.11.3). Check the prior register state.
+                    DeviceKind::C6472 => self.config & SDCFG_BOOT_UNLOCK != 0,
+                };
+                if boot_unlocked {
                     writable |= match self.device {
                         DeviceKind::C6455 => 1 << 18,
                         DeviceKind::C6472 => (1 << 27) | (0x7f << 16),
@@ -274,7 +281,7 @@ mod tests {
         assert_eq!(ddr2.read(SDRFC, LITTLE_CONTEXT), Some(0x3e));
         ddr2.write(SDRFC, (1 << 31) | 0x79e, LITTLE_CONTEXT);
         assert_eq!(ddr2.read(SDRFC, LITTLE_CONTEXT), Some((1 << 31) | 0x79e));
-        // The boot-locked fields need BOOT_UNLOCK in the same write.
+        // C6455 boot-locked fields need BOOT_UNLOCK in the same write.
         ddr2.write(SDCFG, SDCFG_RESET | (1 << 18), LITTLE_CONTEXT);
         assert_eq!(ddr2.read(SDCFG, LITTLE_CONTEXT).unwrap() & (1 << 18), 0);
         ddr2.write(
@@ -315,17 +322,13 @@ mod tests {
         );
         assert_eq!(ddr2.read(SDCFG, LITTLE_CONTEXT), Some(initial | (1 << 3)));
 
-        // BOOT_UNLOCK gates bits 27 and 22:16, including the DDR enable and drive fields.
+        // C6472 requires a prior write to set BOOT_UNLOCK; configuration fields are then
+        // accepted by the following write that clears BOOT_UNLOCK (SPRU894J section 2.11.3).
+        ddr2.write(SDCFG, initial | SDCFG_BOOT_UNLOCK, LITTLE_CONTEXT);
         ddr2.write(SDCFG, initial | (1 << 27) | (1 << 18), LITTLE_CONTEXT);
-        assert_eq!(ddr2.read(SDCFG, LITTLE_CONTEXT), Some(initial));
-        ddr2.write(
-            SDCFG,
-            initial | SDCFG_BOOT_UNLOCK | (1 << 27) | (1 << 18),
-            LITTLE_CONTEXT,
-        );
         assert_eq!(
             ddr2.read(SDCFG, LITTLE_CONTEXT),
-            Some(initial | SDCFG_BOOT_UNLOCK | (1 << 27) | (1 << 18))
+            Some(initial | (1 << 27) | (1 << 18))
         );
     }
 
@@ -385,11 +388,21 @@ mod tests {
         let mut ddr2 = Ddr2::c6472();
         assert_eq!(ddr2.read(DMCSTAT, LITTLE_CONTEXT), Some(1 << 30));
 
-        let partial = C6472_SDCFG_RESET | SDCFG_BOOT_UNLOCK | (1 << 17) | (1 << 16);
-        ddr2.write(SDCFG, partial, LITTLE_CONTEXT);
+        // Section 2.11.3 first sets BOOT_UNLOCK and TIMUNLOCK, then programs the SDCFG
+        // fields while clearing BOOT_UNLOCK. The final write starts initialization.
+        let initial = ddr2.read(SDCFG, LITTLE_CONTEXT).unwrap();
+        ddr2.write(
+            SDCFG,
+            initial | SDCFG_BOOT_UNLOCK | SDCFG_TIMUNLOCK,
+            LITTLE_CONTEXT,
+        );
         assert_eq!(ddr2.read(DMCSTAT, LITTLE_CONTEXT), Some(1 << 30));
 
-        ddr2.write(SDCFG, partial | (1 << 20), LITTLE_CONTEXT);
+        ddr2.write(
+            SDCFG,
+            initial | (1 << 20) | (1 << 17) | (1 << 16) | SDCFG_TIMUNLOCK,
+            LITTLE_CONTEXT,
+        );
         assert_eq!(
             ddr2.read(DMCSTAT, LITTLE_CONTEXT),
             Some((1 << 30) | DMCSTAT_IFRDY)
