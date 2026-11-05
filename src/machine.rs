@@ -257,6 +257,8 @@ pub struct Machine {
     /// The board the device sits on: what it straps, fuses and supplies, and so which boot
     /// runs. Held so a reload builds the same board again.
     board: Board,
+    /// The parsed host schedule, retained so a debugger reload repeats the same HPI boot input.
+    hpi_replay: Option<crate::hpi_replay::Schedule>,
 }
 
 /// One member of the stop-condition set `resume` evaluates on every cycle. The machine-native
@@ -335,6 +337,11 @@ impl Machine {
         let profile = DeviceProfile::named(&args.device)
             .ok_or_else(|| format!("unknown device {}", args.device))?;
         let board = Board::from_args(profile, args)?;
+        let hpi_replay = args
+            .hpi_replay
+            .as_deref()
+            .map(crate::hpi_replay::Schedule::load)
+            .transpose()?;
         // A boot builds the memory image from the host, wire or bus, so the ELF supplies only
         // symbols (SPRS276M section 2.4, SPRUEC6G sections 2.3.4 and 4.3.5).
         let load = if board.source() != BootSource::Image {
@@ -396,6 +403,7 @@ impl Machine {
             breakpoints: Vec::new(),
             initial_breakpoints: Vec::new(),
             board,
+            hpi_replay,
         };
         // A boot table replaces the ELF's memory image entirely: the ELF is only there for the
         // symbols a debugger and the CIO handshake need (SPRUEC6G section 6.2.2).
@@ -420,11 +428,7 @@ impl Machine {
             .iter()
             .map(|token| machine.resolve(token))
             .collect::<Result<_, _>>()?;
-        if let Some(path) = &args.hpi_replay {
-            for readback in crate::hpi_replay::replay(&mut machine, path)? {
-                eprintln!("hpi-replay {readback}");
-            }
-        }
+        machine.replay_hpi()?;
         Ok(machine)
     }
 
@@ -478,6 +482,7 @@ impl Machine {
             breakpoints: Vec::new(),
             initial_breakpoints: Vec::new(),
             board: Board::pins(&crate::device::C6455, 0),
+            hpi_replay: None,
         }
     }
 
@@ -516,6 +521,16 @@ impl Machine {
         }
         self.cio_output.clear();
         result?;
+        self.replay_hpi()?;
+        Ok(())
+    }
+
+    fn replay_hpi(&mut self) -> Result<(), String> {
+        if let Some(schedule) = self.hpi_replay.clone() {
+            for readback in schedule.replay(self)? {
+                eprintln!("hpi-replay {readback}");
+            }
+        }
         Ok(())
     }
 
@@ -1812,6 +1827,27 @@ mod tests {
             })
         );
         assert_eq!(machine.resume(&mut []).unwrap(), StopReason::Exit);
+    }
+
+    #[test]
+    fn hpi_replay_is_reapplied_after_each_reload() {
+        let directory =
+            std::env::temp_dir().join(format!("c64xemu-hpi-reload-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let schedule_path = directory.join("schedule.csv");
+        std::fs::write(&schedule_path, "0,control,write,2\n1,control,read,-\n").unwrap();
+
+        let mut machine = Machine::bare(Cpu::new(0));
+        machine.board = Board::pins(&crate::device::C6455, crate::hpi::BOOTMODE_HPI);
+        machine.hpi_replay = Some(crate::hpi_replay::Schedule::load(&schedule_path).unwrap());
+        for _ in 0..2 {
+            machine.reload().unwrap();
+            assert!(!machine.core_held_in_reset(0));
+            assert_eq!(machine.pc(), crate::hpi::HPI_BOOT_ENTRY);
+            assert_eq!(machine.event_time(), 1);
+        }
+
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     /// The core that reached the CIO handshake answers it, whichever one that is, and both the

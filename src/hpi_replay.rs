@@ -20,42 +20,56 @@ struct Transaction {
     line: usize,
 }
 
-/// Parse and deliver a simple CSV schedule. A read reports the value seen at its event tick;
-/// writes use the same Fabric HPI path as socket driven host accesses.
-pub(crate) fn replay(machine: &mut Machine, path: &Path) -> Result<Vec<String>, String> {
-    let input = fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))?;
-    let transactions = parse(&input).map_err(|error| format!("{}: {error}", path.display()))?;
-    let ticks = transactions
-        .iter()
-        .map(|transaction| transaction.tick)
-        .collect::<Vec<_>>();
-    let mut readbacks = Vec::new();
-    machine.replay_release_ticks(&ticks, |machine, index, tick| {
-        let transaction = transactions[index];
-        match transaction.direction {
-            Direction::Read => match machine.device.fabric().hpi_host_read(transaction.port) {
-                Some(value) => {
-                    readbacks.push(format!(
-                        "tick={tick} port={} read=0x{value:08x}",
-                        transaction.code
-                    ));
+/// A parsed schedule retained by Machine so debugger reloads replay the same input.
+#[derive(Clone)]
+pub(crate) struct Schedule {
+    transactions: Vec<Transaction>,
+}
+
+impl Schedule {
+    pub(crate) fn load(path: &Path) -> Result<Self, String> {
+        let input =
+            fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))?;
+        let transactions = parse(&input).map_err(|error| format!("{}: {error}", path.display()))?;
+        Ok(Self { transactions })
+    }
+
+    /// Deliver the schedule through the modeled HPI host port. Read transactions return the
+    /// value seen at their event tick; writes use the same Fabric path as socket accesses.
+    pub(crate) fn replay(&self, machine: &mut Machine) -> Result<Vec<String>, String> {
+        let ticks = self
+            .transactions
+            .iter()
+            .map(|transaction| transaction.tick)
+            .collect::<Vec<_>>();
+        let mut readbacks = Vec::new();
+        machine.replay_release_ticks(&ticks, |machine, index, tick| {
+            let transaction = self.transactions[index];
+            match transaction.direction {
+                Direction::Read => match machine.device.fabric().hpi_host_read(transaction.port) {
+                    Some(value) => {
+                        readbacks.push(format!(
+                            "tick={tick} port={} read=0x{value:08x}",
+                            transaction.code
+                        ));
+                        Ok(())
+                    }
+                    None => Err(format!(
+                        "HPI read on line {} was blocked by HPIRST",
+                        transaction.line
+                    )),
+                },
+                Direction::Write(value) => {
+                    machine
+                        .device
+                        .fabric()
+                        .hpi_host_write(transaction.port, value);
                     Ok(())
                 }
-                None => Err(format!(
-                    "HPI read on line {} was blocked by HPIRST",
-                    transaction.line
-                )),
-            },
-            Direction::Write(value) => {
-                machine
-                    .device
-                    .fabric()
-                    .hpi_host_write(transaction.port, value);
-                Ok(())
             }
-        }
-    })?;
-    Ok(readbacks)
+        })?;
+        Ok(readbacks)
+    }
 }
 
 fn parse(input: &str) -> Result<Vec<Transaction>, String> {
@@ -172,7 +186,10 @@ mod tests {
         machine.device.cpu_mut().write_words(0, &[0; 32]);
         machine.device.cpu_mut().bus_mut().write32(0x0288_0030, 0);
 
-        let readbacks = replay(&mut machine, &schedule).unwrap();
+        let readbacks = Schedule::load(&schedule)
+            .unwrap()
+            .replay(&mut machine)
+            .unwrap();
         assert_eq!(
             readbacks,
             [
