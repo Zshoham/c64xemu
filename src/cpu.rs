@@ -655,9 +655,10 @@ impl Cpu {
     pub fn write_control(&mut self, register: u8, value: u32) {
         self.control.write(register, value);
     }
-    /// Read a CPU control register directly, as MVC would.
+    /// Inspect a control register without the side effects of an MVC read. The timestamp
+    /// registers show the live counter without replacing the guest's saved high word.
     pub fn read_control(&self, register: u8) -> u32 {
-        self.control.read(register, self.packet_address)
+        self.control.peek(register, self.packet_address)
     }
     /// One consistent view of the CPU's state, read once so every consumer sees the same
     /// cycle: both register files, the PC and the whole control register file.
@@ -3891,9 +3892,9 @@ impl Cpu {
         })
     }
 
-    /// A stall cycle: the pipeline is frozen, so only the peripherals advance. The record of
-    /// the previous cycle's writes is dropped because the hazard it describes is now two
-    /// cycles old.
+    /// A stall cycle: the pipeline is frozen, but the timestamp counter and peripherals
+    /// advance. Drop the previous cycle's write record because the hazard it describes is
+    /// now two cycles old.
     fn freeze(&mut self, bus: &mut CoreBus<'_>) {
         self.stalls += 1;
         self.previous_writes = [0; 2];
@@ -4015,7 +4016,7 @@ impl Cpu {
             let noted = traced
                 .then(|| crate::control::register_name(write.register))
                 .flatten()
-                .map(|name| (name, self.control.read(write.register, self.packet_address)));
+                .map(|name| (name, self.control.peek(write.register, self.packet_address)));
             if write.user {
                 self.control.write_user(write.register, write.value);
             } else {
@@ -4029,7 +4030,7 @@ impl Cpu {
                         old,
                         // The register may narrow or ignore bits, so report what it now
                         // holds rather than what the instruction offered.
-                        new: self.control.read(write.register, self.packet_address),
+                        new: self.control.peek(write.register, self.packet_address),
                     },
                 );
             }
@@ -4176,11 +4177,14 @@ impl Cpu {
         }
     }
 
-    /// End a committed cycle by committing writes, completing its SPLOOP stage if any, then
+    /// Advance the timestamp clock, then commit writes and complete any SPLOOP stage before
     /// ticking the device, sampling interrupts, handling interrupt entry, and advancing the
-    /// pipeline cycle. A frozen stall only ticks the device and counts a stall: writes and
+    /// pipeline cycle. A frozen stall advances the timestamp counter and device; writes and
     /// SPLOOP must not advance while the pipeline is frozen.
     fn cycle_boundary(&mut self, bus: &mut CoreBus<'_>, end: CycleEnd) {
+        // The time-stamp counter counts every CPU clock, a frozen stall included, and counts it
+        // before this cycle's control writes land.
+        self.control.count_cpu_clock();
         if matches!(end, CycleEnd::Frozen) {
             self.freeze(bus);
             return;
@@ -6756,5 +6760,254 @@ mod tests {
             ("xor", 35_840),
         ]);
         assert_eq!(counts, frozen, "compact family classification drifted");
+    }
+
+    /// The time-stamp counter as firmware meets it: `MVC` reads and writes, an interrupt taken
+    /// between two reads, a stall, and a debugger looking in.
+    ///
+    /// The words are hand-assembled and agree with TI CGT 8.3.15 `dis6x` and binutils 2.44
+    /// (`gas/testsuite/gas/tic6x/insns-c674x.d`): `mvc .S2 b20,tscl` is 0x055003a2, `mvc .S2
+    /// tscl,b19` is 0x09a803e2, `mvc .S2 tsch,b18` is 0x092c03e2, `dint` is 0x10004000 and
+    /// `rint` is 0x10006000.
+    mod time_stamp_counter {
+        use super::*;
+
+        /// MVC .S2 B0,TSCL: any write starts the count and the value is ignored.
+        const START: u32 = 0x0500_03a2;
+        const NOP_9: u32 = 0x0001_0000;
+        const NOP_5: u32 = 0x0000_8000;
+        /// B .S2 IRP
+        const B_IRP: u32 = 0x0018_00e2;
+        /// ADD .L1 1,A4,A4, a harmless filler that ends a sequence.
+        const ADD: u32 = 0x0210_2058;
+        const DINT: u32 = 0x1000_4000;
+        const RINT: u32 = 0x1000_6000;
+        /// The p-bit: this instruction shares its execute packet with the next word.
+        const PARALLEL: u32 = 1;
+
+        /// MVC .S2 TSCL,Bn
+        const fn tscl_to(n: u32) -> u32 {
+            n << 23 | 0x0a << 18 | 0x3e2
+        }
+
+        /// MVC .S2 TSCH,Bn
+        const fn tsch_to(n: u32) -> u32 {
+            n << 23 | 0x0b << 18 | 0x3e2
+        }
+
+        /// A core whose counter stands at `count`, with INT5 pending and its handler at the
+        /// INT5 vector reading TSCL into B2 and returning: the shape of an ISR that timestamps.
+        fn with_int5_pending(count: u64) -> Cpu {
+            let mut cpu = Cpu::new(0);
+            cpu.control.start_time_stamp_at(count);
+            cpu.write_words(0x400 + 5 * 32, &[tscl_to(2), B_IRP, NOP_5]);
+            cpu.control.write(0x05, 0x400); // ISTP
+            cpu.control.write(0x04, (1 << 5) | 2); // IER: INT5 and NMIE
+            cpu.control.write(0x01, 1); // CSR.GIE
+            cpu.control.write(0x02, 1 << 5); // ISR: raise INT5
+            cpu
+        }
+
+        #[test]
+        fn the_manuals_enable_sequence_reads_zero_then_one() {
+            // SPRU732J 2.9.14.1-2: the counter is 0 and stopped after reset, and a write to TSCL
+            // starts it in the cycle after the MVC, so with no stalls the next two reads are 0
+            // and 1 (the manual prints exactly these three instructions).
+            let mut cpu = Cpu::new(0);
+            cpu.write_words(
+                0,
+                &[
+                    NOP_9,      // nine cycles pass with the counter stopped
+                    tscl_to(3), // B3 = TSCL: still 0
+                    START,      // MVC B0,TSCL ; Start TSC
+                    tscl_to(0), // MVC TSCL,B0 ; B0 = 0
+                    tscl_to(1), // MVC TSCL,B1 ; B1 = 1
+                ],
+            );
+            cycles_to_reach(&mut cpu, 20, 100);
+            assert_eq!(cpu.stalls, 0, "the manual's example assumes no stalls");
+            assert_eq!(cpu.register('B', 3), 0, "stopped until a write to TSCL");
+            assert_eq!(cpu.register('B', 0), 0);
+            assert_eq!(cpu.register('B', 1), 1);
+        }
+
+        #[test]
+        fn a_stall_cycle_is_a_cpu_clock_the_counter_counts() {
+            // SPRU732J 2.9.14: the counter "advances each CPU clock", and the enable example is
+            // qualified "assuming no stalls occur". A cross path read of a result written the
+            // cycle before costs one stall cycle (SPRUFE8B 3.8.4), so the two reads below are
+            // four clocks apart, not three.
+            let mut cpu = Cpu::new(0);
+            cpu.write_words(
+                0,
+                &[
+                    START,
+                    tscl_to(4),  // at 4
+                    0x0080_01E0, // ADD .S1 A0,A0,A1
+                    0x0084_11E2, // ADD .S2X B0,A1,B1: stalls one cycle
+                    tscl_to(5),  // at 16
+                ],
+            );
+            let first = cycles_to_reach(&mut cpu, 4, 100);
+            let second = cycles_to_reach(&mut cpu, 16, 100);
+            cycles_to_reach(&mut cpu, 20, 100);
+            assert_eq!(
+                cpu.stalls, 1,
+                "the pair must stall for this to mean anything"
+            );
+            assert_eq!(second - first, 4);
+            assert_eq!(cpu.register('B', 5) - cpu.register('B', 4), 4);
+        }
+
+        #[test]
+        fn an_interrupt_between_the_two_reads_leaves_the_handlers_snapshot() {
+            // SPRU732J 2.9.14.4: a handler that reads TSCL takes a new snapshot and "there is no
+            // way for an ISR to restore the previous value". Interrupt entry and B IRP save and
+            // restore TSR; they must not do that for the snapshot. The count wraps while the
+            // interrupt is being taken, so the interrupted code's TSCH is the handler's 4.
+            let mut cpu = with_int5_pending(0x0000_0003_FFFF_FFFC);
+            cpu.write_words(0, &[tscl_to(0), tsch_to(1), ADD]);
+            cycles_to_reach(&mut cpu, 12, 200);
+            assert_eq!(cpu.fault(), None);
+            assert_eq!(cpu.register('B', 0), 0xffff_fffc);
+            let handler = cpu.register('B', 2);
+            assert!(
+                handler > 0 && handler < 0x100,
+                "the handler read after the wrap: {handler:#x}"
+            );
+            assert_eq!(cpu.register('B', 1), 4);
+        }
+
+        #[test]
+        fn the_read_pairs_the_manual_and_linux_use_are_not_split_by_an_interrupt() {
+            // INT5 is pending throughout and the count wraps between the two reads. Unprotected,
+            // the handler sneaks in and the pair is torn (8:FFFFFFFF, 2^32 clocks in the future).
+            // SPRU732J Examples 2-1 and 2-2 and Linux's get_cycles() (v5.10 arch/c6x timex.h)
+            // keep the handler out, and the pair is the count at the TSCL read, 7:FFFFFFFF.
+            struct Idiom {
+                name: &'static str,
+                words: Vec<u32>,
+                /// Clocks from the start of the sequence to its TSCL read.
+                to_read: u32,
+                torn: bool,
+            }
+            let idioms = [
+                Idiom {
+                    name: "unprotected",
+                    words: vec![tscl_to(0), tsch_to(1), ADD],
+                    to_read: 0,
+                    torn: true,
+                },
+                Idiom {
+                    // BNOP TSC_Read_Done,3 ; MVC TSCL,B0 ; MVC TSCH,B1: no interrupt in a
+                    // branch's delay slots.
+                    name: "Example 2-1",
+                    words: vec![0x0003_6120, tscl_to(0), tsch_to(1), ADD, ADD],
+                    to_read: 4,
+                    torn: false,
+                },
+                Idiom {
+                    // DINT || MVC TSCL,B0 ; RINT || MVC TSCH,B1
+                    name: "Example 2-2",
+                    words: vec![
+                        DINT | PARALLEL,
+                        tscl_to(0),
+                        RINT | PARALLEL,
+                        tsch_to(1),
+                        ADD,
+                    ],
+                    to_read: 0,
+                    torn: false,
+                },
+                Idiom {
+                    // dint ; mvc TSCL ; mvc TSCH ; rint, one packet each.
+                    name: "Linux get_cycles",
+                    words: vec![DINT, tscl_to(0), tsch_to(1), RINT, ADD],
+                    to_read: 1,
+                    torn: false,
+                },
+            ];
+            for idiom in idioms {
+                // Arrange for the TSCL read to see 7:FFFFFFFF.
+                let mut cpu = with_int5_pending(0x0000_0007_FFFF_FFFF - u64::from(idiom.to_read));
+                cpu.write_words(0, &idiom.words);
+                cycles_to_reach(&mut cpu, 20, 300);
+                assert_eq!(cpu.fault(), None, "{}", idiom.name);
+                assert_eq!(cpu.register('B', 0), 0xffff_ffff, "{}: TSCL", idiom.name);
+                assert_eq!(
+                    cpu.register('B', 1),
+                    if idiom.torn { 8 } else { 7 },
+                    "{}: TSCH",
+                    idiom.name
+                );
+                let handler = cpu.register('B', 2);
+                assert!(
+                    handler > 0 && handler < 0x100,
+                    "{}: the handler must still run, after the pair ({handler:#x})",
+                    idiom.name
+                );
+            }
+        }
+
+        #[test]
+        fn looking_at_the_core_between_the_two_reads_changes_nothing() {
+            // A debugger stop, a GDB register read or a dashboard refresh between the firmware's
+            // TSCL and TSCH reads is not an MVC. The count wraps before the observer looks, and
+            // firmware must still get the high word of its own TSCL read.
+            for name in ["snapshot", "read_control"] {
+                let mut cpu = Cpu::new(0);
+                cpu.control.start_time_stamp_at(0x0000_0007_FFFF_FFF0);
+                // TSCL read, then 18 idle cycles (the count wraps), then the TSCH read.
+                cpu.write_words(0, &[tscl_to(0), NOP_9, NOP_9, tsch_to(1)]);
+                cycles_to_reach(&mut cpu, 12, 100);
+                if name == "snapshot" {
+                    let _ = cpu.snapshot();
+                } else {
+                    let _ = (cpu.read_control(0x0a), cpu.read_control(0x0b));
+                }
+                cycles_to_reach(&mut cpu, 16, 100);
+                assert_eq!(cpu.register('B', 0), 0xffff_fff0, "{name}");
+                assert_eq!(cpu.register('B', 1), 7, "{name}");
+            }
+        }
+
+        #[test]
+        fn tracing_a_tscl_write_changes_nothing() {
+            // The trace line for a control write shows the register before and after, which is
+            // two looks at TSCL. Tracing is passive: with it on, the TSCL write between the
+            // reads (a second module enabling a running counter) must leave the snapshot alone.
+            for traced in [false, true] {
+                let mut cpu = Cpu::new(0);
+                if traced {
+                    let file = std::env::temp_dir().join(format!(
+                        "c64xemu-tscl-trace-test-{}.txt",
+                        std::process::id()
+                    ));
+                    let writer = std::io::BufWriter::new(std::fs::File::create(&file).unwrap());
+                    cpu.set_trace(crate::trace::Trace::open(writer, false, Some(64), 0));
+                    std::fs::remove_file(&file).ok();
+                }
+                cpu.control.start_time_stamp_at(0x0000_0007_FFFF_FFF0);
+                // TSCL read, 18 idle cycles (the count wraps), MVC B0,TSCL, then the TSCH read.
+                cpu.write_words(0, &[tscl_to(0), NOP_9, NOP_9, START, tsch_to(1)]);
+                cycles_to_reach(&mut cpu, 20, 100);
+                assert_eq!(cpu.register('B', 1), 7, "traced: {traced}");
+            }
+        }
+
+        #[test]
+        fn user_mode_reads_both_halves() {
+            // SPRU732J Table 3-22: TSCL and TSCH are readable in User mode, so a profiler need
+            // not be Supervisor code; neither read raises the privilege exception.
+            let mut cpu = Cpu::new(0);
+            cpu.control.start_time_stamp_at(5);
+            cpu.user_mode = true;
+            cpu.write_words(0, &[tscl_to(0), tsch_to(1)]);
+            cycles_to_reach(&mut cpu, 8, 50);
+            assert_eq!(cpu.fault(), None);
+            assert_eq!(cpu.control.peek(0x1f, 0), 0, "IERR");
+            assert_eq!(cpu.register('B', 0), 5);
+            assert_eq!(cpu.register('B', 1), 0);
+        }
     }
 }

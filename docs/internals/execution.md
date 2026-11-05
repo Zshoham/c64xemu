@@ -35,6 +35,7 @@ cross-path stall uses the same frozen path. A multicycle NOP does not freeze any
 write-backs scheduled by earlier packets still land.
 
 `cycles()` is `cycle + stalls`, which is the wall-clock time base everything timing-related uses.
+An enabled time-stamp counter also advances on frozen stall cycles.
 
 ## Fetch and issue
 
@@ -207,6 +208,14 @@ because CSR.SAT is set only by a saturating functional unit and cleared only by 
 interrupt and exception registers, TSC as a pair with a latched high half, ILC and RILC, REP,
 SSR, the Galois state (GPLYA, GPLYB, GFPGFR, which resets to `0x0700_001d`), and DNUM. CSR.EN
 (bit 8) reads 0 on a big-endian device and 1 on a little-endian one (SPRU732J Table 2-9).
+
+The time-stamp counter follows SPRU732J §2.9.14: a TSCL write enables counting after that
+instruction's cycle, and subsequent writes leave the count running. Each CPU clock advances
+the counter, including frozen stalls. An MVC read of TSCL saves the high half for later TSCH
+reads; an interrupt handler's TSCL read replaces that same snapshot. Debugger, dashboard and
+trace inspection use `Control::peek`, which displays the live counter without changing the
+guest's snapshot. CPU tests cover the manual's enable sequence and protected read idioms,
+interrupts and passive inspection; a sweep of the existing timing vectors checks stall clocks.
 
 Two encodings name one register on read and another on write: `0x02` reads IFR and writes ISR,
 `0x1d` reads EFR and writes ECR (SPRU732J Table 3-22). `register_name` and

@@ -1,5 +1,3 @@
-use std::cell::Cell;
-
 const CSR_CPU_ID: u32 = 0x10 << 24;
 /// CSR bit 8, EN: 0 is big endian and 1 little endian (SPRU732J Table 2-9).
 const CSR_EN_LITTLE: u32 = 1 << 8;
@@ -89,7 +87,9 @@ pub struct Control {
     tscl: u32,
     tsch: u32,
     tsc_enabled: bool,
-    tsch_latch: Cell<u32>,
+    /// The TSCH snapshot: the high word as it stood when `MVC` last read TSCL (SPRU732J
+    /// 2.9.14.4). Reset leaves it 0, and there is one for the core: an interrupt does not save it.
+    tsch_latch: u32,
     dier: u32,
     ilc: u32,
     rilc: u32,
@@ -126,7 +126,7 @@ impl Default for Control {
             tsch: 0,
             tsc_enabled: false,
             ilc: 0,
-            tsch_latch: Cell::new(0),
+            tsch_latch: 0,
             dier: 0,
             rilc: 0,
             rep: 0,
@@ -158,7 +158,24 @@ impl Control {
         self.dnum = core;
     }
 
-    pub fn read(&self, register: u8, pce1: u32) -> u32 {
+    /// An `MVC` read of a control register, with the side effects an `MVC` has: reading TSCL
+    /// copies the high word into the TSCH snapshot, and TSCH returns that snapshot (SPRU732J
+    /// 2.9.14.4).
+    pub fn read(&mut self, register: u8, pce1: u32) -> u32 {
+        match register {
+            0x0a => {
+                self.tsch_latch = self.tsch;
+                self.tscl
+            }
+            0x0b => self.tsch_latch,
+            _ => self.peek(register, pce1),
+        }
+    }
+
+    /// A look at a control register that no instruction made - a debugger, a trace line, the
+    /// dashboard. It must not disturb what firmware reads next, so it leaves the TSCH snapshot
+    /// alone; TSCL and TSCH both show the live count, which is the pair an inspector wants.
+    pub fn peek(&self, register: u8, pce1: u32) -> u32 {
         match register {
             0x00 => self.amr,
             0x01 => {
@@ -174,11 +191,8 @@ impl Control {
             0x05 => self.istp_base | (self.highest_pending().unwrap_or(0) as u32) << 5,
             0x06 => self.irp,
             0x07 => self.nrp,
-            0x0a => {
-                self.tsch_latch.set(self.tsch);
-                self.tscl
-            }
-            0x0b => self.tsch_latch.get(),
+            0x0a => self.tscl,
+            0x0b => self.tsch,
             0x0d => self.ilc,
             0x0e => self.rilc,
             0x0f => self.rep,
@@ -252,13 +266,21 @@ impl Control {
         }
     }
 
+    /// One CPU clock of the time-stamp counter, stall cycles included: it "advances each CPU
+    /// clock" (SPRU732J 2.9.14). The CPU calls this first at every cycle boundary, before that
+    /// cycle's control writes land, so a write to TSCL starts the count in the cycle after
+    /// the `MVC` and the first read after it is 0 (SPRU732J 2.9.14.2).
     #[inline(always)]
-    pub fn tick(&mut self, cycle: u64, lines: u16) -> Option<u8> {
+    pub fn count_cpu_clock(&mut self) {
         if self.tsc_enabled {
             let (low, carry) = self.tscl.overflowing_add(1);
             self.tscl = low;
             self.tsch = self.tsch.wrapping_add(u32::from(carry));
         }
+    }
+
+    #[inline(always)]
+    pub fn tick(&mut self, cycle: u64, lines: u16) -> Option<u8> {
         if lines == self.line_high && self.set_due_mask == 0 {
             return None;
         }
@@ -582,6 +604,17 @@ pub fn written_register_name(register: u8) -> Option<&'static str> {
 }
 
 #[cfg(test)]
+impl Control {
+    /// Start the counter running at `count`, as if software had enabled it that many clocks
+    /// ago. An `MVC` can only start it at 0, and a wrap is 2^32 clocks away from there.
+    pub(crate) fn start_time_stamp_at(&mut self, count: u64) {
+        self.tscl = count as u32;
+        self.tsch = (count >> 32) as u32;
+        self.tsc_enabled = true;
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -627,5 +660,91 @@ mod tests {
             control.tick(cycle, line);
         }
         assert_eq!(control.takeable_interrupt(true), Some(4));
+    }
+
+    /// Control register numbers: TSCL is 0x0a and TSCH 0x0b.
+    const TSCL: u8 = 0x0a;
+    const TSCH: u8 = 0x0b;
+
+    /// A counter software enabled earlier, standing at `high:low` now.
+    fn counting(high: u32, low: u32) -> Control {
+        Control {
+            tsch: high,
+            tscl: low,
+            tsc_enabled: true,
+            ..Control::default()
+        }
+    }
+
+    #[test]
+    fn tsch_reads_zero_until_tscl_has_been_read() {
+        // SPRU732J 2.9.14.4: "If it is read with no TSCL reads having taken place since reset,
+        // then the reset value of 0 is read" - whatever the live high word is.
+        let mut control = counting(5, 9);
+        assert_eq!(control.read(TSCH, 0), 0);
+        assert_eq!(control.read(TSCL, 0), 9);
+        assert_eq!(control.read(TSCH, 0), 5);
+    }
+
+    #[test]
+    fn tsch_keeps_the_high_word_the_tscl_read_saw_across_a_wrap() {
+        // The reason the snapshot exists: the low word wraps between the two reads, and the
+        // pair must still be the count at the TSCL read, 7:FFFFFFFF, not 8:FFFFFFFF.
+        let mut control = counting(7, u32::MAX);
+        assert_eq!(control.read(TSCL, 0), u32::MAX);
+        control.count_cpu_clock(); // live: 8:00000000
+        assert_eq!(control.read(TSCH, 0), 7);
+        assert_eq!(
+            control.read(TSCH, 0),
+            7,
+            "reading TSCH leaves the snapshot alone"
+        );
+        // The next pair is read fresh.
+        assert_eq!(control.read(TSCL, 0), 0);
+        assert_eq!(control.read(TSCH, 0), 8);
+    }
+
+    #[test]
+    fn a_later_tscl_read_replaces_the_snapshot() {
+        // SPRU732J 2.9.14.4: "There is no way for an ISR to restore the previous value of TSCH
+        // (snapshot) if it reads TSCL, since a new snapshot is performed."
+        let mut control = counting(3, u32::MAX - 1);
+        assert_eq!(control.read(TSCL, 0), u32::MAX - 1); // interrupted code: snapshot 3
+        control.count_cpu_clock();
+        control.count_cpu_clock(); // live: 4:00000000
+        assert_eq!(control.read(TSCL, 0), 0); // handler: snapshot 4
+        assert_eq!(control.read(TSCH, 0), 4); // the interrupted code gets the handler's
+    }
+
+    #[test]
+    fn writing_tscl_starts_the_count_and_does_nothing_else() {
+        // SPRU732J 2.9.14.2-3: any write enables counting and the value is ignored; software
+        // cannot stop or restart it, so a second module enabling a running counter moves
+        // nothing. TSCH is read-only.
+        let mut control = Control::default();
+        control.count_cpu_clock();
+        assert_eq!(control.read(TSCL, 0), 0, "stopped after reset");
+        control.write(TSCL, 0xdead_beef);
+        for _ in 0..3 {
+            control.count_cpu_clock();
+        }
+        assert_eq!(control.read(TSCL, 0), 3);
+        control.write(TSCL, 0);
+        control.write(TSCH, u32::MAX);
+        control.count_cpu_clock();
+        assert_eq!(control.read(TSCL, 0), 4);
+        assert_eq!(control.peek(TSCH, 0), 0);
+    }
+
+    #[test]
+    fn a_passive_look_leaves_the_snapshot_alone() {
+        // A debugger, trace line or dashboard looking at TSCL is not an MVC: what the firmware's
+        // next TSCH read returns must not change.
+        let mut control = counting(7, u32::MAX);
+        assert_eq!(control.read(TSCL, 0), u32::MAX);
+        control.count_cpu_clock();
+        assert_eq!(control.peek(TSCL, 0), 0);
+        assert_eq!(control.peek(TSCH, 0), 8); // the inspector sees the live pair
+        assert_eq!(control.read(TSCH, 0), 7); // the firmware still gets its snapshot
     }
 }

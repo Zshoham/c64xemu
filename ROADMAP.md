@@ -666,7 +666,9 @@ little-endian way, which pushes and pops cannot see because they round-trip eith
 **[x] Control register file.** *Complete for C64x+.* DIER implements its WSEL-protected
 NMI/EXCEP/INT mask, TSCL write-enables the counter, a TSCL read latches the coherent high word
 returned by TSCH, and DNUM reports core zero. `cpu:timestamp-latch-and-dier` checks the
-counter, high-word latch and full DIER mask alongside the existing MVC/privilege cases.
+counter and full DIER mask alongside the existing MVC/privilege cases. The timestamp CPU
+tests check the documented enable timing, rollover snapshots, interrupt-protected reads and
+passive inspection. The timing-vector sweep checks that enabled counters include stall clocks.
 
 **[x] Linked atomics.** *Done.* LL records the aligned word and its memory-write generation, SL
 buffers a matching word without exposing it, and CMTL reports success after load latency and

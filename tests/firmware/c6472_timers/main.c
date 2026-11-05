@@ -110,7 +110,7 @@ int main(void)
     unsigned first[TIMER_COUNT];
     unsigned index, start, spin, worst = 0;
 
-    /* A write to TSCL enables the time-stamp counter and the value is discarded (SPRUFE8B 2.9.3). */
+    /* A write to TSCL enables the time-stamp counter and the value is discarded (SPRUFE8B 2.9.14). */
     TSCL = 0u;
 
     for (index = 0; index < 32u; index++) {

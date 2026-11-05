@@ -383,3 +383,49 @@ pub(crate) fn run_vector(relative: &str) {
     let root = vector_root();
     check_case(load_case(&root, &root.join(relative)));
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The time-stamp counter advances once per CPU clock, stalls included (SPRU732J 2.9.14), so
+    /// a counter started with the run must read the elapsed cycles at the end of every timing
+    /// case - the cases whose stall counts were derived from SPRU862B and SPRUFE8B before the
+    /// emulator was measured. One invariant, every stall source those vectors reach.
+    #[test]
+    fn the_time_stamp_counter_equals_the_elapsed_cycles_of_every_timing_case() {
+        let root = vector_root();
+        let mut checked = 0;
+        let mut multicycle = 0;
+        for entry in std::fs::read_dir(root.join("timing")).expect("the timing vectors") {
+            let path = entry.expect("a timing vector").path();
+            let mut request = load_case(&root, &path)["request"].clone();
+            let object = request.as_object_mut().expect("a request object");
+            // TSCL is control register 0x0a; any write starts the count.
+            object
+                .entry("controls")
+                .or_insert_with(|| json!({}))
+                .as_object_mut()
+                .expect("controls are an object")
+                .insert("10".into(), json!(0));
+            object
+                .entry("observe_controls")
+                .or_insert_with(|| json!([]))
+                .as_array_mut()
+                .expect("observe_controls is an array")
+                .push(json!(10));
+            let actual = run_execute(&request).unwrap_or_else(|error| panic!("{path:?}: {error}"));
+            assert_eq!(
+                actual["controls"]["10"], actual["cycles"],
+                "{path:?}: the counter and the elapsed cycles disagree"
+            );
+            checked += 1;
+            multicycle += usize::from(actual["cycles"].as_u64() > Some(1));
+        }
+        assert!(checked >= 30, "the timing vectors went missing ({checked})");
+        assert!(
+            multicycle > 0,
+            "the timing sweep must include multicycle cases"
+        );
+    }
+}
