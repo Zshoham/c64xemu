@@ -527,7 +527,15 @@ impl Machine {
 
     fn replay_hpi(&mut self) -> Result<(), String> {
         if let Some(schedule) = self.hpi_replay.clone() {
-            for readback in schedule.replay(self)? {
+            // A replay can run guest code between scheduled transactions. Debugger breakpoints
+            // must not turn that deterministic input schedule into a stop condition, but remain
+            // armed once replay completes (including when a transaction returns an error).
+            let breakpoints = std::mem::take(&mut self.breakpoints);
+            self.install_halt(false);
+            let result = schedule.replay(self);
+            self.breakpoints = breakpoints;
+            self.install_halt(false);
+            for readback in result? {
                 eprintln!("hpi-replay {readback}");
             }
         }
@@ -1835,16 +1843,22 @@ mod tests {
             std::env::temp_dir().join(format!("c64xemu-hpi-reload-{}", std::process::id()));
         std::fs::create_dir_all(&directory).unwrap();
         let schedule_path = directory.join("schedule.csv");
-        std::fs::write(&schedule_path, "0,control,write,2\n1,control,read,-\n").unwrap();
+        std::fs::write(&schedule_path, "0,control,write,2\n10,control,read,-\n").unwrap();
 
         let mut machine = Machine::bare(Cpu::new(0));
         machine.board = Board::pins(&crate::device::C6455, crate::hpi::BOOTMODE_HPI);
         machine.hpi_replay = Some(crate::hpi_replay::Schedule::load(&schedule_path).unwrap());
+        let breakpoint = crate::hpi::HPI_BOOT_ENTRY + 4;
+        machine.arm_halt(&[breakpoint]);
         for _ in 0..2 {
             machine.reload().unwrap();
             assert!(!machine.core_held_in_reset(0));
-            assert_eq!(machine.pc(), crate::hpi::HPI_BOOT_ENTRY);
-            assert_eq!(machine.event_time(), 1);
+            assert_eq!(machine.event_time(), 10);
+            assert!(
+                machine.pc() > breakpoint,
+                "schedule did not run past guest breakpoint"
+            );
+            assert_eq!(machine.breakpoints, [breakpoint]);
         }
 
         std::fs::remove_dir_all(directory).unwrap();
