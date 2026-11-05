@@ -158,6 +158,38 @@ pub(crate) const C6472_MAP: AddressMap = AddressMap {
 };
 
 impl AddressMap {
+    /// Known on-chip holes only. General sparse addresses may be external memory on a board.
+    pub(crate) fn known_hole(&self, requester: Requester, address: u32) -> bool {
+        if address < 0x1_0000 {
+            return true;
+        }
+        if self.cores == 6 {
+            // Shared ROM and RAM are the only memories below 2 MiB; this catches the reserved
+            // first MiB and the gap between ROM and shared RAM.
+            if address < 0x0020_0000
+                && self.placement(Requester::Core(0), address) == Placement::Sparse
+            {
+                return true;
+            }
+            // DMA uses the global aliases, never a core's local SRAM window.
+            if requester == Requester::Dma && (0x0080_0000..0x0100_0000).contains(&address) {
+                return true;
+            }
+            if matches!(requester, Requester::Core(_))
+                && (0x0080_0000..0x00a0_0000).contains(&address)
+                && self.placement(requester, address) == Placement::Sparse
+            {
+                return true;
+            }
+            if (0x1000_0000..0x1600_0000).contains(&address)
+                && self.placement(requester, address) == Placement::Sparse
+            {
+                return true;
+            }
+        }
+        false
+    }
+
     pub(crate) const fn l2_bytes(&self) -> u32 {
         self.l2.bytes
     }

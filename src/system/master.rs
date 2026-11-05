@@ -365,6 +365,9 @@ impl Fabric {
     /// the line may be tagged with either the local or the global address, depending on which
     /// the core used, so both are looked for.
     fn memory_bytes(&mut self, address: u32, length: usize) -> Vec<u8> {
+        self.shared
+            .backing
+            .check_strict_access(Requester::Dma, address, length, "DMA read");
         self.note_sl2_transfer(address, length, true);
         self.note_coherence(address, length, false);
         let mut data = self
@@ -384,6 +387,9 @@ impl Fabric {
     /// operation. Outside L2 SRAM the CPU keeps its stale line, and maintaining that is the
     /// firmware's job (SPRU862B sections 2.4 and 2.6).
     fn store_memory_bytes(&mut self, address: u32, bytes: &[u8]) {
+        self.shared
+            .backing
+            .check_strict_access(Requester::Dma, address, bytes.len(), "DMA write");
         self.note_sl2_transfer(address, bytes.len(), false);
         self.shared.backing.note_memory_write(address, bytes.len());
         self.shared
@@ -524,6 +530,16 @@ mod tests {
     const PERMISSIONS: u32 = 0x3f;
     const PARAM: u32 = 0x02a0_4000;
     const ESR: u32 = 0x02a0_1010;
+
+    #[test]
+    fn strict_memory_check_runs_on_the_fabric_dma_path() {
+        let mut fabric = Fabric::new(&C6472);
+        fabric.shared.backing.strict_physical_memory = true;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            fabric.read(Privilege::ID0_SUPERVISOR, 0x0080_0000, 4);
+        }));
+        assert!(result.is_err());
+    }
 
     /// Every kind of master the device has, by the privilege its accesses carry: the HPI and
     /// the IDMA (PrivID 0, supervisor), the EMACs and the UTOPIA PDMA (PrivID 0, user), and an
