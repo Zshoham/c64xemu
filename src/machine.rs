@@ -121,6 +121,9 @@ pub struct MachineArgs {
     /// Unix datagram socket HPI replies are sent to
     #[arg(long, value_name = "PATH")]
     pub hpi_peer: Option<PathBuf>,
+    /// Replay scheduled HPI host register transactions from a CSV file before the front end runs
+    #[arg(long, value_name = "FILE")]
+    pub hpi_replay: Option<PathBuf>,
     /// How often, in cycles, the run loop looks for host accesses
     #[arg(long, default_value_t = 1_024, value_parser = non_zero_cycles, value_name = "CYCLES")]
     pub hpi_poll: u64,
@@ -417,6 +420,11 @@ impl Machine {
             .iter()
             .map(|token| machine.resolve(token))
             .collect::<Result<_, _>>()?;
+        if let Some(path) = &args.hpi_replay {
+            for readback in crate::hpi_replay::replay(&mut machine, path)? {
+                eprintln!("hpi-replay {readback}");
+            }
+        }
         Ok(machine)
     }
 
@@ -590,8 +598,7 @@ impl Machine {
 
     /// The monotonic clock used by the run budget and host polling for the current boot mode.
     /// This is emulator event time, not guest TSCL or host wall time.
-    #[allow(dead_code)] // Driver API; the current CLI has no timed input trace option.
-    pub fn event_time(&self) -> u64 {
+    pub(crate) fn event_time(&self) -> u64 {
         self.run_clock()
     }
 
@@ -599,14 +606,13 @@ impl Machine {
     /// The machine advances to each tick and invokes the callback before executing that cycle.
     /// Equal ticks are delivered in input order. A callback may update memory or use a device
     /// host interface, but must not advance the machine clock itself.
-    #[allow(dead_code)] // Driver API; exercised by machine tests until a CLI driver uses it.
-    pub fn replay_release_ticks<F>(
+    pub(crate) fn replay_release_ticks<F>(
         &mut self,
         release_ticks: &[u64],
         mut on_release: F,
     ) -> Result<(), String>
     where
-        F: FnMut(&mut Machine, usize, u64),
+        F: FnMut(&mut Machine, usize, u64) -> Result<(), String>,
     {
         if release_ticks.windows(2).any(|pair| pair[0] > pair[1]) {
             return Err("release ticks must be sorted".into());
@@ -635,7 +641,8 @@ impl Machine {
                     ));
                 }
             }
-            on_release(self, index, tick);
+            on_release(self, index, tick)
+                .map_err(|error| format!("release callback {index} at tick {tick}: {error}"))?;
             let after_callback = self.event_time();
             if after_callback != tick {
                 return Err(format!(
@@ -1540,6 +1547,7 @@ mod tests {
             .replay_release_ticks(&ticks, |machine, index, tick| {
                 delivered.push((index, tick, machine.event_time()));
                 machine.write_memory(0x100 + index as u32 * 4, &tick.to_le_bytes());
+                Ok(())
             })
             .unwrap();
 
@@ -1558,13 +1566,16 @@ mod tests {
     fn release_replay_rejects_invalid_schedule_and_callback_clock_changes() {
         let mut machine = Machine::bare(Cpu::new(0));
         machine.device.cpu_mut().write_words(0, &[0; 32]);
-        assert!(machine.replay_release_ticks(&[4, 3], |_, _, _| {}).is_err());
+        assert!(machine
+            .replay_release_ticks(&[4, 3], |_, _, _| Ok(()))
+            .is_err());
         assert_eq!(machine.event_time(), 0);
 
         let error = machine
             .replay_release_ticks(&[2], |machine, _, _| {
                 let mut one_cycle = [StopCondition::Budget(1)];
                 assert_eq!(machine.resume(&mut one_cycle).unwrap(), StopReason::Budget);
+                Ok(())
             })
             .unwrap_err();
         assert!(error.contains("advanced event time from tick 2 to 3"));
