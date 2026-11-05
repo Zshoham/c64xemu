@@ -81,11 +81,18 @@ impl RegisterWrite {
 }
 
 /// A store waiting for the end of the cycle it executed on.
+///
+/// A doubleword store is queued as two word writes, which is how memory takes it; the extent
+/// fields keep the instruction's whole access beside each piece, so a passive observer can still
+/// judge what the instruction as a whole touched. A piece's access starts `extent_offset` bytes
+/// below its own address and is `extent_size` bytes long; a single write is its own extent.
 #[derive(Clone, Copy)]
 pub(crate) struct StoreWrite {
     pub(crate) due: u64,
     pub(crate) address: u32,
     pub(crate) size: u8,
+    pub(crate) extent_offset: u8,
+    pub(crate) extent_size: u8,
     pub(crate) value: u32,
 }
 
@@ -488,6 +495,8 @@ mod tests {
                     due: cycle,
                     address: 0,
                     size: 4,
+                    extent_offset: 0,
+                    extent_size: 4,
                     value,
                 };
                 queue.schedule_store(store);

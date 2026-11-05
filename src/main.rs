@@ -45,6 +45,7 @@ mod runner;
 mod smc;
 mod space;
 mod sploop;
+mod stack_observer;
 mod sysclk3;
 mod system;
 mod timer;

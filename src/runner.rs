@@ -29,6 +29,12 @@ pub struct RunArgs {
     /// Print this memory window when the run ends; repeatable
     #[arg(long, value_parser = parse_dump, value_name = "ADDR:LEN", help_heading = "Batch run")]
     pub dump: Vec<(u32, usize)>,
+    /// Observe B15 and committed stores within START:END without writing a guest watermark
+    #[arg(long, value_parser = parse_stack_window, value_name = "START:END", help_heading = "Batch run")]
+    pub stack_window: Option<(u32, u32)>,
+    /// Observe B15 and committed stores on every core within START:END
+    #[arg(long, value_parser = parse_stack_window, value_name = "START:END", conflicts_with = "stack_window", help_heading = "Batch run")]
+    pub stack_window_all: Option<(u32, u32)>,
     /// Keep this many recent execute-packet addresses for fault diagnosis
     #[arg(
         long,
@@ -48,6 +54,12 @@ pub struct RunArgs {
 pub fn run(args: RunArgs) -> Result<u8, String> {
     crate::install_termination_handler();
     let mut machine = Machine::load(&args.image, &args.machine)?;
+    if let Some((start, end)) = args.stack_window {
+        machine.configure_stack_observation(start, end)?;
+    }
+    if let Some((start, end)) = args.stack_window_all {
+        machine.configure_stack_observation_all(start, end)?;
+    }
     if machine.stop_address().is_none() {
         return Err("ELF has no C$$EXIT symbol; pass --stop-pc".into());
     }
@@ -184,4 +196,56 @@ fn parse_dump(text: &str) -> Result<(u32, usize), String> {
             .parse()
             .map_err(|_| format!("invalid length {length}"))?,
     ))
+}
+
+fn parse_stack_window(text: &str) -> Result<(u32, u32), String> {
+    let (start, end) = text
+        .split_once(':')
+        .ok_or_else(|| "expected START:END".to_string())?;
+    let start = crate::parse_address(start)?;
+    let end = crate::parse_address(end)?;
+    crate::stack_observer::StackMemoryObservation::new(start, end)?;
+    Ok((start, end))
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{Cli, Command};
+    use clap::Parser;
+
+    fn run_args(extra: &[&str]) -> Result<super::RunArgs, clap::Error> {
+        let mut argv = vec!["c64xemu", "run", "image.out"];
+        argv.extend_from_slice(extra);
+        match Cli::try_parse_from(argv)?.command {
+            Command::Run(args) => Ok(args),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn stack_windows_parse_and_are_mutually_exclusive() {
+        let single = run_args(&["--stack-window", "0x00801000:0x00802000"]).unwrap();
+        assert_eq!(single.stack_window, Some((0x0080_1000, 0x0080_2000)));
+        assert_eq!(single.stack_window_all, None);
+        let all = run_args(&["--stack-window-all", "4096:8192"]).unwrap();
+        assert_eq!(all.stack_window_all, Some((0x1000, 0x2000)));
+        assert_eq!(all.stack_window, None);
+        assert!(run_args(&[
+            "--stack-window",
+            "0x1000:0x2000",
+            "--stack-window-all",
+            "0x1000:0x2000",
+        ])
+        .is_err());
+        for bad in [
+            "0x2000:0x1000",
+            "0x1000:0x1000",
+            "0x1002:0x2000",
+            "0x1000:0x2002",
+            "0x1000",
+        ] {
+            assert!(run_args(&["--stack-window", bad]).is_err(), "{bad}");
+            assert!(run_args(&["--stack-window-all", bad]).is_err(), "{bad}");
+        }
+    }
 }

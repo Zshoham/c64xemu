@@ -6,6 +6,7 @@ use crate::decoder::{
 };
 use crate::memory::DataClock;
 use crate::sploop::{LoopBuffer, LoopStart, ReplayPackets};
+use crate::stack_observer::StackMemoryObservation;
 use crate::system::{CoreBus, Endian, Fabric, Permission};
 use crate::trace::{Event, Trace};
 use crate::view::{
@@ -371,6 +372,7 @@ pub struct Cpu {
     /// The register-write diagnostic is configured once per CPU instead of querying the
     /// process environment on every scheduled write.
     trace_a4: bool,
+    stack_observation: Option<StackMemoryObservation>,
     /// Sparse, exact-address decode cache for the 2 MiB L2 SRAM code window. Pages are
     /// allocated only when executed; fetched bytes and compact headers validate every hit.
     decoded_l2: Vec<Option<Box<[Option<DecodedEntry>]>>>,
@@ -433,6 +435,7 @@ impl Cpu {
             sploop_was_active: false,
             profiling: false,
             trace_a4: std::env::var_os("C64XEMU_TRACE_A4").is_some(),
+            stack_observation: None,
             decoded_l2: (0..DECODE_PAGES).map(|_| None).collect(),
             validated_l2: (0..DECODE_PAGES).map(|_| None).collect(),
             packet_address: pc,
@@ -445,10 +448,30 @@ impl Cpu {
         }
     }
 
+    /// A host write to a register (debugger, GDB, tests). It is not guest execution, so the
+    /// stack observer does not see it.
     pub fn set_register(&mut self, name: &str, value: u32) -> Result<(), String> {
         let (bank, index) = parse_register(name)?;
-        self.write_register(bank, index, value);
+        match bank {
+            Bank::A => self.a[index] = value,
+            Bank::B => self.b[index] = value,
+        }
         Ok(())
+    }
+
+    /// Start observing B15 and committed stores against `[start, end)`, replacing any earlier
+    /// observation; see `stack_observer` for what is recorded.
+    pub fn configure_stack_observation(&mut self, start: u32, end: u32) -> Result<(), String> {
+        self.stack_observation = Some(StackMemoryObservation::new(start, end)?);
+        Ok(())
+    }
+
+    pub fn clear_stack_observation(&mut self) {
+        self.stack_observation = None;
+    }
+
+    pub fn stack_observation(&self) -> Option<StackMemoryObservation> {
+        self.stack_observation
     }
 
     pub fn register(&self, bank: char, index: usize) -> u32 {
@@ -2312,6 +2335,8 @@ impl Cpu {
                         due: self.cycle,
                         address,
                         size: 4,
+                        extent_offset: 0,
+                        extent_size: 4,
                         value,
                     });
                 }
@@ -2394,6 +2419,8 @@ impl Cpu {
                     due: self.cycle,
                     address: effective,
                     size: 4,
+                    extent_offset: 0,
+                    extent_size: 4,
                     value: self.read_register(data_bank, ((word >> 23) & 0x1f) as usize),
                 });
             }
@@ -2417,6 +2444,8 @@ impl Cpu {
                     address: effective & !(size - 1),
                     value,
                     size: size as u8,
+                    extent_offset: 0,
+                    extent_size: size as u8,
                 });
             }
             Opcode::Sploop | Opcode::Sploopd | Opcode::Sploopw => {
@@ -2597,6 +2626,8 @@ impl Cpu {
                             due: self.cycle,
                             address: effective & !(size - 1),
                             size: size as u8,
+                            extent_offset: 0,
+                            extent_size: size as u8,
                             value: self.read_register(side, register),
                         })
                     }
@@ -3328,6 +3359,8 @@ impl Cpu {
                         due: self.cycle,
                         address: address & !3,
                         size: 4,
+                        extent_offset: 0,
+                        extent_size: 4,
                         value: self.read_register(data_bank, register),
                     });
                 }
@@ -3382,6 +3415,8 @@ impl Cpu {
                             due: self.cycle,
                             address: aligned,
                             size: 4,
+                            extent_offset: 0,
+                            extent_size: 4,
                             value: self.read_register(data_bank, register),
                         });
                     }
@@ -3490,6 +3525,8 @@ impl Cpu {
                             base
                         },
                         size: size as u8,
+                        extent_offset: 0,
+                        extent_size: size as u8,
                         value: self.read_register(data_bank, register),
                     });
                 }
@@ -3911,11 +3948,13 @@ impl Cpu {
     /// A doubleword store as two word writes in this cycle, `first` at `address` and `second`
     /// four bytes above it; `doubleword_halves` has already put the pair in memory order.
     fn schedule_doubleword_store(&mut self, address: u32, first: u32, second: u32) {
-        for (offset, value) in [(0, first), (4, second)] {
+        for (offset, value) in [(0u8, first), (4, second)] {
             self.writeback.schedule_store(StoreWrite {
                 due: self.cycle,
-                address: address.wrapping_add(offset),
+                address: address.wrapping_add(u32::from(offset)),
                 size: 4,
+                extent_offset: offset,
+                extent_size: 8,
                 value,
             });
         }
@@ -3984,6 +4023,15 @@ impl Cpu {
             // A page that does not grant the write swallows it and reports the fault.
             let user = self.user_mode;
             if bus.check_access(store.address, Permission::Write, user) {
+                if let Some(observation) = self.stack_observation.as_mut() {
+                    observation.observe_store(
+                        store.address,
+                        store.size,
+                        store.extent_offset,
+                        store.extent_size,
+                        cycle,
+                    );
+                }
                 self.stats.stores += 1;
                 if traced {
                     // The old value comes from the host view: reading it through the
@@ -4338,7 +4386,13 @@ impl Cpu {
         }
     }
 
+    /// A guest register write, committed by the write-back; the stack observer sees B15 here.
     fn write_register(&mut self, bank: Bank, index: usize, value: u32) {
+        if bank == Bank::B && index == 15 {
+            if let Some(observation) = self.stack_observation.as_mut() {
+                observation.observe_sp(value, self.cycle);
+            }
+        }
         match bank {
             Bank::A => self.a[index] = value,
             Bank::B => self.b[index] = value,

@@ -254,6 +254,16 @@ pub struct Machine {
     /// The board the device sits on: what it straps, fuses and supplies, and so which boot
     /// runs. Held so a reload builds the same board again.
     board: Board,
+    /// `--stack-window` or `--stack-window-all`, kept so a reload observes the same window.
+    stack_window: Option<StackWindow>,
+}
+
+/// Which cores a configured stack window observes: the core focused when it was configured,
+/// or every core.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StackWindow {
+    Core { core: usize, start: u32, end: u32 },
+    All { start: u32, end: u32 },
 }
 
 /// One member of the stop-condition set `resume` evaluates on every cycle. The machine-native
@@ -393,6 +403,7 @@ impl Machine {
             breakpoints: Vec::new(),
             initial_breakpoints: Vec::new(),
             board,
+            stack_window: None,
         };
         // A boot table replaces the ELF's memory image entirely: the ELF is only there for the
         // symbols a debugger and the CIO handshake need (SPRUEC6G section 6.2.2).
@@ -470,6 +481,7 @@ impl Machine {
             breakpoints: Vec::new(),
             initial_breakpoints: Vec::new(),
             board: Board::pins(&crate::device::C6455, 0),
+            stack_window: None,
         }
     }
 
@@ -500,6 +512,10 @@ impl Machine {
         let result = self.install();
         if result.is_ok() {
             self.configure_memory();
+            // The program starts over, so the observation does too.
+            if let Some(window) = self.stack_window {
+                self.apply_stack_window(window)?;
+            }
         }
         self.install_halt(false);
         // A reinstalled trace keeps writing to the same file rather than truncating it.
@@ -837,6 +853,59 @@ impl Machine {
         self.device.cpu().register(bank, index)
     }
 
+    /// Observe the focused core's stack without touching guest stack bytes. The state report
+    /// then carries a single `stack_observation` for that core, even if the focus moves on.
+    /// Replaces any window configured before, on this core or on all of them.
+    pub fn configure_stack_observation(&mut self, start: u32, end: u32) -> Result<(), String> {
+        let core = self.device.focus();
+        self.apply_stack_window(StackWindow::Core { core, start, end })
+    }
+
+    /// Configure the same passive stack observer on every core, held ones included, without
+    /// changing the focus. The state report then carries `stack_observations` in core order.
+    pub fn configure_stack_observation_all(&mut self, start: u32, end: u32) -> Result<(), String> {
+        self.apply_stack_window(StackWindow::All { start, end })
+    }
+
+    fn apply_stack_window(&mut self, window: StackWindow) -> Result<(), String> {
+        // Validate once before touching any core, so a bad window leaves the old one in place.
+        let (start, end) = match window {
+            StackWindow::Core { start, end, .. } | StackWindow::All { start, end } => (start, end),
+        };
+        crate::stack_observer::StackMemoryObservation::new(start, end)?;
+        for core in 0..self.device.cores() {
+            let observed = match window {
+                StackWindow::Core { core: chosen, .. } => core == chosen,
+                StackWindow::All { .. } => true,
+            };
+            self.device.with_core(core, |cpu| {
+                if observed {
+                    cpu.configure_stack_observation(start, end)
+                } else {
+                    cpu.clear_stack_observation();
+                    Ok(())
+                }
+            })?;
+        }
+        self.stack_window = Some(window);
+        Ok(())
+    }
+
+    fn stack_observation_json(&self, core: usize) -> Option<Value> {
+        let observation = self.device.core(core).stack_observation()?;
+        let mut value = json!(observation);
+        value["core"] = json!(core);
+        Some(value)
+    }
+
+    /// Observations in ascending core order, including cores still held in reset; empty when
+    /// no window is configured.
+    pub fn stack_observations(&self) -> Vec<Value> {
+        (0..self.device.cores())
+            .filter_map(|core| self.stack_observation_json(core))
+            .collect()
+    }
+
     /// The endianness the device is strapped to, which the GDB stub's word order follows.
     pub fn endian(&self) -> Endian {
         self.device.cpu().endian()
@@ -1109,6 +1178,15 @@ impl Machine {
             "cores": snapshot.cores,
             "stats": snapshot.stats,
         });
+        match self.stack_window {
+            Some(StackWindow::Core { core, .. }) => {
+                state["stack_observation"] = json!(self.stack_observation_json(core));
+            }
+            Some(StackWindow::All { .. }) => {
+                state["stack_observations"] = json!(self.stack_observations());
+            }
+            None => {}
+        }
         // What the boot the board strapped has done: how a case tells a boot that completed
         // from one still waiting for its next frame, cell or EEPROM block.
         for (member, report) in self.device.boot().report(self.cores()) {
@@ -1582,6 +1660,176 @@ mod tests {
             assert_eq!(machine.device.core(1).pc(), 8);
             assert_eq!(machine.device.core(3).pc(), 8);
         }
+    }
+
+    /// Each core builds B15 = 0x00802000 in its own local L2 the way crt0 does - MVK leaves
+    /// 0x00002000 for a cycle, MVKH completes it - then pushes it down by a per-core depth and
+    /// stores B0 there. Encodings from TI CGT 8.3.15, checked with dis6x.
+    fn stack_program(core: usize) -> [u32; 6] {
+        let depth = 4 * (core as u32 + 1);
+        [
+            0x0790_002a,                                          // MVK.S2 0x2000,B15
+            0x0780_406a,                                          // MVKH.S2 0x800000,B15
+            0x0780_0052 | ((depth.wrapping_neg() & 0xffff) << 7), // ADDK.S2 -depth,B15
+            0x003c_02f6,                                          // STW.D2T2 B0,*+B15[0]
+            0,
+            0,
+        ]
+    }
+
+    const STACK: (u32, u32) = (0x0080_1000, 0x0080_2000);
+
+    fn six_cores_running_stack_programs() -> Machine {
+        let mut machine = Machine::bare(Cpu::new(0));
+        machine.device =
+            Device::with_boot_mode(&crate::device::C6472, 0x0080_0000, Endian::Little, 0);
+        for core in 0..6 {
+            machine.device.with_core(core, |cpu| {
+                cpu.write_words(0x0080_0000, &stack_program(core));
+                cpu.set_register("B0", 0x1122_0000 + core as u32).unwrap();
+            });
+        }
+        machine
+    }
+
+    #[test]
+    fn all_core_observation_is_per_core_ordered_and_keeps_focus_and_held_cores() {
+        let mut machine = six_cores_running_stack_programs();
+        machine.device.fabric().set_held_in_reset(1, true);
+        machine.set_focus(4);
+        machine
+            .configure_stack_observation_all(STACK.0, STACK.1)
+            .unwrap();
+        assert_eq!(machine.focus(), 4);
+        machine.resume(&mut [StopCondition::Budget(6)]).unwrap();
+        assert_eq!(machine.focus(), 4);
+        assert!(machine.core_held_in_reset(1));
+
+        let observations = machine.stack_observations();
+        assert_eq!(observations.len(), 6);
+        for (core, observation) in observations.iter().enumerate() {
+            assert_eq!(observation["core"], core);
+            assert_eq!(observation["start"], STACK.0);
+            assert_eq!(observation["end"], STACK.1);
+            if core == 1 {
+                // Held: never wrote B15, so nothing about its stack is known.
+                assert_eq!(observation["sp_written"], false);
+                assert_eq!(observation["armed"], false);
+                assert_eq!(observation["min_sp"], Value::Null);
+                assert_eq!(observation["lowest_write"], Value::Null);
+                continue;
+            }
+            let sp = STACK.1 - 4 * (core as u32 + 1);
+            assert_eq!(observation["sp_written"], true);
+            assert_eq!(observation["armed"], true);
+            assert_eq!(observation["min_sp"], sp);
+            assert_eq!(observation["min_sp_cycle"], 2);
+            assert_eq!(observation["lowest_write"], sp);
+            assert_eq!(observation["lowest_write_cycle"], 3);
+            assert_eq!(observation["out_of_bounds_sp"], false);
+            assert_eq!(observation["out_of_bounds_write"], false);
+            let stored = machine
+                .device
+                .with_core(core, |cpu| cpu.host_read_bytes(sp, 4));
+            assert_eq!(stored, (0x1122_0000 + core as u32).to_le_bytes());
+            assert_eq!(machine.device.core(core).fault(), None);
+        }
+        let state = machine.state_json(false);
+        assert_eq!(state["stack_observations"], json!(observations));
+        assert!(state.get("stack_observation").is_none());
+
+        // Released late, core 1 runs the same program on its own pipeline clock: its cycles
+        // count from its first step, not from the device's.
+        machine.device.fabric().set_held_in_reset(1, false);
+        machine.resume(&mut [StopCondition::Budget(6)]).unwrap();
+        let after = machine.stack_observations();
+        assert_eq!(after[1]["min_sp"], STACK.1 - 8);
+        assert_eq!(after[1]["min_sp_cycle"], 2);
+        assert_eq!(after[1]["lowest_write_cycle"], 3);
+        for core in [0, 2, 3, 4, 5] {
+            assert_eq!(after[core], observations[core], "core {core} moved");
+        }
+    }
+
+    #[test]
+    fn single_window_reports_the_core_it_was_configured_on() {
+        let mut machine = six_cores_running_stack_programs();
+        machine.set_focus(4);
+        machine
+            .configure_stack_observation(STACK.0, STACK.1)
+            .unwrap();
+        machine.set_focus(0);
+        machine.resume(&mut [StopCondition::Budget(6)]).unwrap();
+        let state = machine.state_json(false);
+        let single = &state["stack_observation"];
+        assert_eq!(single["core"], 4);
+        assert_eq!(single["min_sp"], STACK.1 - 20);
+        assert!(state.get("stack_observations").is_none());
+        assert_eq!(machine.stack_observations(), vec![single.clone()]);
+
+        // A rejected window changes nothing; a valid all-core one replaces the single one.
+        assert!(machine
+            .configure_stack_observation_all(STACK.1, STACK.0)
+            .is_err());
+        assert_eq!(machine.state_json(false)["stack_observation"], *single);
+        machine
+            .configure_stack_observation_all(STACK.0, STACK.1)
+            .unwrap();
+        let state = machine.state_json(false);
+        assert!(state.get("stack_observation").is_none());
+        assert_eq!(state["stack_observations"].as_array().unwrap().len(), 6);
+        // And the other way round: back to one core, the rest stop observing.
+        machine
+            .configure_stack_observation(STACK.0, STACK.1)
+            .unwrap();
+        assert_eq!(machine.stack_observations().len(), 1);
+        assert_eq!(machine.stack_observations()[0]["core"], 0);
+    }
+
+    #[test]
+    fn all_core_observation_does_not_change_guest_execution() {
+        let mut plain = six_cores_running_stack_programs();
+        let mut observed = six_cores_running_stack_programs();
+        observed
+            .configure_stack_observation_all(STACK.0, STACK.1)
+            .unwrap();
+        for machine in [&mut plain, &mut observed] {
+            machine.resume(&mut [StopCondition::Budget(12)]).unwrap();
+        }
+        let mut observed_state = observed.state_json(false);
+        assert_eq!(observed_state["stack_observations"][5]["armed"], true);
+        observed_state
+            .as_object_mut()
+            .unwrap()
+            .remove("stack_observations");
+        assert_eq!(plain.state_json(false), observed_state);
+        for core in 0..6 {
+            let window = |machine: &mut Machine| {
+                machine
+                    .device
+                    .with_core(core, |cpu| cpu.host_read_bytes(STACK.0, 0x1000))
+            };
+            assert_eq!(window(&mut plain), window(&mut observed), "core {core}");
+        }
+    }
+
+    /// A reload restarts the program, so the observation restarts with it.
+    #[test]
+    fn reload_restarts_the_observation() {
+        let mut machine = Machine::bare(Cpu::new(0));
+        machine
+            .device
+            .with_core(0, |cpu| cpu.write_words(0, &stack_program(0)));
+        machine
+            .configure_stack_observation(STACK.0, STACK.1)
+            .unwrap();
+        machine.resume(&mut [StopCondition::Budget(4)]).unwrap();
+        assert_eq!(machine.stack_observations()[0]["armed"], true);
+        machine.reload().unwrap();
+        let restarted = machine.stack_observations();
+        assert_eq!(restarted.len(), 1);
+        assert_eq!(restarted[0]["sp_written"], false);
+        assert_eq!(restarted[0]["start"], STACK.0);
     }
 
     #[test]
