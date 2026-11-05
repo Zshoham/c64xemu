@@ -1,0 +1,17 @@
+{
+  "domain": "decoder",
+  "expected": {
+    "mnemonic": "sshl",
+    "unit": "s1",
+    "operands": "a5,3,a5"
+  },
+  "request": {
+    "action": "decode",
+    "address": 0,
+    "endian": "little",
+    "header": 4024451072,
+    "id": "decoder:compact-sshl-binutils-66c2",
+    "width": 16,
+    "word": 26306
+  }
+}

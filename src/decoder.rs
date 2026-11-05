@@ -1216,11 +1216,13 @@ pub fn decode_compact(word: u16, header: u32) -> Option<CompactOpcode> {
     if word & 0x040e == 0x0400 {
         return Some(CompactOpcode::AddConst);
     }
-    if word & 0x041e == 0x0402 && (word >> 5) & 3 != 3 && !sat {
+    if word & 0x041e == 0x0402 && (word >> 5) & 3 != 3 {
         let kind = match (word >> 5) & 3 {
             0 => ShiftKind::Shl,
             1 => ShiftKind::Shr,
-            _ => ShiftKind::Shru,
+            2 if sat => ShiftKind::Sshl,
+            2 => ShiftKind::Shru,
+            _ => unreachable!("op field 3 is the compact register-count shift"),
         };
         return Some(CompactOpcode::ShiftConst5(kind));
     }

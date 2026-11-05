@@ -2167,6 +2167,15 @@ the view renders its raw word and resource validation reports the same failure w
 classification. The whole compact word/header-space classification snapshots and the `dis6x`
 differentials retain the observable behavior while guarding this shared seam.
 
+**[x] Compact constant shifts under a saturating packet.** *Fixed.* Before this fix, compact constant
+SHL/SHR/SSHL in a SAT-header packet were unclassified and faulted. The dis6x differential over
+the whole Ssh5 space (2,048 words across SAT/BR/RS/DSZ headers) disagreed on 12,288 encodings
+before the fix and zero after. cl6x -O2 emits compact SSHL for `_sshl`, although none of the
+existing firmware, DSPLIB or RTS corpora contained it. `compact-sshl-zero-shift` and
+`compact-sshl-zero-value` require successful execution; `compact-shl-sat-header-overflow`
+checks wrapping without saturation flags. Decoder vectors cover compiler A4/B5 encodings and
+six binutils S-unit examples, with operands checked against dis6x.
+
 **[x] The compact subtract under a saturating packet.** *Fixed.* A fetch packet's SAT bit selects the
 saturating form of the compact three-operand ALU, and the model applied it on either functional
 unit. SSUB has no .S unit form: TI's assembler rejects `SSUB .S1` while accepting `SADD .S1`,

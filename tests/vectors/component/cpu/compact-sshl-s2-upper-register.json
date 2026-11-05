@@ -1,0 +1,39 @@
+{
+  "domain": "cpu",
+  "expected": {
+    "registers": {
+      "B19": 2147483648
+    },
+    "controls": {
+      "1": 268436224,
+      "21": 8
+    },
+    "fault": null,
+    "cycles": 2
+  },
+  "request": {
+    "action": "execute",
+    "cycles": 2,
+    "endian": "little",
+    "id": "cpu:compact-sshl-s2-upper-register",
+    "memory": [],
+    "observe_controls": [
+      1,
+      21
+    ],
+    "pc": 0,
+    "registers": {
+      "B19": 2684354560
+    },
+    "words": [
+      208545219,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      3760734208
+    ]
+  }
+}

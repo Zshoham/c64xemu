@@ -1,0 +1,17 @@
+{
+  "domain": "decoder",
+  "expected": {
+    "mnemonic": "shru",
+    "unit": "s1",
+    "operands": "a3,16,a3"
+  },
+  "request": {
+    "action": "decode",
+    "address": 0,
+    "endian": "little",
+    "header": 0,
+    "id": "decoder:compact-shift-constant-shru",
+    "width": 16,
+    "word": 5570
+  }
+}

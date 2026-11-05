@@ -1,0 +1,39 @@
+{
+  "domain": "cpu",
+  "expected": {
+    "registers": {
+      "A3": 2147483647
+    },
+    "controls": {
+      "1": 268436224,
+      "21": 4
+    },
+    "fault": null,
+    "cycles": 2
+  },
+  "request": {
+    "action": "execute",
+    "cycles": 2,
+    "endian": "little",
+    "id": "cpu:compact-sshl-positive-overflow-count1-flags",
+    "memory": [],
+    "observe_controls": [
+      1,
+      21
+    ],
+    "pc": 0,
+    "registers": {
+      "A3": 1073741824
+    },
+    "words": [
+      208545218,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      3760209920
+    ]
+  }
+}

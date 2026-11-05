@@ -1,0 +1,31 @@
+{
+  "domain": "cpu",
+  "expected": {
+    "registers": {
+      "A3": 2147483647
+    },
+    "fault": null,
+    "cycles": 8
+  },
+  "request": {
+    "action": "execute",
+    "cycles": 8,
+    "endian": "little",
+    "id": "cpu:compact-s-unit-saturating-shift-constant",
+    "memory": [],
+    "pc": 0,
+    "registers": {
+      "A3": 65536
+    },
+    "words": [
+      208541122,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      3760209920
+    ]
+  }
+}

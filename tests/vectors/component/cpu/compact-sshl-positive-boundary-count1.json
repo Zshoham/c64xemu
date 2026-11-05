@@ -1,0 +1,39 @@
+{
+  "domain": "cpu",
+  "expected": {
+    "registers": {
+      "A3": 2147483646
+    },
+    "controls": {
+      "1": 268435712,
+      "21": 0
+    },
+    "fault": null,
+    "cycles": 2
+  },
+  "request": {
+    "action": "execute",
+    "cycles": 2,
+    "endian": "little",
+    "id": "cpu:compact-sshl-positive-boundary-count1",
+    "memory": [],
+    "observe_controls": [
+      1,
+      21
+    ],
+    "pc": 0,
+    "registers": {
+      "A3": 1073741823
+    },
+    "words": [
+      208545218,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      3760209920
+    ]
+  }
+}
