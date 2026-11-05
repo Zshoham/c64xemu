@@ -588,6 +588,64 @@ impl Machine {
         }
     }
 
+    /// The monotonic clock used by the run budget and host polling for the current boot mode.
+    /// This is emulator event time, not guest TSCL or host wall time.
+    #[allow(dead_code)] // Driver API; the current CLI has no timed input trace option.
+    pub fn event_time(&self) -> u64 {
+        self.run_clock()
+    }
+
+    /// Deliver a sorted schedule of host-side releases at exact emulator event-clock boundaries.
+    /// The machine advances to each tick and invokes the callback before executing that cycle.
+    /// Equal ticks are delivered in input order. A callback may update memory or use a device
+    /// host interface, but must not advance the machine clock itself.
+    #[allow(dead_code)] // Driver API; exercised by machine tests until a CLI driver uses it.
+    pub fn replay_release_ticks<F>(
+        &mut self,
+        release_ticks: &[u64],
+        mut on_release: F,
+    ) -> Result<(), String>
+    where
+        F: FnMut(&mut Machine, usize, u64),
+    {
+        if release_ticks.windows(2).any(|pair| pair[0] > pair[1]) {
+            return Err("release ticks must be sorted".into());
+        }
+        let start = self.event_time();
+        if let Some(tick) = release_ticks.first().filter(|tick| **tick < start) {
+            return Err(format!(
+                "release tick {tick} precedes current event time {start}"
+            ));
+        }
+
+        for (index, &tick) in release_ticks.iter().enumerate() {
+            let current = self.event_time();
+            if tick < current {
+                return Err(format!(
+                    "release tick {tick} precedes current event time {current}"
+                ));
+            }
+            if tick > current {
+                let mut conditions = [StopCondition::Budget(tick - current)];
+                let reason = self.resume(&mut conditions)?;
+                if reason != StopReason::Budget || self.event_time() != tick {
+                    return Err(format!(
+                        "failed to reach release {index} at tick {tick}: stopped at {} ({reason:?})",
+                        self.event_time()
+                    ));
+                }
+            }
+            on_release(self, index, tick);
+            let after_callback = self.event_time();
+            if after_callback != tick {
+                return Err(format!(
+                    "release callback {index} advanced event time from tick {tick} to {after_callback}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// The host connections with the device's fabric and the run clock they measure by. The
     /// machine chooses the clock; the connections own poll scheduling and what they say.
     fn with_host<R>(
@@ -1470,6 +1528,46 @@ mod tests {
         let mut conditions = [StopCondition::Budget(100)];
         assert_eq!(machine.resume(&mut conditions).unwrap(), StopReason::Budget);
         assert_eq!(machine.device.cpu_mut().cycles(), 100);
+    }
+
+    #[test]
+    fn release_replay_delivers_exact_ticks_in_input_order() {
+        let ticks = [5, 5, 19, 43];
+        let mut machine = Machine::bare(Cpu::new(0));
+        machine.device.cpu_mut().write_words(0, &[0; 200]);
+        let mut delivered = Vec::new();
+        machine
+            .replay_release_ticks(&ticks, |machine, index, tick| {
+                delivered.push((index, tick, machine.event_time()));
+                machine.write_memory(0x100 + index as u32 * 4, &tick.to_le_bytes());
+            })
+            .unwrap();
+
+        assert_eq!(
+            delivered,
+            vec![(0, 5, 5), (1, 5, 5), (2, 19, 19), (3, 43, 43)]
+        );
+        assert_eq!(machine.event_time(), 43);
+        assert_eq!(
+            machine.read_memory(0x100, 16),
+            [5, 0, 0, 0, 5, 0, 0, 0, 19, 0, 0, 0, 43, 0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn release_replay_rejects_invalid_schedule_and_callback_clock_changes() {
+        let mut machine = Machine::bare(Cpu::new(0));
+        machine.device.cpu_mut().write_words(0, &[0; 32]);
+        assert!(machine.replay_release_ticks(&[4, 3], |_, _, _| {}).is_err());
+        assert_eq!(machine.event_time(), 0);
+
+        let error = machine
+            .replay_release_ticks(&[2], |machine, _, _| {
+                let mut one_cycle = [StopCondition::Budget(1)];
+                assert_eq!(machine.resume(&mut one_cycle).unwrap(), StopReason::Budget);
+            })
+            .unwrap_err();
+        assert!(error.contains("advanced event time from tick 2 to 3"));
     }
 
     #[test]
