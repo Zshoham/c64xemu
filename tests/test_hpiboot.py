@@ -277,5 +277,6 @@ def test_c6472_host_replicates_local_segments_and_writes_shared_ones_once() -> N
     code = Segment(0x0080_0400, b"code")
     shared = Segment(0x0020_0000, b"data")
     placements = place_segments(Image(0, code.address, (code, shared)), (1, 4))
-    assert placements == [(0x1180_0400, b"code"), (0x1480_0400, b"code"), (0x0020_0000, b"data")]
+    # Shared L2's 0020 0000h is local-only (SPRS612G Table 2-2); the HPI names it by its alias.
+    assert placements == [(0x1180_0400, b"code"), (0x1480_0400, b"code"), (0x1020_0000, b"data")]
 

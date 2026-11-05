@@ -4,7 +4,7 @@ use crate::decoder::{
     compact_register, compact_stack_constant, long_roles, mpy_roles, AluOp, CmpOp, CompactOpcode,
     LogicOp, MpyOp, MvkForm, Opcode, SetClrOp, ShiftKind,
 };
-use crate::memory::DataClock;
+use crate::memory::{DataClock, StrictViolation};
 use crate::sploop::{LoopBuffer, LoopStart, ReplayPackets};
 use crate::stack_observer::StackMemoryObservation;
 use crate::system::{CoreBus, Endian, Fabric, Permission};
@@ -508,7 +508,88 @@ impl Cpu {
     }
     #[cfg(test)]
     pub fn step_cycle(&mut self) {
-        self.with_bus(|cpu, bus| cpu.step(bus));
+        self.with_bus(|cpu, bus| {
+            if !bus.strict_stopped() {
+                cpu.step(bus);
+            }
+            cpu.take_own_strict_violation(bus);
+        });
+    }
+
+    /// When a strict physical-memory violation has ended the run and it is reported on this
+    /// core, take it as this core's fault (`Backing::latch_strict_stop` decides, and records
+    /// where the core stopped the first time).
+    #[inline]
+    fn take_own_strict_violation(&mut self, bus: &mut CoreBus<'_>) {
+        let (pc, cycles) = (self.pc, self.cycles());
+        if let Some(violation) = bus.latch_strict_stop(pc, cycles) {
+            self.latch_strict_violation(violation);
+        }
+    }
+
+    /// Take a strict physical-memory violation reported on this core, already latched with
+    /// where it stopped, as this core's fault - ahead of any fault the core already had, which
+    /// the text keeps after `; original fault: `. The run stops the way it stops for any fault,
+    /// without the IERR bit, exception or event a CPU-detected fault raises, because the
+    /// diagnostic is the emulator's, not the device's.
+    #[cold]
+    pub(crate) fn latch_strict_violation(&mut self, violation: &StrictViolation) {
+        let Some(message) = violation.fault_text() else {
+            return;
+        };
+        let message = if let Some(original) = self.fault.as_ref() {
+            if original.starts_with(&message) {
+                return;
+            }
+            format!("{message}; original fault: {original}")
+        } else {
+            message
+        };
+        self.stats.faults += 1;
+        if self.trace.enabled() {
+            self.trace.emit(
+                self.cycle,
+                Event::Fault {
+                    message: message.clone(),
+                    ierr: 0,
+                },
+            );
+        }
+        self.fault = Some(message);
+    }
+
+    /// Strict physical-memory work at the start of a packet: a packet kept across a carve - by
+    /// this core or by the core whose memory it came from through a global alias - is fetched
+    /// again, and checked, once any core's cache configuration has moved. With the checks off
+    /// this never runs, and the packet stays: the L1P copy it stands for is not invalidated by
+    /// another core's configuration on silicon either. Answers the refusal count, so the fetch
+    /// can tell whether it was refused.
+    #[cold]
+    #[inline(never)]
+    fn strict_packet_start(&mut self, bus: &mut CoreBus<'_>) -> u64 {
+        if bus.strict_sram_moved() {
+            self.packet_line = None;
+        }
+        bus.strict_refusals()
+    }
+
+    /// Whether strict mode refused a fetch of this packet: then it is not issued, and the core
+    /// stays on it - its PC names the packet - without finishing the cycle. The zeros the
+    /// refused fetch answered with are not kept for reuse.
+    #[cold]
+    #[inline(never)]
+    fn strict_fetch_refused(
+        &mut self,
+        bus: &CoreBus<'_>,
+        refusals: u64,
+        packet_start: u32,
+    ) -> bool {
+        if bus.strict_refusals() == refusals {
+            return false;
+        }
+        self.pc = packet_start;
+        self.packet_line = None;
+        true
     }
 
     /// One cycle against a fabric the device is holding rather than lending. The device keeps
@@ -540,7 +621,14 @@ impl Cpu {
     ) -> u64 {
         let start = self.cycle;
         let mut first = true;
-        while self.cycle.wrapping_sub(start) < cycles && self.fault.is_none() {
+        // A strict physical-memory violation ends the batch at the cycle boundary after it, as
+        // a fault does. Whether the diagnostic is on is asked once per batch, so with it off the
+        // per-cycle test is a register.
+        let strict = bus.strict_on();
+        while self.cycle.wrapping_sub(start) < cycles
+            && self.fault.is_none()
+            && !(strict && bus.strict_stopped())
+        {
             // The pipeline-clean test is shared by the halt, CIO-boundary and replay tests;
             // computing it once keeps the per-cycle bookkeeping to one load set.
             let clean =
@@ -560,6 +648,9 @@ impl Cpu {
                 self.step(bus);
             }
             first = false;
+        }
+        if bus.strict_stopped() {
+            self.take_own_strict_violation(bus);
         }
         self.cycle.wrapping_sub(start)
     }
@@ -938,6 +1029,13 @@ impl Cpu {
             self.packet_line = None;
             self.packet_line_epoch = epoch;
         }
+        // Strict physical-memory checks run when a packet is fetched (`strict_packet_start`).
+        // With them off this is one flag test, and everything else is out of line.
+        let strict_refusals = if bus.strict_on() {
+            Some(self.strict_packet_start(bus))
+        } else {
+            None
+        };
         // The coherence check marked an L1P line stale. A packet L1P holds is read back through
         // it - the same bytes, so this changes nothing that executes - so the read can report;
         // one a frozen L1P let past is not held, and stays buffered exactly as it would unchecked.
@@ -978,6 +1076,11 @@ impl Cpu {
         let packet = unsafe {
             std::slice::from_raw_parts(packet_storage.as_ptr().cast::<Fetched>(), length)
         };
+        if let Some(refusals) = strict_refusals {
+            if self.strict_fetch_refused(bus, refusals, packet_start) {
+                return;
+            }
+        }
         let program_fetch_stalls = bus.fetch_stalls(self.cycles());
         // Cross path stalls are restricted inside the SPLOOP buffer (SPRU732J §7.16), so the
         // check only applies to packets issued from program memory.
@@ -1432,7 +1535,7 @@ impl Cpu {
         // A page that does not grant execute delivers no instruction: the packet reads as NOP
         // and the unit's fault event turns into EXCEP at the end of the cycle.
         let user = self.user_mode;
-        if !bus.check_access(address, Permission::Execute, user) {
+        if !bus.check_access(address, Permission::Execute, user, 4) {
             let decode_cached = self.decoded_instruction(address, 0, None, &mut slot.inst);
             slot.decode_cached = decode_cached;
             slot.next = address.wrapping_add(4);
@@ -2314,7 +2417,7 @@ impl Cpu {
                 // protection unit once, as `read_u32` does it. The bus reads the word and links it.
                 self.note_load(bus, address);
                 let user = self.user_mode;
-                let value = if bus.check_access(address, Permission::Read, user) {
+                let value = if bus.check_access(address, Permission::Read, user, 4) {
                     bus.load_link(address)
                 } else {
                     0
@@ -4025,7 +4128,7 @@ impl Cpu {
         while let Some(store) = self.writeback.pop_store(cycle) {
             // A page that does not grant the write swallows it and reports the fault.
             let user = self.user_mode;
-            if bus.check_access(store.address, Permission::Write, user) {
+            if bus.check_access(store.address, Permission::Write, user, store.size as usize) {
                 if let Some(observation) = self.stack_observation.as_mut() {
                     observation.observe_store(
                         store.address,
@@ -4054,10 +4157,11 @@ impl Cpu {
                         },
                     );
                 }
+                // Admitted: `check_access` made the strict physical-memory check too.
                 match store.size {
-                    1 => bus.write_u8(store.address, store.value as u8),
-                    2 => bus.write_u16(store.address, store.value as u16),
-                    4 => bus.write32(store.address, store.value),
+                    1 => bus.write_u8_admitted(store.address, store.value as u8),
+                    2 => bus.write_u16_admitted(store.address, store.value as u16),
+                    4 => bus.write32_admitted(store.address, store.value),
                     _ => unreachable!(),
                 }
             }
@@ -4426,33 +4530,35 @@ impl Cpu {
     }
     /// Data reads go through these three accessors so that every addressing form - wide,
     /// compact, long-offset - records its access for the PROT NOP, bank conflict and L1D miss
-    /// rules exactly once, and meets the memory protection unit exactly once. A denied read
-    /// returns zero and has already raised the unit's fault event.
+    /// rules exactly once, and meets the memory protection unit - and, when it is on, the
+    /// strict physical-memory diagnostic - exactly once. A read the unit denies returns zero and
+    /// has already raised the unit's fault event; one the diagnostic refuses returns zero and
+    /// has recorded the violation. Admitted, the read itself is not checked again.
     fn read_u8(&mut self, bus: &mut CoreBus<'_>, address: u32) -> u8 {
         self.note_load(bus, address);
         let user = self.user_mode;
-        if !bus.check_access(address, Permission::Read, user) {
+        if !bus.check_access(address, Permission::Read, user, 1) {
             return 0;
         }
-        bus.read_u8(address)
+        bus.read_u8_admitted(address)
     }
 
     fn read_u16(&mut self, bus: &mut CoreBus<'_>, address: u32) -> u16 {
         self.note_load(bus, address);
         let user = self.user_mode;
-        if !bus.check_access(address, Permission::Read, user) {
+        if !bus.check_access(address, Permission::Read, user, 2) {
             return 0;
         }
-        bus.read_u16(address)
+        bus.read_u16_admitted(address)
     }
 
     fn read_u32(&mut self, bus: &mut CoreBus<'_>, address: u32) -> u32 {
         self.note_load(bus, address);
         let user = self.user_mode;
-        if !bus.check_access(address, Permission::Read, user) {
+        if !bus.check_access(address, Permission::Read, user, 4) {
             return 0;
         }
-        bus.read32(address)
+        bus.read32_admitted(address)
     }
 }
 
@@ -7065,6 +7171,164 @@ mod tests {
             assert_eq!(cpu.control.peek(0x1f, 0), 0, "IERR");
             assert_eq!(cpu.register('B', 0), 5);
             assert_eq!(cpu.register('B', 1), 0);
+        }
+    }
+
+    const L2CFG: u32 = 0x0184_0000;
+    const L1PCFG: u32 = 0x0184_0020;
+    const L1DCFG: u32 = 0x0184_0040;
+
+    /// Each of core 3's memories, an address near its top through core 3's global alias, and
+    /// the cache configuration that converts that address into cache: L2 grown to 256 KB, and
+    /// L1P or L1D given a 4 KB cache.
+    const PEER_CARVES: [(&str, u32, u32, u32); 3] = [
+        ("L2", 0x1389_0000, L2CFG, 4),
+        ("L1P", 0x13e0_7000, L1PCFG, 1),
+        ("L1D", 0x13f0_7000, L1DCFG, 1),
+    ];
+
+    /// CPU 0 runs a loop wholly inside one fetch packet at `code` in one of core 3's memories,
+    /// through its global alias, with L1P on - so the packet is held and reused rather than
+    /// fetched again. Core 3 then writes `value` to its cache configuration register `config`,
+    /// which converts that address into cache. With strict checks on, the next packet is
+    /// fetched again and refused, which stops the core on it; with them off, the held packet
+    /// runs on, as core 0's L1P copy of it would.
+    fn run_through_a_peer_carve(strict: bool, (code, config, value): (u32, u32, u32)) -> Cpu {
+        let mut fabric = Box::new(crate::system::Fabric::new(&crate::device::C6472));
+        fabric.set_strict_physical_memory(strict);
+        let mut cpu = Cpu::new_on_device(code, Endian::Little, 0, fabric);
+        cpu.bus_mut().write32(L1PCFG, 1);
+        cpu.set_register("B0", 1).unwrap();
+        cpu.set_register("B3", code).unwrap();
+        // [B0] B .S2 B3, then five NOPs of delay: a branch to itself every packet.
+        cpu.write_words(code, &[0x0000_0010, 0, 0, 0, 0, 0, 0, 0]);
+        cpu.step_cycle();
+        assert_eq!(cpu.pc(), code + 4);
+        cpu.fabric_mut().write32(3, config, value);
+        assert!(cpu.packet_line.is_some());
+        for _ in 0..50 {
+            cpu.step_cycle();
+        }
+        cpu
+    }
+
+    /// SPRS276M Table 2-2 reserves the range immediately above L2: a refused
+    /// fetch must stop before issuing even the zero-filled response as NOPs.
+    #[test]
+    fn a_refused_fetch_does_not_issue_a_packet() {
+        let mut fabric = Box::new(crate::system::Fabric::new(&crate::device::C6455));
+        fabric.set_strict_physical_memory(true);
+        let mut cpu = Cpu::new_on_device(0x00a0_0000, Endian::Little, 0, fabric);
+        cpu.step_cycle();
+        assert_eq!(cpu.pc(), 0x00a0_0000);
+        assert_eq!(cpu.cycles(), 0);
+        assert_eq!(cpu.packets_executed(), 0);
+        assert_eq!(
+            cpu.fault(),
+            Some(
+                "strict physical-memory: fetch of 32 bytes by Core(0) at 0x00a00000 enters a \
+                 reserved, unsupported, or cache-converted range at 0x00a00000 (reported on \
+                 core 0, the core that made the access; stopped at PC 0x00a00000, cycle 0)"
+            )
+        );
+    }
+
+    #[test]
+    fn a_strict_fetch_is_checked_again_after_a_peer_carves_the_packet_it_holds() {
+        for (memory, code, config, value) in PEER_CARVES {
+            let cpu = run_through_a_peer_carve(true, (code, config, value));
+            // The execute packet was not issued: the core stopped on it, inside the fetch
+            // packet that was refused, its cycle count frozen there.
+            let pc = cpu.pc();
+            assert_eq!(pc & !0x1f, code, "{memory}");
+            let cycles = cpu.cycles();
+            assert_eq!(
+                cpu.fault(),
+                Some(
+                    format!(
+                        "strict physical-memory: fetch of 32 bytes by Core(0) at 0x{code:08x} \
+                         enters a reserved, unsupported, or cache-converted range at \
+                         0x{code:08x} (reported on core 0, the core that made the access; \
+                         stopped at PC 0x{pc:08x}, cycle {cycles})"
+                    )
+                    .as_str()
+                ),
+                "{memory}"
+            );
+            assert!(cycles < 10, "{memory}: {cycles}");
+            // Nothing guest-visible: no IERR bit, and no exception taken.
+            assert_eq!(cpu.control.peek(0x1f, cpu.pc()), 0, "{memory}");
+        }
+    }
+
+    /// SPRS276M Table 2-2: byte and halfword accesses may end exactly at L2's end.
+    #[test]
+    fn strict_narrow_accesses_at_the_l2_end() {
+        for (store, load, address, value, bytes) in [
+            (0x0010_0234, 0x0090_0224, 0x009f_ffff, 0x35, vec![0x35]),
+            (
+                0x0010_0254,
+                0x0090_0244,
+                0x009f_fffe,
+                0x1235,
+                vec![0x35, 0x12],
+            ),
+        ] {
+            let mut fabric = Box::new(crate::system::Fabric::new(&crate::device::C6455));
+            fabric.set_strict_physical_memory(true);
+            let mut cpu = Cpu::new_on_device(0x0080_0000, Endian::Little, 0, fabric);
+            cpu.write_words(0x0080_0000, &[store, 0, 0, 0, 0, load, 0, 0]);
+            cpu.set_register("A4", address).unwrap();
+            cpu.set_register("A0", value).unwrap();
+            for _ in 0..12 {
+                cpu.step_cycle();
+            }
+            assert_eq!(cpu.fault(), None);
+            assert_eq!(cpu.host_read_bytes(address, bytes.len()), bytes);
+            assert_eq!(cpu.read_bank(crate::view::Bank::A, 1), value);
+        }
+    }
+
+    /// A doubleword store is admitted a word at a time, as the MPU admits it: a C6455 STNDW
+    /// whose second word crosses the end of L2 into reserved space stores its first word, has
+    /// its second refused and reported, and counts only the store that landed.
+    #[test]
+    fn a_strict_doubleword_store_is_checked_word_by_word() {
+        const STNDW: u32 = 0x0090_0374; // STNDW.D1T1 A1:A0,*+A4[0]
+        const CODE: u32 = 0x0080_0000;
+        const STRADDLE: u32 = 0x009f_fffc;
+        let mut fabric = Box::new(crate::system::Fabric::new(&crate::device::C6455));
+        fabric.set_strict_physical_memory(true);
+        let mut cpu = Cpu::new_on_device(CODE, Endian::Little, 0, fabric);
+        cpu.write_words(CODE, &[STNDW, 0, 0, 0, 0, 0, 0, 0]);
+        cpu.set_register("A4", STRADDLE).unwrap();
+        cpu.set_register("A0", 0x4433_2211).unwrap();
+        cpu.set_register("A1", 0x8877_6655).unwrap();
+        for _ in 0..20 {
+            cpu.step_cycle();
+        }
+        assert_eq!(
+            cpu.fault(),
+            Some(
+                "strict physical-memory: write of 4 bytes by Core(0) at 0x00a00000 enters a \
+                 reserved, unsupported, or cache-converted range at 0x00a00000 (reported on \
+                 core 0, the core that made the access; stopped at PC 0x00800004, cycle 1)"
+            )
+        );
+        assert_eq!(
+            cpu.host_read_bytes(STRADDLE, 8),
+            [0x11, 0x22, 0x33, 0x44, 0, 0, 0, 0]
+        );
+        assert_eq!(cpu.stats().stores, 1);
+    }
+
+    #[test]
+    fn a_permissive_fetch_keeps_the_packet_it_holds_across_a_peer_carve() {
+        for (memory, code, config, value) in PEER_CARVES {
+            let cpu = run_through_a_peer_carve(false, (code, config, value));
+            assert_eq!(cpu.fault(), None, "{memory}");
+            assert!(cpu.packets_executed() > 40, "{memory}");
+            assert_eq!(cpu.pc() & !0x1f, code, "{memory}");
         }
     }
 }

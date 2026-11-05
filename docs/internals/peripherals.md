@@ -72,8 +72,27 @@ active register set contains a previously processed transfer request".
 registers, channel 1 moves blocks between local memories. IDMA is not routed like a DMA master:
 it lives inside the megamodule, so it is reached through the megamodule's own configuration
 space, and its completion is the `PortWrite::Event` case above — the port raises the event and
-the router latches it. Its interaction with the caches is in
+the router latches it. Its transfers still move as a master's, protection and the L1D snoop
+included, under the PrivID of its core and the privilege mode its CPU started it in; on the
+C6472 a local window address names the IDMA's own core's memory, carried to the fabric as that
+core's global alias. Its interaction with the caches is in
 [Memory and caches](memory-and-caches.md).
+
+A transfer is judged when the COUNT write submits it. Channel 1's source (unless it fills) and
+destination, and channel 0's local end, must lie wholly inside one of the megamodule's L2, L1P
+or L1D SRAM windows; channel 0's other end must be in the external configuration space
+`0200 0000h`–`03FF FFFFh`, and a channel 1 count must be a whole number of words. A transfer
+that is not is refused: nothing moves and the port raises the IDMA error event, 97. The windows
+are the device's, from its `AddressMap` (`AddressMap::local_sram_windows`): 2 MB of L2 on the
+C6455 and 608 KB on the C6472, so on the C6472 an address from `0089 8000h` up to the C6455's
+`00A0 0000h` is refused like any other address outside them, rather than accepted and lost to
+sparse storage. The windows are whole: SRAM the cache configuration has converted into cache is
+still local to this check. SPRU871K says that "DMA/IDMA cannot access L1P cache" (section
+2.9.1.3) and that IDMA accesses "to addresses held in L2 cache are not checked" by memory
+protection (section 4.6.1), but not what the IDMA does with such an address, so the model keeps
+its existing behaviour and accepts the transfer; with `C64XEMU_STRICT_PHYSICAL_MEMORY=1` the
+step that reaches the carve is then refused and stops the run (see
+[Memory and caches](memory-and-caches.md#strict-physical-memory)).
 
 ## Timers
 

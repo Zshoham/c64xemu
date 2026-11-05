@@ -412,7 +412,7 @@ described. The messages `run` can fail with:
 | `stopped at breakpoint 0x… NAME` | A `--break` address was reached. |
 | `cycle limit N reached at PC 0x…` | `--max-cycles` was exhausted. |
 | `fetch left the image at PC 0x…` | `--trap-oob` fired; the stderr lines above it name the trail. |
-| the fault text | The CPU refused to execute something. Preceded on stderr by `fault: …` and, with `--pc-trail`, the trail. |
+| the fault text | The CPU refused to execute something, or `C64XEMU_STRICT_PHYSICAL_MEMORY=1` refused an access (the text starts `strict physical-memory:`). Preceded on stderr by `fault: …` and, with `--pc-trail`, the trail. |
 
 ```console
 $ c64xemu run tests/firmware/bios_kernel/build/bios_kernel.out --max-cycles 1000 >/dev/null
@@ -431,6 +431,12 @@ SIGTERM is the exception. `run` installs a handler (`install_termination_handler
 exiting with the program's `exit_code`. SIGINT is deliberately left at its default so Ctrl-C keeps
 its meaning, and only the batch runner installs the handler — the interactive front ends keep
 their own control of the terminal.
+
+One diagnostic is an environment variable rather than an option: with
+`C64XEMU_STRICT_PHYSICAL_MEMORY=1` (only the exact value `1`), an access to a documented on-chip
+hole or to cache-converted SRAM is refused and stops the run as a fault — the last row of the
+table above. The state report is written, with a `strict_violation` member describing the access,
+and `run` exits 1. See [Debugging](debugging.md#recipes).
 
 For a first run end to end see [Getting started](getting-started.md); for what the machine, the
 run loop and the halt rule are, see [Architecture](../internals/architecture.md).

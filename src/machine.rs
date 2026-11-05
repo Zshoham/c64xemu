@@ -208,6 +208,8 @@ pub struct MachineSnapshot {
     pub breakpoint: Option<BreakpointHit>,
     /// Parked on the program's exit point, which is what "the program finished" means.
     pub at_stop: bool,
+    /// The focused core's fault, or the fault of the core a strict physical-memory violation
+    /// stopped the run on (`Machine::fault`).
     pub fault: Option<String>,
     /// The SPLOOP buffer is live, which `TSR.SPLX` mirrors.
     pub loop_active: bool,
@@ -745,6 +747,9 @@ impl Machine {
     /// Evaluate machine-native conditions before driver conditions, once per cycle.
     /// The budget-only path batches cycles without changing that halt precedence.
     fn run_until_stop(&mut self, conditions: &mut [StopCondition]) -> Result<StopReason, String> {
+        // A strict physical-memory violation made before the run - by a boot table, a host or
+        // a debugger read - stops it before its first cycle.
+        self.device.latch_strict_violation();
         let start_cycles = self.run_clock();
         let start_packets = self.device.cpu_mut().packets_executed();
         if !self.host.history_enabled() && !self.trace_exceptions && !self.coherence_check {
@@ -753,7 +758,7 @@ impl Machine {
             }
         }
         loop {
-            if self.device.cpu_mut().fault().is_some() {
+            if self.fault().is_some() {
                 return Ok(StopReason::Fault);
             }
             if self.at_stop() {
@@ -802,7 +807,7 @@ impl Machine {
             if termination_requested() {
                 return Ok(StopReason::Terminated);
             }
-            if self.device.cpu_mut().fault().is_some() {
+            if self.fault().is_some() {
                 return Ok(StopReason::Fault);
             }
             if self.at_stop() {
@@ -844,8 +849,40 @@ impl Machine {
         self.device.cpu().cycles()
     }
 
+    /// The fault of the core a strict physical-memory violation is reported on, once it has
+    /// taken it - carrying any fault that core already had - so a front end stops for it
+    /// whichever core it is looking at; otherwise the focused core's.
     pub fn fault(&self) -> Option<&str> {
-        self.device.cpu().fault()
+        self.device
+            .strict_violation()
+            .and_then(|violation| self.device.core(violation.reported_core).fault())
+            .or_else(|| self.device.cpu().fault())
+    }
+
+    /// The strict physical-memory violation that stopped the run, for the state report: what was
+    /// refused, the core it is reported on and what that core is to it, and where that core
+    /// stopped. `None` while the diagnostic is off or nothing has been refused.
+    pub fn strict_violation_json(&self) -> Option<Value> {
+        let violation = self.device.strict_violation()?;
+        let core = violation.reported_core;
+        // Where the core stopped when it took the fault; a violation no core has taken yet -
+        // only possible between the access and the next latch - reports the core as it is.
+        let (pc, cycles) = violation.stopped.unwrap_or_else(|| {
+            let cpu = self.device.core(core);
+            (cpu.pc(), cpu.cycles())
+        });
+        Some(json!({
+            "message": violation.message(),
+            "operation": violation.operation,
+            "length": violation.length,
+            "requester": violation.requester(),
+            "start": format!("0x{:08x}", violation.start),
+            "first": violation.first.map(|first| format!("0x{first:08x}")),
+            "core": core,
+            "role": violation.role(),
+            "pc": pc,
+            "cycles": cycles,
+        }))
     }
 
     /// One register of the focused core, for a watchpoint that samples a single one.
@@ -923,6 +960,8 @@ impl Machine {
     /// wants: the cache, interrupt-selector, event-flag and cacheability views, the memory
     /// window, and the hotspot histogram. Those are their own operations.
     pub fn snapshot(&mut self) -> MachineSnapshot {
+        self.device.latch_strict_violation();
+        let fault = self.fault().map(str::to_owned);
         let focus = self.focus();
         let cores = (0..self.cores())
             .map(|core| CoreSummary {
@@ -945,7 +984,7 @@ impl Machine {
             halted: cpu.halted(),
             breakpoint,
             at_stop,
-            fault: cpu.fault().map(str::to_owned),
+            fault,
             loop_active: cpu.loop_active(),
             stats: cpu.stats().counters(),
             last_issue: cpu.last_issue().to_vec(),
@@ -1178,6 +1217,11 @@ impl Machine {
             "cores": snapshot.cores,
             "stats": snapshot.stats,
         });
+        // Only a run strict physical-memory mode stopped carries this, so a report without the
+        // diagnostic is unchanged.
+        if let Some(violation) = self.strict_violation_json() {
+            state["strict_violation"] = violation;
+        }
         match self.stack_window {
             Some(StackWindow::Core { core, .. }) => {
                 state["stack_observation"] = json!(self.stack_observation_json(core));
@@ -1590,6 +1634,150 @@ mod tests {
         let mut conditions: [StopCondition; 0] = [];
         assert_eq!(machine.resume(&mut conditions).unwrap(), StopReason::Fault);
         assert!(machine.device.cpu_mut().fault().is_some());
+    }
+
+    /// SPRU871K chapter 5: IDMA continues independently of a faulted CPU.
+    #[test]
+    fn strict_idma_preserves_an_existing_fault() {
+        let mut machine = Machine::bare(Cpu::new(0));
+        machine.device =
+            Device::with_boot_mode(&crate::device::C6472, 0x0080_0000, Endian::Little, 0);
+        machine.device.with_core(3, |cpu| {
+            cpu.write_words(0x0080_0000, &[0, 0x5645_4314]);
+            for _ in 0..4 {
+                cpu.step_cycle();
+            }
+        });
+        assert_eq!(
+            machine.device.core(3).fault(),
+            Some("invalid opcode at 0x00800004: 0x56454314")
+        );
+        machine.device.fabric().set_strict_physical_memory(true);
+        {
+            let fabric = machine.device.fabric();
+            fabric.write32(3, 0x0184_0000, 1);
+            for (address, value) in [
+                (0x0182_0108, 0x0080_1000),
+                (0x0182_010c, 0x0089_7ffc),
+                (0x0182_0110, 4),
+            ] {
+                fabric.write32(3, address, value);
+            }
+            for _ in 0..20 {
+                fabric.tick_once();
+            }
+        }
+        machine.device.latch_strict_violation();
+        let expected = "strict physical-memory: IDMA write of 4 bytes by the IDMA of Core(3) at 0x13897ffc enters a reserved, unsupported, or cache-converted range at 0x13897ffc (reported on core 3, the core whose IDMA made the access; stopped at PC 0x00800008, cycle 2); original fault: invalid opcode at 0x00800004: 0x56454314";
+        assert_eq!(machine.fault(), Some(expected));
+        assert_eq!(
+            machine.resume(&mut [StopCondition::Budget(10)]).unwrap(),
+            StopReason::Fault
+        );
+        assert_eq!(machine.fault(), Some(expected));
+    }
+
+    /// A strict physical-memory violation on a core the front end is not looking at still
+    /// stops the run as a fault, and the state report names it: the message, the core it is
+    /// reported on and why, and where that core stopped.
+    #[test]
+    fn a_strict_violation_on_another_core_stops_the_run_and_is_reported() {
+        let mut machine = Machine::bare(Cpu::new(0));
+        machine.device =
+            Device::with_boot_mode(&crate::device::C6472, 0x0080_0000, Endian::Little, 0);
+        machine.device.fabric().set_strict_physical_memory(true);
+        let mut code = 0x0080_0264u32.to_le_bytes().to_vec();
+        code.resize(1024, 0);
+        machine.device.load_image(0x0080_0000, &code);
+        for core in 0..6 {
+            let pointer = if core == 5 { 0x00a0_0000 } else { 0x0080_1000 };
+            machine
+                .device
+                .with_core(core, |cpu| cpu.set_register("A0", pointer).unwrap());
+        }
+        for budget in [StopCondition::Budget(1000), StopCondition::Packets(1000)] {
+            let mut conditions = [budget];
+            assert_eq!(machine.resume(&mut conditions).unwrap(), StopReason::Fault);
+        }
+        let fault = machine.fault().expect("the run's fault").to_owned();
+        assert!(
+            fault.starts_with("strict physical-memory: read of 4 bytes by Core(5)"),
+            "{fault}"
+        );
+        assert_eq!(machine.device.cpu().fault(), None);
+        let state = machine.state_json(false);
+        assert_eq!(state["fault"], json!(fault));
+        let violation = &state["strict_violation"];
+        assert_eq!(violation["core"], json!(5));
+        assert_eq!(violation["requester"], json!("Core(5)"));
+        assert_eq!(violation["operation"], json!("read"));
+        assert_eq!(violation["start"], json!("0x00a00000"));
+        assert_eq!(violation["first"], json!("0x00a00000"));
+        assert_eq!(violation["role"], json!("the core that made the access"));
+        assert_eq!(violation["pc"], json!(0x0080_0004));
+        assert_eq!(violation["cycles"], json!(1));
+        assert_eq!(state["cores"][5]["fault"], json!(fault));
+        assert_eq!(state["cores"][0]["fault"], json!(null));
+    }
+
+    /// The reviewer's case: on a C6472 focused on core 2, a system master's violation is
+    /// latched on core 2; focusing core 4 afterwards changes neither the attribution nor the
+    /// PC and cycle reported, `Machine::fault` still answers, and no snapshot hands the
+    /// violation to core 4.
+    #[test]
+    fn a_masters_strict_violation_does_not_follow_the_focus() {
+        use crate::system::{MasterAccess, Privilege};
+        let mut machine = Machine::bare(Cpu::new(0));
+        machine.device =
+            Device::with_boot_mode(&crate::device::C6472, 0x0080_0000, Endian::Little, 0);
+        machine.device.fabric().set_strict_physical_memory(true);
+        machine.device.load_image(0x0080_0000, &[0; 1024]);
+        machine.set_focus(2);
+        let mut conditions = [StopCondition::Budget(10)];
+        assert_eq!(machine.resume(&mut conditions).unwrap(), StopReason::Budget);
+        let (pc, cycles) = (machine.pc(), machine.cycles());
+        assert!(cycles >= 10);
+        machine
+            .device
+            .fabric()
+            .read(Privilege::ID0_SUPERVISOR, 0x0080_0000, 4);
+        let mut conditions = [StopCondition::Budget(10)];
+        assert_eq!(machine.resume(&mut conditions).unwrap(), StopReason::Fault);
+        let fault = machine.fault().expect("core 2's fault").to_owned();
+        assert!(
+            fault.contains("reported on core 2, the focused core"),
+            "{fault}"
+        );
+        assert!(
+            fault.ends_with(&format!("stopped at PC 0x{pc:08x}, cycle {cycles})")),
+            "{fault}"
+        );
+
+        machine.set_focus(4);
+        assert_eq!(machine.fault(), Some(fault.as_str()));
+        let snapshot = machine.snapshot();
+        assert_eq!(snapshot.fault.as_deref(), Some(fault.as_str()));
+        assert_eq!(snapshot.cores[2].fault.as_deref(), Some(fault.as_str()));
+        assert_eq!(snapshot.cores[4].fault, None);
+        let state = machine.state_json(false);
+        assert_eq!(state["fault"], json!(fault));
+        let violation = &state["strict_violation"];
+        assert_eq!(violation["core"], json!(2));
+        assert_eq!(violation["pc"], json!(pc));
+        assert_eq!(violation["cycles"], json!(cycles));
+        assert_eq!(state["cores"][4]["fault"], json!(null));
+        // Running again stops at once, still on core 2.
+        let mut conditions = [StopCondition::Budget(10)];
+        assert_eq!(machine.resume(&mut conditions).unwrap(), StopReason::Fault);
+        assert_eq!(machine.device.core(4).fault(), None);
+        assert_eq!(machine.device.core(2).fault(), Some(fault.as_str()));
+    }
+
+    /// Without the diagnostic the report carries no `strict_violation` member at all.
+    #[test]
+    fn a_report_without_a_strict_violation_has_no_member_for_it() {
+        let mut machine = Machine::bare(Cpu::new(0));
+        assert!(machine.state_json(false).get("strict_violation").is_none());
     }
 
     /// Inspecting memory must not change what the program will observe. Reading through the

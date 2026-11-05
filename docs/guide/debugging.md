@@ -190,6 +190,48 @@ The same run without the writeback transmits whatever memory held, exactly as si
 report is what says why. The three kinds and the rule behind each are in
 [Memory and caches](../internals/memory-and-caches.md#the-coherence-check).
 
+**Data vanishes into memory that is not there.** Writes to a reserved address, or to SRAM the
+cache configuration has taken over, are dropped or land in sparse storage without complaint.
+Set `C64XEMU_STRICT_PHYSICAL_MEMORY=1` (only the exact value `1` enables it) and any CPU access,
+instruction fetch, boot-ROM read, DMA transfer or IDMA step that reaches a documented on-chip
+hole or a cache-converted range is refused - it has no effect - and stops the run as a fault at
+the end of that cycle. The fault names the operation, its length, the requester, the address and
+the first address in the hole, then the core it is reported on and where that core stopped:
+
+```console
+$ C64XEMU_STRICT_PHYSICAL_MEMORY=1 c64xemu run IMAGE >state.json
+fault: strict physical-memory: read of 4 bytes by Core(0) at 0x00a00000 enters a reserved, unsupported, or cache-converted range at 0x00a00000 (reported on core 0, the core that made the access; stopped at PC 0x00800870, cycle 17)
+c64xemu: strict physical-memory: read of 4 bytes by Core(0) at 0x00a00000 …
+$ echo $?
+1
+$ jq .strict_violation state.json
+{
+  "core": 0,
+  "cycles": 17,
+  "first": "0x00a00000",
+  "length": 4,
+  "message": "strict physical-memory: read of 4 bytes by Core(0) at 0x00a00000 enters a reserved, unsupported, or cache-converted range at 0x00a00000",
+  "operation": "read",
+  "pc": 8390768,
+  "requester": "Core(0)",
+  "role": "the core that made the access",
+  "start": "0x00a00000"
+}
+```
+
+The state report is the normal one: registers, `cores`, statistics. On a six-core device the
+violation is reported on the core that made the access, or whose IDMA did, even when another core
+is focused; `fault` at the top of the report and that core's entry in `cores` both carry it. A
+system master - EDMA3, HPI, EMAC, UTOPIA - has no core, so its violation is reported on the
+core that was focused when the master made the access, and `role` says so: that core's PC is
+where the program was, not what made the access. The core, PC and cycle reported are fixed when
+the run stops; focusing another core afterwards does not move them. Only the first violation is reported. The console debugger prints it as `fault: …` and
+stops, and stays stopped until `reload`; the GDB stub answers SIGILL and prints the text on its
+own stderr. Nothing guest-visible records it - no exception, interrupt or error event - so the
+program cannot handle it. External and unmodelled sparse space stays permissive. Which ranges
+count, and exactly what a refused access does, is in
+[Memory and caches](../internals/memory-and-caches.md#strict-physical-memory).
+
 **The cycle count is too high.** `--perf` attributes the cycles to stall classes, and `cache` in
 the REPL shows what is resident. The costs each class charges, and the manual rule behind each,
 are in [Execution and timing](../internals/execution.md).

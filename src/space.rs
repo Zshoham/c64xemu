@@ -91,7 +91,24 @@ pub(crate) struct AddressMap {
     global_stride: u32,
     /// The DDR2 window.
     dram: Window,
+    /// The internal range, from 0000 0000h up to the configuration space at 0180 0000h, that
+    /// holds only the device's own memories: every address in it that none of the windows above
+    /// answers for the requester is reserved (SPRS276M and SPRS612G Table 2-2).
+    internal: Window,
+    /// On-chip ROM inside `internal` that the model does not back. It is real memory, served
+    /// sparsely, so it is not a hole.
+    unbacked_rom: Window,
+    /// The global alias region, including the reserved slots past the last core's: every address
+    /// in it that no core's alias names is reserved. Empty without global aliases.
+    global_region: Window,
 }
+
+/// Everything below the configuration space at 0180 0000h is the megamodule's own memories and
+/// the reserved space between them, on both devices (SPRS276M and SPRS612G Table 2-2).
+const INTERNAL: Window = Window {
+    base: 0,
+    bytes: 0x0180_0000,
+};
 
 /// The C6455: one megamodule, 2 MB of L2 SRAM, no global aliases and no shared memory
 /// (SPRS276M section 2.3, Table 2-2).
@@ -117,6 +134,13 @@ pub(crate) const C6455_MAP: AddressMap = AddressMap {
         base: 0xe000_0000,
         bytes: 0x1000_0000,
     },
+    internal: INTERNAL,
+    // The boot ROM, 0010 0000h-0010 7FFFh (SPRS276M Table 2-2), which the model leaves sparse.
+    unbacked_rom: Window {
+        base: 0x0010_0000,
+        bytes: 32 * 1024,
+    },
+    global_region: Window::none(),
 };
 
 /// The C6472: six megamodules with 608 KB of L2 SRAM each, 768 KB of shared L2 RAM and 768 KB
@@ -155,9 +179,52 @@ pub(crate) const C6472_MAP: AddressMap = AddressMap {
         base: 0xe000_0000,
         bytes: 0x2000_0000,
     },
+    internal: INTERNAL,
+    unbacked_rom: Window::none(),
+    // Six alias slots and the reserved space after them, through 1FFF FFFFh (SPRS612G
+    // Table 2-2).
+    global_region: Window {
+        base: 0x1000_0000,
+        bytes: 0x1000_0000,
+    },
 };
 
 impl AddressMap {
+    /// Whether an access is in a documented on-chip hole: an address in the internal range or
+    /// the global alias region that no memory answers for this requester. That covers the
+    /// reserved gaps between the local windows, the tails of each window past the memory it
+    /// holds, a C6472 alias slot's gaps and the reserved slots after the sixth, and - because a
+    /// DMA master has no local view on a device with global aliases (SPRS612G Table 2-2) - a
+    /// C6472 master's use of any local-only address, the shared ROM and RAM windows included.
+    /// Sparse addresses elsewhere may be external memory on a board, so they are never holes.
+    pub(crate) fn known_hole(&self, requester: Requester, address: u32) -> bool {
+        let reserved =
+            self.internal.offset(address).is_some() || self.global_region.offset(address).is_some();
+        reserved
+            && self.unbacked_rom.offset(address).is_none()
+            && self.placement(requester, address) == Placement::Sparse
+    }
+
+    /// A core's global alias for an address in its own L2, L1P or L1D window, on a device that
+    /// has aliases: the inverse of `local_of_global`.
+    pub(crate) fn global_of_local(&self, core: usize, address: u32) -> Option<u32> {
+        let base = self.global_alias_base(core)?;
+        let local = self.l2.offset(address).is_some()
+            || self.l1p.offset(address).is_some()
+            || self.l1d.offset(address).is_some();
+        local.then_some(base + address)
+    }
+
+    /// The local L2, L1P and L1D SRAM windows as `base..end` ranges, whole: the memory each
+    /// window holds before any of it is converted into cache. Every core has the same ones.
+    pub(crate) const fn local_sram_windows(&self) -> [std::ops::Range<u32>; 3] {
+        [
+            self.l2.base..self.l2.base + self.l2.bytes,
+            self.l1p.base..self.l1p.base + self.l1p.bytes,
+            self.l1d.base..self.l1d.base + self.l1d.bytes,
+        ]
+    }
+
     pub(crate) const fn l2_bytes(&self) -> u32 {
         self.l2.bytes
     }
@@ -458,6 +525,37 @@ mod tests {
         for address in [0x0020_0000, 0x0080_0000, 0x1020_0000, 0xe000_0000] {
             assert_eq!(C6455_MAP.shared_ram_offset(address), None);
             assert_eq!(C6455_MAP.shared_ram_alias(address), None);
+        }
+    }
+
+    #[test]
+    fn a_core_names_its_own_local_memory_globally_by_its_alias() {
+        assert_eq!(C6472_MAP.global_of_local(3, 0x0080_0b80), Some(0x1380_0b80));
+        assert_eq!(C6472_MAP.global_of_local(5, 0x00e0_0000), Some(0x15e0_0000));
+        assert_eq!(C6472_MAP.global_of_local(1, 0x00f0_7ffc), Some(0x11f0_7ffc));
+        // Past the 608 KB, and the shared memories, which belong to no core.
+        assert_eq!(C6472_MAP.global_of_local(3, 0x0089_8000), None);
+        assert_eq!(C6472_MAP.global_of_local(3, 0x0020_0000), None);
+        assert_eq!(C6472_MAP.global_of_local(3, 0x0010_0000), None);
+        // A device without aliases has no other name for anything.
+        assert_eq!(C6455_MAP.global_of_local(0, 0x0080_0000), None);
+    }
+
+    #[test]
+    fn a_known_hole_is_reserved_space_no_memory_answers() {
+        // The local-only shared memories are memory to a core and a hole to a C6472 master.
+        for address in [0x0010_0000, 0x0020_0000, 0x0080_0000] {
+            assert!(!C6472_MAP.known_hole(Requester::Core(2), address));
+            assert!(C6472_MAP.known_hole(Requester::Dma, address));
+        }
+        // The C6455 boot ROM is unbacked but real, and its masters share the CPU's view.
+        assert!(!C6455_MAP.known_hole(Requester::Dma, 0x0010_7ffc));
+        assert!(C6455_MAP.known_hole(Requester::Dma, 0x0010_8000));
+        assert!(!C6455_MAP.known_hole(Requester::Dma, 0x0080_0000));
+        // Unmodelled space outside the internal range and the alias region is never a hole.
+        for address in [0x0180_0000, 0x2000_0000, 0x7000_0000, 0xa000_0000] {
+            assert!(!C6455_MAP.known_hole(Requester::Core(0), address));
+            assert!(!C6472_MAP.known_hole(Requester::Dma, address));
         }
     }
 }

@@ -208,7 +208,10 @@ else changes inside a batch, so the masks always equal a fresh scan. Held-in-res
 state and is read at the moment of the test, as the halt rule requires.
 
 For a positive request, a zero count means a batch boundary is already due, or the single
-core already has a fault. The machine returns to its stop checks and CIO handshake; it never
+core already has a fault. A strict physical-memory violation (see
+[Memory and caches](memory-and-caches.md#strict-physical-memory)) also ends a batch after the
+cycle that made it, in both forms, and the device hands it to the core it is reported on as that
+core's fault (`Device::latch_strict_violation`) before the machine looks. The machine returns to its stop checks and CIO handshake; it never
 repairs progress by stepping a CPU itself. CIO readiness deliberately includes held cores,
 matching the handshake scan, and answering it exempts the first device cycle of the next batch.
 
@@ -288,7 +291,7 @@ Given an address and a requester, this is which module answers:
 | CPU or master access to the shared L2 (C6472: `0x0020_0000..0x002c_0000`, or any core's global alias of it) | The same path as any memory, with the shared-memory controller (`src/smc.rs`) asked first: `Fabric::observe_sl2` for a CPU load, store or fetch that the megamodule's own caches do not answer, `note_sl2_transfer` for a master's transfer. A request wakes its page and a read is served in three wait states and counted by the requesting megamodule's profiler; the controller does not judge it |
 | LL, SL, CMTL | `CoreBus::load_link`/`store_link`/`commit_link` → `Fabric`: on SL2 the controller's monitor for the word's bank (SPRUEG5D Tables 3 and 4); elsewhere the megamodule's own `LinkReservation` against `Backing`'s write stamps. The CPU holds no reservation |
 | User-mode CPU write to an SMC register | `Fabric::check_access` → `SharedMemory::refuse_user_write`: the write is refused, SL2MPFSR/SL2MPFAR latch the megamodule, mode and address, and event 63 is raised in every megamodule on the next device tick |
-| System master (HPI, IDMA, EDMA3, EMAC, UTOPIA PDMA) to memory (`is_memory`) | `MasterAccess for Fabric` (`src/system/master.rs`): `read`/`write` under the `Privilege` the master passes - HPI and IDMA ID 0 supervisor, EMAC and PDMA ID 0 user, the EDMA3 the one stamped on the PaRAM set → `admit`: the unit of the megamodule that owns the page judges every byte, and the first protected byte latches the fault and refuses the whole access → `memory_bytes`/`store_memory_bytes`, with the L2 snoop |
+| System master (HPI, IDMA, EDMA3, EMAC, UTOPIA PDMA) to memory (`is_memory`) | `MasterAccess for Fabric` (`src/system/master.rs`): `read`/`write` under the `Privilege` the master passes - HPI ID 0 supervisor, EMAC and PDMA ID 0 user, IDMA the starting CPU's core index and mode, the EDMA3 the one stamped on the PaRAM set → `admit`: the unit of the megamodule that owns the page judges every byte, and the first protected byte latches the fault and refuses the whole access → `memory_bytes`/`store_memory_bytes`, with the L2 snoop |
 | A word or an element of a master (`read_word`, `read_element`, and the writes) | The same access, with the bytes assembled in one place: a word is its four bytes in the device's byte order, an element narrower than a word (a PDMA switch element) is the low bytes right-justified in that order; a refused read is `None` |
 | System master to a peripheral aperture (`!is_memory`) | `register_word`/`store_register_word`: the master's `Privilege` presented to the EDMA3 (`present_to_edma`) and `Shared::touched`, then the port walk; the megamodule registers (`0x0180_0000..0x01c0_0000`) read zero and ignore writes (SPRU871K section 5.3.1); anything else is device memory, which is also where a lent-out master's own aperture lands. Not protected: protection judges memory pages only. A byte access is assembled around whole register words, and a word access is one access to the register |
 | HPI host side | `Fabric::hpi_host_read`/`hpi_host_write` through `lend_hpi` → `hpi_read32`/`hpi_write32`, which drop accesses inside `DeviceProfile::host_excluded` (denied reads complete with zero) → `read_word`/`write_word` as ID 0 supervisor |
@@ -394,7 +397,7 @@ are always members and are checked first, in this order:
 
 | Order | Condition | `StopReason` |
 |---|---|---|
-| 1 | `Cpu::fault()` is set on the focused core | `Fault` |
+| 1 | `Machine::fault()`: the focused core's `Cpu::fault()` is set, or a strict physical-memory violation has stopped the run and set the fault of the core it is reported on | `Fault` |
 | 2 | `Machine::at_stop` - any core out of reset is about to fetch the exit point | `Exit` |
 | 3 | `Machine::halt_location` - any core out of reset stopped on an armed address | `Breakpoint(hit)` |
 | 4 | `StopCondition::Budget(cycles)`, zero meaning no limit | `Budget` |

@@ -58,8 +58,9 @@ pub struct Privilege {
 }
 
 impl Privilege {
-    /// The HPI's DMA and the IDMA: PrivID 0, supervisor (SPRS276M section 5.2, SPRS612G
-    /// Table 5-3).
+    /// The HPI's DMA: PrivID 0, supervisor (SPRS276M section 5.2, SPRS612G Table 5-3). An IDMA
+    /// transfer carries its initiating CPU's own identity instead (`Fabric::tick_idma`), which on
+    /// the C6455 is this one unless the CPU started it in user mode.
     pub const ID0_SUPERVISOR: Self = Self { id: 0, user: false };
     /// The EMACs and the UTOPIA PDMA: PrivID 0, always user (SPRS612G section 5.2: "For most
     /// peripheral masters (EMAC0, EMAC1, UTOPIA, TSIP0, TSIP1, and TSIP2), the privilege mode
@@ -319,8 +320,9 @@ impl Fabric {
     }
 
     /// DMA accesses carry a requestor PrivID rather than LOCAL, and the privilege mode the
-    /// master transfers in. IDMA, the HPI's DMA, the UTOPIA PDMA and the EMACs use ID 0; an
-    /// EDMA3 transfer carries the identity stamped on its PaRAM set. The unit consulted belongs
+    /// master transfers in. The HPI's DMA, the UTOPIA PDMA and the EMACs use ID 0; an IDMA
+    /// transfer carries the PrivID and mode of the CPU that started it, and an EDMA3 transfer
+    /// the identity stamped on its PaRAM set. The unit consulted belongs
     /// to whichever megamodule owns the memory, which on a multicore device is decided by the
     /// global address the master used.
     fn check_dma_access(
@@ -364,7 +366,16 @@ impl Fabric {
     /// (SPRU862B section 2.4.2). External memory is not snooped at all. On a multicore device
     /// the line may be tagged with either the local or the global address, depending on which
     /// the core used, so both are looked for.
+    ///
+    /// A read strict mode refuses returns zeros and touches no cache, snoop or SL2 statistic.
     fn memory_bytes(&mut self, address: u32, length: usize) -> Vec<u8> {
+        if self
+            .shared
+            .backing
+            .strict_refuses(Requester::Dma, address, length, "DMA read")
+        {
+            return vec![0; length];
+        }
         self.note_sl2_transfer(address, length, true);
         self.note_coherence(address, length, false);
         let mut data = self
@@ -383,7 +394,16 @@ impl Fabric {
     /// A DMA write to L2 SRAM is snoop-written into L1D, so the CPU sees it without any cache
     /// operation. Outside L2 SRAM the CPU keeps its stale line, and maintaining that is the
     /// firmware's job (SPRU862B sections 2.4 and 2.6).
+    ///
+    /// A write strict mode refuses stores nothing, under any name.
     fn store_memory_bytes(&mut self, address: u32, bytes: &[u8]) {
+        if self
+            .shared
+            .backing
+            .strict_refuses(Requester::Dma, address, bytes.len(), "DMA write")
+        {
+            return;
+        }
         self.note_sl2_transfer(address, bytes.len(), false);
         self.shared.backing.note_memory_write(address, bytes.len());
         self.shared
@@ -512,6 +532,7 @@ impl MasterAccess for std::collections::BTreeMap<u32, u8> {
 mod tests {
     use super::*;
     use crate::device::{DeviceProfile, C6455, C6472};
+    use crate::memory::tests::take_strict_message;
     use crate::memory::{CoherenceHazard, DataCache, L1DCFG, L2CFG, MAR_BASE};
     use std::collections::BTreeMap;
 
@@ -525,8 +546,99 @@ mod tests {
     const PARAM: u32 = 0x02a0_4000;
     const ESR: u32 = 0x02a0_1010;
 
+    fn strict_fabric(profile: &'static DeviceProfile) -> Fabric {
+        let mut fabric = Fabric::new(profile);
+        fabric.shared.backing.set_strict_physical_memory(true);
+        fabric
+    }
+
+    /// A C6472 master names SL2, ROM and a core's L2 only through local-only addresses it does
+    /// not have (SPRS612G Table 2-2: 0020 0000h is "SL2 RAM (Local address map)"), so strict
+    /// mode refuses each at the fabric, naming the transfer and the address. A refused read
+    /// answers zeros - not a protection denial, which a master would see - and a refused write
+    /// stores nothing.
+    #[test]
+    fn strict_memory_refuses_c6472_local_only_addresses_on_the_fabric_dma_path() {
+        let mut fabric = strict_fabric(&C6472);
+        fabric.write(Privilege::ID0_SUPERVISOR, 0x1080_0000, &[7; 4]);
+        assert_eq!(
+            fabric.read(Privilege::ID0_SUPERVISOR, 0x0080_0000, 4),
+            Some(vec![0; 4])
+        );
+        assert!(fabric.strict_stopped());
+        assert_eq!(
+            take_strict_message(&mut fabric.shared.backing),
+            "strict physical-memory: DMA read of 4 bytes by Dma at 0x00800000 enters a \
+             reserved, unsupported, or cache-converted range at 0x00800000"
+        );
+        fabric.read(Privilege::ID0_SUPERVISOR, 0x0010_0000, 4);
+        let message = take_strict_message(&mut fabric.shared.backing);
+        assert!(
+            message.starts_with("strict physical-memory: DMA read of 4 bytes by Dma at 0x00100000"),
+            "{message}"
+        );
+        fabric.write(Privilege::ID0_SUPERVISOR, 0x0020_0000, &[1, 2, 3, 4]);
+        let message = take_strict_message(&mut fabric.shared.backing);
+        assert!(
+            message
+                .starts_with("strict physical-memory: DMA write of 4 bytes by Dma at 0x00200000"),
+            "{message}"
+        );
+        // The refused write stored nothing, under any name for SL2.
+        fabric.shared.backing.set_strict_physical_memory(false);
+        assert_eq!(
+            fabric.read(Privilege::ID0_SUPERVISOR, 0x1020_0000, 4),
+            Some(vec![0; 4])
+        );
+        assert_eq!(fabric.shared.backing.sparse_bytes(), 0);
+        // Nothing guest-visible records it: no megamodule has an event latched.
+        for core in 0..6 {
+            assert_eq!(
+                fabric.mm[core].event_flag_registers(),
+                [0; 4],
+                "core {core}"
+            );
+        }
+    }
+
+    /// The global alias of SL2 is the address a master uses, and strict mode lets it through.
+    #[test]
+    fn strict_memory_accepts_a_c6472_dma_through_the_global_alias() {
+        let mut fabric = strict_fabric(&C6472);
+        fabric.write(Privilege::ID0_SUPERVISOR, 0x1020_0000, &[1, 2, 3, 4]);
+        assert_eq!(
+            fabric.read(Privilege::ID0_SUPERVISOR, 0x1520_0000, 4),
+            Some(vec![1, 2, 3, 4])
+        );
+        assert_eq!(fabric.host_read_bytes(0, 0x0020_0000, 4), vec![1, 2, 3, 4]);
+        // So is a core's L2 through its own alias.
+        fabric.write(Privilege::ID0_SUPERVISOR, 0x1380_0000, &[5, 6, 7, 8]);
+        assert_eq!(fabric.host_read_bytes(3, 0x0080_0000, 4), vec![5, 6, 7, 8]);
+    }
+
+    /// A C6455 transfer whose last word runs past L2 SRAM into the reserved 00A0 0000h is
+    /// refused whole: the word that was in L2 is not written either.
+    #[test]
+    fn strict_memory_refuses_a_c6455_dma_span_that_crosses_into_a_hole() {
+        let mut fabric = strict_fabric(&C6455);
+        fabric.write(Privilege::ID0_SUPERVISOR, 0x009f_fff8, &[9; 8]);
+        assert!(!fabric.strict_stopped());
+        fabric.write(
+            Privilege::ID0_SUPERVISOR,
+            0x009f_fffc,
+            &[1, 2, 3, 4, 5, 6, 7, 8],
+        );
+        assert_eq!(
+            take_strict_message(&mut fabric.shared.backing),
+            "strict physical-memory: DMA write of 8 bytes by Dma at 0x009ffffc enters a \
+             reserved, unsupported, or cache-converted range at 0x00a00000"
+        );
+        assert_eq!(fabric.host_read_bytes(0, 0x009f_fff8, 8), vec![9; 8]);
+        assert_eq!(fabric.shared.backing.sparse_bytes(), 0);
+    }
+
     /// Every kind of master the device has, by the privilege its accesses carry: the HPI and
-    /// the IDMA (PrivID 0, supervisor), the EMACs and the UTOPIA PDMA (PrivID 0, user), and an
+    /// a C6455 IDMA transfer started in supervisor mode (PrivID 0, supervisor), the EMACs and the UTOPIA PDMA (PrivID 0, user), and an
     /// EDMA3 transfer made for the core that programmed it - which on the six-core device is
     /// not PrivID 0 (SPRS612G Table 5-3).
     fn masters(profile: &DeviceProfile) -> Vec<(&'static str, Privilege)> {
@@ -1033,7 +1145,7 @@ mod tests {
                 let context = format!("{} {name}", profile.name);
                 let mut fabric = Fabric::new(profile);
                 // Whoever last touched the bus - a user-mode core - is not the master.
-                assert!(fabric.check_access(cpu, ESR, Permission::Write, true));
+                assert!(fabric.check_access(cpu, ESR, Permission::Write, true, 4));
                 fabric.write_word(privilege, PARAM + 4, 0x1234_5678);
                 // The port took the word, and the set it wrote carries the master's own
                 // PRIV and PRIVID (SPRU966C section 2.10.2), not the CPU's.

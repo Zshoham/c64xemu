@@ -256,6 +256,14 @@ impl Session {
         self.machine.arm_halt(&breakpoints);
     }
 
+    /// A fault reaches the client only as SIGILL, so its text - a strict physical-memory
+    /// violation's included - goes to the emulator's own stderr.
+    fn report_fault(&self) {
+        if let Some(fault) = self.machine.fault() {
+            eprintln!("c64xemu: gdb stub: fault: {fault}");
+        }
+    }
+
     /// Runs until a breakpoint, the program's exit, a fault, the client's ^C, or the budget.
     fn resume(&mut self) -> String {
         let client = &mut self.client;
@@ -271,7 +279,10 @@ impl Session {
         ];
         let reply = match self.machine.resume(&mut conditions) {
             Ok(StopReason::Breakpoint(hit)) => breakpoint_stop(hit, self.machine.endian()),
-            Ok(StopReason::Fault) => ILLEGAL_INSTRUCTION.to_string(),
+            Ok(StopReason::Fault) => {
+                self.report_fault();
+                ILLEGAL_INSTRUCTION.to_string()
+            }
             Ok(StopReason::Exit) => self.exited(),
             Ok(StopReason::Interrupted) => INTERRUPT.to_string(),
             Ok(_) => TRAP.to_string(),
@@ -290,7 +301,10 @@ impl Session {
         let mut conditions = [StopCondition::Packets(1)];
         let reply = match self.machine.resume(&mut conditions) {
             Ok(StopReason::Breakpoint(hit)) => breakpoint_stop(hit, self.machine.endian()),
-            Ok(StopReason::Fault) => ILLEGAL_INSTRUCTION.into(),
+            Ok(StopReason::Fault) => {
+                self.report_fault();
+                ILLEGAL_INSTRUCTION.into()
+            }
             Ok(StopReason::Exit) => self.exited(),
             Ok(_) => TRAP.into(),
             Err(error) => {

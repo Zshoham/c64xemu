@@ -14,7 +14,7 @@ use crate::cpu::Cpu;
 use crate::ddr2::Ddr2Profile;
 use crate::events::{EventMap, C6455_EVENTS, C6472_EVENTS};
 use crate::hpi::HPI_BOOT_ENTRY;
-use crate::memory::CoherenceHazard;
+use crate::memory::{CoherenceHazard, StrictViolation};
 use crate::space::{AddressMap, C6455_MAP, C6472_MAP};
 use crate::system::{Endian, Fabric};
 use crate::utopia::{UtopiaProfile, C6455_UTOPIA, C6472_UTOPIA};
@@ -367,6 +367,7 @@ impl Device {
             cpus.push(cpu);
         }
         cpus.reverse();
+        fabric.set_strict_focus(profile.reset_core);
         cpus[profile.reset_core].attach(fabric);
         let boot = board.start(cpus[profile.reset_core].fabric_mut());
         Self {
@@ -479,7 +480,9 @@ impl Device {
         if core == self.focus {
             return;
         }
-        let fabric = self.cpus[self.focus].detach();
+        let mut fabric = self.cpus[self.focus].detach();
+        // A system master's strict violation is reported on the core focused when it is made.
+        fabric.set_strict_focus(core);
         self.cpus[core].attach(fabric);
         self.focus = core;
     }
@@ -522,10 +525,40 @@ impl Device {
 
     /// One device cycle: every core that is out of reset executes, and the shared peripherals
     /// advance once.
+    ///
+    /// Once strict physical-memory mode has refused an access, no further cycle runs.
     pub fn step_cycle(&mut self) {
         let mut fabric = self.cpus[self.focus].detach();
-        self.cycle_on(&mut fabric, None);
+        if !fabric.strict_stopped() {
+            self.cycle_on(&mut fabric, None);
+        }
+        self.latch_strict_violation_from(&mut fabric);
         self.cpus[self.focus].attach(fabric);
+    }
+
+    /// The first access strict physical-memory mode refused. The core it is reported on is
+    /// fixed in it (`StrictViolation::reported_core`), whatever the focus is now.
+    pub(crate) fn strict_violation(&self) -> Option<&StrictViolation> {
+        self.cpus[self.focus].fabric_ref().strict_violation()
+    }
+
+    /// Hand a strict physical-memory violation to the core it is reported on, as that core's
+    /// fault, so every front end stops and reports it the way it does any fault. Idempotent,
+    /// and it keeps whatever fault the core already had.
+    pub(crate) fn latch_strict_violation(&mut self) {
+        let mut fabric = self.cpus[self.focus].detach();
+        self.latch_strict_violation_from(&mut fabric);
+        self.cpus[self.focus].attach(fabric);
+    }
+
+    fn latch_strict_violation_from(&mut self, fabric: &mut Fabric) {
+        let Some(core) = fabric.strict_violation().map(|v| v.reported_core) else {
+            return;
+        };
+        let cpu = &mut self.cpus[core];
+        if let Some(violation) = fabric.latch_strict_stop(core, cpu.pc(), cpu.cycles()) {
+            cpu.latch_strict_violation(violation);
+        }
     }
 
     /// Run up to `cycles` cycles while no machine-level service is due, answering how many
@@ -558,14 +591,20 @@ impl Device {
         let mut fabric = self.cpus[self.focus].detach();
         let mut boundaries = Boundaries::scan(&self.cpus, cio);
         let start = self.cycle;
+        // A strict physical-memory violation ends the batch after the device cycle that made it,
+        // as a fault does. Whether the diagnostic is on is asked once per batch.
+        let strict = fabric.strict_on();
         for step in 0..cycles {
-            if boundaries.any_halted(&fabric) {
+            if (strict && fabric.strict_stopped()) || boundaries.any_halted(&fabric) {
                 break;
             }
             if boundaries.at_cio != 0 && !(step == 0 && ignore_cio_once) {
                 break;
             }
             self.cycle_on(&mut fabric, Some(&mut boundaries));
+        }
+        if fabric.strict_stopped() {
+            self.latch_strict_violation_from(&mut fabric);
         }
         self.cpus[self.focus].attach(fabric);
         self.cycle - start
@@ -1337,6 +1376,154 @@ mod tests {
         assert_eq!(device.run_cycles(4, None, false), 0);
         assert_eq!(device.cpu().cycles(), cycles);
         assert_eq!(device.cpu().pc(), pc);
+    }
+
+    /// `LDW *A0, A1` and then nothing but NOPs, in every core's L2, with strict physical-memory
+    /// checks on and A0 pointing each core at its own L2 - except core `bad`, which reads
+    /// `address`.
+    fn strict_c6472_loading(bad: usize, address: u32) -> Device {
+        let mut device = c6472();
+        device.fabric().set_strict_physical_memory(true);
+        let mut code = 0x0080_0264u32.to_le_bytes().to_vec();
+        code.resize(1024, 0);
+        device.load_image(0x0080_0000, &code);
+        for core in 0..6 {
+            let pointer = if core == bad { address } else { 0x0080_1000 };
+            device.with_core(core, |cpu| cpu.set_register("A0", pointer).unwrap());
+        }
+        device
+    }
+
+    /// A strict violation by one core's load ends the batch after the device cycle it was made
+    /// in - every core finishes that cycle, none starts another - and becomes that core's
+    /// fault, naming the access and where the core stopped. The load never writes back.
+    #[test]
+    fn a_strict_violation_stops_the_device_on_the_core_that_made_it() {
+        let mut device = strict_c6472_loading(3, 0x0089_8000);
+        assert_eq!(device.run_cycles(100, None, false), 1);
+        let violation = device.strict_violation().unwrap();
+        assert_eq!((violation.core(), violation.reported_core), (Some(3), 3));
+        for core in 0..6 {
+            assert_eq!(device.core(core).cycles(), 1, "core {core}");
+            if core != 3 {
+                assert_eq!(device.core(core).fault(), None, "core {core}");
+            }
+        }
+        assert_eq!(
+            device.core(3).fault(),
+            Some(
+                "strict physical-memory: read of 4 bytes by Core(3) at 0x00898000 enters a \
+                 reserved, unsupported, or cache-converted range at 0x00898000 (reported on \
+                 core 3, the core that made the access; stopped at PC 0x00800004, cycle 1)"
+            )
+        );
+        // The focused core is still core 0; it does not have the fault.
+        assert_eq!(device.focus(), 0);
+        assert_eq!(device.cpu().fault(), None);
+        // Nothing runs after it, however the device is driven.
+        assert_eq!(device.run_cycles(100, None, false), 0);
+        device.step_cycle();
+        for core in 0..6 {
+            assert_eq!(device.core(core).cycles(), 1, "core {core}");
+        }
+        assert_eq!(device.core(3).register('A', 1), 0);
+        // No exception and no IERR bit: the diagnostic is the emulator's.
+        assert_eq!(device.core(3).snapshot().control[0x1f], 0);
+    }
+
+    /// The first violation is the one reported, even when a later core makes another in the
+    /// same cycle.
+    #[test]
+    fn the_first_strict_violation_is_the_one_reported() {
+        let mut device = strict_c6472_loading(1, 0x0000_0000);
+        device.with_core(4, |cpu| cpu.set_register("A0", 0x0089_8000).unwrap());
+        device.run_cycles(100, None, false);
+        let violation = device.strict_violation().unwrap();
+        assert_eq!(violation.reported_core, 1);
+        assert_eq!(violation.start, 0);
+        assert!(device.core(1).fault().is_some());
+        assert_eq!(device.core(4).fault(), None);
+    }
+
+    /// A system master has no core of its own, so its violation is reported on the focused
+    /// core, saying that this core is only where the program was.
+    #[test]
+    fn a_masters_strict_violation_is_reported_on_the_focused_core() {
+        let mut device = strict_c6472_loading(usize::MAX, 0);
+        device.set_focus(2);
+        assert_eq!(
+            device
+                .fabric()
+                .read(Privilege::ID0_SUPERVISOR, 0x0080_0000, 4),
+            Some(vec![0; 4])
+        );
+        assert_eq!(device.run_cycles(100, None, false), 0);
+        assert_eq!(device.strict_violation().map(|v| v.reported_core), Some(2));
+        assert_eq!(device.core(2).fault(), Some(MASTER_FAULT_ON_CORE_2));
+    }
+
+    const MASTER_FAULT_ON_CORE_2: &str = "strict physical-memory: DMA read of 4 bytes by Dma at \
+        0x00800000 enters a reserved, unsupported, or cache-converted range at 0x00800000 \
+        (reported on core 2, the focused core; a system bus master made the access, not this \
+        core; stopped at PC 0x00800000, cycle 0)";
+
+    /// "Focused" means focused when the master made the access: moving the focus between the
+    /// access and the run loop noticing it, or after the fault is latched, moves nothing, and
+    /// latching again never hands the violation to a second core.
+    #[test]
+    fn a_masters_strict_violation_stays_on_the_core_focused_at_the_access() {
+        for refocus_before_latch in [false, true] {
+            let mut device = strict_c6472_loading(usize::MAX, 0);
+            device.set_focus(2);
+            device
+                .fabric()
+                .read(Privilege::ID0_SUPERVISOR, 0x0080_0000, 4);
+            if refocus_before_latch {
+                device.set_focus(4);
+            }
+            assert_eq!(device.run_cycles(100, None, false), 0);
+            device.set_focus(4);
+            device.latch_strict_violation();
+            device.step_cycle();
+            device.set_focus(0);
+            device.latch_strict_violation();
+            let context = format!("refocus before latch {refocus_before_latch}");
+            let violation = device.strict_violation().unwrap();
+            assert_eq!(violation.reported_core, 2, "{context}");
+            assert_eq!(violation.stopped, Some((0x0080_0000, 0)), "{context}");
+            assert_eq!(
+                device.core(2).fault(),
+                Some(MASTER_FAULT_ON_CORE_2),
+                "{context}"
+            );
+            for core in [0, 1, 3, 4, 5] {
+                assert_eq!(device.core(core).fault(), None, "{context} core {core}");
+            }
+        }
+    }
+
+    /// A single core runs its own batches; a violation stops it the same way.
+    #[test]
+    fn a_strict_violation_stops_a_single_core_batch() {
+        let entry = 0x0080_0000;
+        let mut device = Device::new(&C6455, entry, Endian::Little);
+        device.fabric().set_strict_physical_memory(true);
+        let mut code = 0x0080_0274u32.to_le_bytes().to_vec();
+        code.resize(1024, 0);
+        device.load_image(entry, &code);
+        device.cpu_mut().set_register("A0", 0x00a0_0000).unwrap();
+        device.cpu_mut().set_register("A1", 0x1234_5678).unwrap();
+        let ran = device.run_cycles(100, None, false);
+        let fault = device.cpu().fault().expect("a strict fault").to_owned();
+        assert!(
+            fault.starts_with(
+                "strict physical-memory: write of 4 bytes by Core(0) at 0x00a00000 enters"
+            ),
+            "{fault}"
+        );
+        assert_eq!(device.run_cycles(100, None, false), 0);
+        assert_eq!(device.cpu().cycles(), ran);
+        assert_eq!(device.fabric().host_read_bytes(0, 0x00a0_0000, 4), [0; 4]);
     }
 
     /// A held core executes nothing, but its memories still answer: that is how a host, or

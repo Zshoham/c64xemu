@@ -36,6 +36,7 @@ use crate::mcbsp::Mcbsp;
 use crate::mdio::Mdio;
 use crate::memory::{
     Backing, BoundHierarchy, CoherenceHazard, DataClock, LinkReservation, MemoryHierarchy,
+    StrictViolation,
 };
 use crate::pdma::{Pdma, MAX_BURST_WORDS};
 use crate::pll::{Pll, Pll2};
@@ -151,6 +152,11 @@ fn directly_routed_memory(address: u32) -> bool {
 /// power-down registers.
 const MEGAMODULE_REGISTERS: std::ops::Range<u32> = 0x0180_0000..0x01c0_0000;
 
+/// `Megamodule::cpu_checks`: some memory protection page restricts the CPU.
+const CPU_CHECK_MPU: u8 = 1 << 0;
+/// `Megamodule::cpu_checks`: the strict physical-memory diagnostic is on.
+const CPU_CHECK_STRICT: u8 = 1 << 1;
+
 fn mux_uses_combiner(value: u32) -> bool {
     (0..4).any(|slot| ((value >> (slot * 8)) & 0x7f) < 4)
 }
@@ -216,12 +222,14 @@ pub(crate) struct Megamodule {
     pdccmd: u32,
     l2_power_status: [u32; 2],
     /// Per-page attributes for L2, L1P and L1D, with the fault address and status each unit
-    /// latches. `restrictive` is false while every page still grants a CPU everything, which
-    /// is the reset state and lets the access path skip the check entirely.
+    /// latches.
     mpu_pages: [[u32; MPU_PAGES]; 3],
     mpu_fault_address: [u32; 3],
     mpu_fault_status: [u32; 3],
-    mpu_restrictive: bool,
+    /// Which of the CPU's slow access checks apply (`CPU_CHECK_MPU`, `CPU_CHECK_STRICT`). Zero
+    /// while every page still grants a CPU everything and the strict physical-memory diagnostic
+    /// is off, which is the reset state and lets the access path skip both with one test.
+    cpu_checks: u8,
     /// Whether any page has stopped granting every DMA requester id everything. The DMA check
     /// runs per byte, so the reset state has to cost nothing.
     mpu_dma_restrictive: bool,
@@ -262,7 +270,7 @@ impl Megamodule {
             mpu_pages: [[0x0000_ffff; MPU_PAGES]; 3],
             mpu_fault_address: [0; 3],
             mpu_fault_status: [0; 3],
-            mpu_restrictive: false,
+            cpu_checks: 0,
             mpu_dma_restrictive: false,
             mpu_lock_key: [[0; 4]; 3],
             mpu_lock_input: [[0; 4]; 3],
@@ -423,13 +431,8 @@ impl Megamodule {
 
     /// The megamodule's own configuration registers, except the ones the fabric has to see:
     /// `None` when the address is not one of them.
-    fn cfg_read(
-        &mut self,
-        address: u32,
-        profile: &'static DeviceProfile,
-        context: PortContext,
-    ) -> Option<u32> {
-        if let Some(value) = self.idma.read(address, context) {
+    fn cfg_read(&mut self, address: u32, profile: &'static DeviceProfile) -> Option<u32> {
+        if let Some(value) = self.idma.read(address) {
             return Some(value);
         }
         if let Some((bank, kind)) = intc_register(address) {
@@ -481,9 +484,8 @@ impl Megamodule {
         address: u32,
         value: u32,
         profile: &'static DeviceProfile,
-        context: PortContext,
     ) -> Option<CfgWrite> {
-        match self.idma.write(address, value, context) {
+        match self.idma.write(address, value, profile.map) {
             PortWrite::Unhandled => {}
             PortWrite::Done => return Some(CfgWrite::Done),
             PortWrite::Event(event) => return Some(CfgWrite::Event(event)),
@@ -592,11 +594,13 @@ impl Megamodule {
                 if let Some(value) = value {
                     if !self.mpu_locked[unit] {
                         self.mpu_pages[unit][index] = value & 0xffff;
-                        self.mpu_restrictive = self
+                        let restrictive = self
                             .mpu_pages
                             .iter()
                             .flatten()
                             .any(|page| page & MPPA_CPU_MASK != MPPA_CPU_MASK);
+                        self.cpu_checks = (self.cpu_checks & !CPU_CHECK_MPU)
+                            | if restrictive { CPU_CHECK_MPU } else { 0 };
                         self.mpu_dma_restrictive = self
                             .mpu_pages
                             .iter()
@@ -1195,7 +1199,7 @@ impl Fabric {
 
     /// A device strapped to a boot mode, which is what decides how many cores start.
     pub(crate) fn with_boot_mode(profile: &'static DeviceProfile, boot_mode: u8) -> Self {
-        Self {
+        let mut fabric = Self {
             profile,
             mm: (0..profile.cores())
                 .map(|core| Box::new(Megamodule::new(core, profile)))
@@ -1207,7 +1211,9 @@ impl Fabric {
             ticked_cycle: None,
             pending_nmi: 0,
             pending_release: 0,
-        }
+        };
+        fabric.sync_strict_cpu_checks();
+        fabric
     }
 
     /// One megamodule, for inspecting what it holds without disturbing it.
@@ -1307,28 +1313,120 @@ impl Fabric {
         self.mm[core].memory.bind(&mut self.shared.backing)
     }
 
+    /// Turn the strict physical-memory checks on or off without the environment variable.
+    #[cfg(test)]
+    pub(crate) fn set_strict_physical_memory(&mut self, on: bool) {
+        self.shared.backing.set_strict_physical_memory(on);
+        self.sync_strict_cpu_checks();
+    }
+
+    /// Make every megamodule's CPU access check follow the strict physical-memory switch, which
+    /// the backing store reads from the environment when the device is built.
+    fn sync_strict_cpu_checks(&mut self) {
+        let on = self.shared.backing.strict_physical_memory();
+        for mm in self.mm.iter_mut() {
+            mm.cpu_checks =
+                (mm.cpu_checks & !CPU_CHECK_STRICT) | if on { CPU_CHECK_STRICT } else { 0 };
+        }
+    }
+
+    /// Whether the strict physical-memory diagnostic is on.
+    #[inline(always)]
+    pub(crate) fn strict_on(&self) -> bool {
+        self.shared.backing.strict_physical_memory()
+    }
+
+    /// Whether strict physical-memory mode has refused an access, which ends the run.
+    #[inline(always)]
+    pub(crate) fn strict_stopped(&self) -> bool {
+        self.shared.backing.strict_stopped()
+    }
+
+    /// The first access strict physical-memory mode refused.
+    pub(crate) fn strict_violation(&self) -> Option<&StrictViolation> {
+        self.shared.backing.strict_violation()
+    }
+
+    /// See `Backing::set_strict_focus`.
+    pub(crate) fn set_strict_focus(&mut self, core: usize) {
+        self.shared.backing.set_strict_focus(core);
+    }
+
+    /// See `Backing::latch_strict_stop`.
+    pub(crate) fn latch_strict_stop(
+        &mut self,
+        core: usize,
+        pc: u32,
+        cycles: u64,
+    ) -> Option<&StrictViolation> {
+        self.shared.backing.latch_strict_stop(core, pc, cycles)
+    }
+
     #[inline(always)]
     pub(crate) fn read32(&mut self, core: usize, address: u32) -> u32 {
+        self.read32_on::<false>(core, address)
+    }
+
+    /// A CPU load `check_access` has admitted, strict physical-memory check included, so the
+    /// memory accessor does not make it again. Every other caller uses `read32`.
+    #[inline(always)]
+    pub(crate) fn read32_admitted(&mut self, core: usize, address: u32) -> u32 {
+        self.read32_on::<true>(core, address)
+    }
+
+    #[inline(always)]
+    fn read32_on<const ADMITTED: bool>(&mut self, core: usize, address: u32) -> u32 {
         self.observe_sl2(core, address, Sl2Access::Load);
         if directly_routed_memory(address) {
-            return self.memory(core).read_u32(address);
+            return self.memory_read_u32::<ADMITTED>(core, address);
         }
         self.shared.touched();
         let context = self.port_context();
         if let Some(value) = self.peripheral_read(address, context) {
             return value;
         }
-        if let Some(value) = self.mm[core].cfg_read(address, self.profile, context) {
+        if let Some(value) = self.mm[core].cfg_read(address, self.profile) {
             return value;
         }
-        self.memory(core).read_u32(address)
+        self.memory_read_u32::<ADMITTED>(core, address)
+    }
+
+    #[inline(always)]
+    fn memory_read_u32<const ADMITTED: bool>(&mut self, core: usize, address: u32) -> u32 {
+        let mut memory = self.memory(core);
+        if ADMITTED {
+            memory.read_u32_unchecked(address)
+        } else {
+            memory.read_u32(address)
+        }
+    }
+
+    #[inline(always)]
+    fn memory_write_u32<const ADMITTED: bool>(&mut self, core: usize, address: u32, value: u32) {
+        let mut memory = self.memory(core);
+        if ADMITTED {
+            memory.write_u32_unchecked(address, value);
+        } else {
+            memory.write_u32(address, value);
+        }
     }
 
     #[inline(always)]
     pub(crate) fn write32(&mut self, core: usize, address: u32, value: u32) {
+        self.write32_on::<false>(core, address, value);
+    }
+
+    /// A CPU store `check_access` has admitted (see `read32_admitted`).
+    #[inline(always)]
+    pub(crate) fn write32_admitted(&mut self, core: usize, address: u32, value: u32) {
+        self.write32_on::<true>(core, address, value);
+    }
+
+    #[inline(always)]
+    fn write32_on<const ADMITTED: bool>(&mut self, core: usize, address: u32, value: u32) {
         self.observe_sl2(core, address, Sl2Access::Store);
         if directly_routed_memory(address) {
-            self.memory(core).write_u32(address, value);
+            self.memory_write_u32::<ADMITTED>(core, address, value);
             return;
         }
         self.shared.touched();
@@ -1338,7 +1436,7 @@ impl Fabric {
         }
         let written = {
             let (mm, shared) = (&mut self.mm[core], &mut self.shared);
-            mm.cfg_write(&mut shared.backing, address, value, self.profile, context)
+            mm.cfg_write(&mut shared.backing, address, value, self.profile)
         };
         match written {
             Some(CfgWrite::Done) => return,
@@ -1348,7 +1446,7 @@ impl Fabric {
             }
             None => {}
         }
-        self.memory(core).write_u32(address, value);
+        self.memory_write_u32::<ADMITTED>(core, address, value);
     }
 
     /// The MDIO interrupts an EMAC's MACINVECTOR reports alongside its own.
@@ -1782,22 +1880,57 @@ impl Fabric {
     }
 
     /// Each megamodule's own IDMA moves data between its local memories.
+    ///
+    /// The IDMA "is local to the megamodule - it provides data move services only within the
+    /// megamodule (L1P, L1D, L2, and CFG)" (SPRU871K section 1.2.5), so a local window address
+    /// it is given names its own megamodule's memory, as it would for that core's CPU. It still
+    /// moves data as a master - protection, the L1D snoop and coherence apply - and on a device
+    /// with global aliases a master can only name a core's memory by its alias, so the local
+    /// address is carried as the owning core's alias of it. On a device without aliases the
+    /// local window is the address every master uses, and nothing is translated.
     fn tick_idma(&mut self) {
         for core in 0..self.cores {
             if !self.mm[core].idma.active() {
                 continue;
             }
+            let map = self.profile.map;
+            let own = |address: u32| map.global_of_local(core, address).unwrap_or(address);
             let steps = self.mm[core].idma.tick();
             for step in steps.into_iter().flatten() {
-                let value = match step.source {
-                    Some(IdmaSource::Address(address)) => {
-                        self.read_word(Privilege::ID0_SUPERVISOR, address)
+                // The ID of the CPU that started the transfer, in the mode it was in then
+                // (SPRU871K sections 8.1.2 and 8.3.2.1). A core's PrivID is its index on both
+                // devices. The pages are judged by their AIDs, not LOCAL: LOCAL is the CPU's
+                // own access, and an IDMA fault is a remote one (SPRU871K section 4.6.1).
+                let privilege = Privilege {
+                    id: core as u8,
+                    user: step.user,
+                };
+                // Strict physical-memory mode checks both ends of a word before either moves,
+                // under the IDMA's own name: a refused step reads and writes nothing and raises
+                // nothing, and the run ends at the end of this cycle (`StrictViolation`).
+                let destination = own(step.destination);
+                let source = match step.source {
+                    Some(IdmaSource::Address(address)) => Some(Some(own(address))),
+                    Some(IdmaSource::Fill(_)) => Some(None),
+                    None => None,
+                };
+                if source.is_some() {
+                    let backing = &mut self.shared.backing;
+                    let refused =
+                        source.flatten().is_some_and(|address| {
+                            backing.strict_refuses_idma(core, address, 4, "IDMA read")
+                        }) || backing.strict_refuses_idma(core, destination, 4, "IDMA write");
+                    if refused {
+                        continue;
                     }
+                }
+                let value = match step.source {
+                    Some(IdmaSource::Address(address)) => self.read_word(privilege, own(address)),
                     Some(IdmaSource::Fill(value)) => Some(value),
                     None => None,
                 };
                 if let Some(value) = value {
-                    self.write_word(Privilege::ID0_SUPERVISOR, step.destination, value);
+                    self.write_word(privilege, destination, value);
                 }
                 if let Some(event) = step.completion_event {
                     self.mm[core].raise_event(event);
@@ -2440,6 +2573,9 @@ impl Fabric {
     ///
     /// The AID fields are not consulted: they gate DMA masters by requester id, and the CPU
     /// is the local requester, which `LOCAL` covers.
+    ///
+    /// `length` is the size of a load or store, for the strict physical-memory diagnostic; a
+    /// fetch's is not used.
     #[inline(always)]
     pub(crate) fn check_access(
         &mut self,
@@ -2447,6 +2583,7 @@ impl Fabric {
         address: u32,
         permission: Permission,
         user: bool,
+        length: usize,
     ) -> bool {
         // The bus carries the requesting core's PrivID and privilege, which the EDMA3's active
         // memory protection filters on and which it stamps on every PaRAM set this access
@@ -2460,23 +2597,13 @@ impl Fabric {
         if self.shared.edma_privilege != privilege {
             self.present_to_edma(privilege);
         }
-        // Cache-register permissions apply even when every SRAM page is unrestricted.
-        // Keep this at the CPU seam: DMA/EMAC/HPI configuration writes do not inherit
-        // the mode of whichever CPU access preceded them.
-        if user
-            && permission == Permission::Write
-            && crate::memory::cache_register_requires_supervisor(address)
+        // A write into the megamodule's register block - the IDMA's and the cache controls -
+        // is judged out of line, so an ordinary store pays one range test here.
+        if permission == Permission::Write
+            && address.wrapping_sub(MEGAMODULE_REGISTERS.start)
+                < MEGAMODULE_REGISTERS.end - MEGAMODULE_REGISTERS.start
+            && !self.megamodule_register_write(core, address, user)
         {
-            // Only L1P specifies a register-write fault (SPRU871K 2.9.1.2).
-            // The L1D/L2 permission tables specify read-only access, not a fault subtype.
-            if address & !3 == crate::memory::L1PCFG {
-                self.mm[core].record_mpu_fault(
-                    1,
-                    address,
-                    MPFSR_LOCAL | permission_bit(permission, user),
-                    self.profile.events,
-                );
-            }
             return false;
         }
         // The shared-memory controller's registers answer a CPU in User mode with a protection
@@ -2489,11 +2616,82 @@ impl Fabric {
             return false;
         }
         // Every page grants the CPU everything until software narrows one, which is the reset
-        // state and the state the whole of this project's firmware runs in.
-        if !self.mm[core].mpu_restrictive {
+        // state and the state the whole of this project's firmware runs in, and the strict
+        // physical-memory diagnostic is off unless asked for: one test covers both.
+        let checks = self.mm[core].cpu_checks;
+        if checks == 0 {
             return true;
         }
-        self.check_restricted_access(core, address, permission, user)
+        self.check_slow_access(core, address, permission, user, length, checks)
+    }
+
+    /// The CPU's access checks once either applies: memory protection, then - for a load or a
+    /// store, of `length` bytes - the strict physical-memory diagnostic, which is made here
+    /// rather than in the memory accessors so that, with it off, a CPU access pays nothing for
+    /// it. A refusal by the diagnostic latches nothing in the device: the load reads 0 and the
+    /// store is dropped, as for a protection refusal, and the violation is recorded for the run
+    /// to stop on (`Backing::strict_refuses`). A fetch is judged by the packet it reads
+    /// (`BoundHierarchy::fetch_packet`).
+    #[inline(never)]
+    fn check_slow_access(
+        &mut self,
+        core: usize,
+        address: u32,
+        permission: Permission,
+        user: bool,
+        length: usize,
+        checks: u8,
+    ) -> bool {
+        if checks & CPU_CHECK_MPU != 0
+            && !self.check_restricted_access(core, address, permission, user)
+        {
+            return false;
+        }
+        if checks & CPU_CHECK_STRICT != 0 && permission != Permission::Execute {
+            let operation = if permission == Permission::Write {
+                "write"
+            } else {
+                "read"
+            };
+            if self
+                .shared
+                .backing
+                .strict_refuses(Requester::Core(core), address, length, operation)
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// A CPU write into the megamodule's register block, `0180 0000h`-`01BF FFFFh`: whether
+    /// the write may proceed.
+    ///
+    /// A transfer the IDMA starts carries this CPU's privilege mode at the time it starts
+    /// (SPRU871K section 8.1.2), so a write to its registers notes the mode first. And
+    /// cache-register permissions apply even when every SRAM page is unrestricted. Both are
+    /// kept at the CPU seam: DMA/EMAC/HPI configuration writes do not inherit the mode of
+    /// whichever CPU access preceded them.
+    #[cold]
+    #[inline(never)]
+    fn megamodule_register_write(&mut self, core: usize, address: u32, user: bool) -> bool {
+        if crate::idma::is_register(address) {
+            self.mm[core].idma.note_initiator_mode(user);
+        }
+        if user && crate::memory::cache_register_requires_supervisor(address) {
+            // Only L1P specifies a register-write fault (SPRU871K 2.9.1.2).
+            // The L1D/L2 permission tables specify read-only access, not a fault subtype.
+            if address & !3 == crate::memory::L1PCFG {
+                self.mm[core].record_mpu_fault(
+                    1,
+                    address,
+                    MPFSR_LOCAL | permission_bit(Permission::Write, user),
+                    self.profile.events,
+                );
+            }
+            return false;
+        }
+        true
     }
 
     /// A User-mode write to an SMC register: the controller refuses it and latches the fault,
@@ -2527,7 +2725,7 @@ impl Fabric {
     }
 
     /// The check itself, once some page has stopped granting everything.
-    #[inline(never)]
+    #[inline(always)]
     fn check_restricted_access(
         &mut self,
         core: usize,
@@ -2551,7 +2749,7 @@ impl Fabric {
     // The memory surface.
     // ------------------------------------------------------------------
 
-    #[inline(always)]
+    #[cfg(test)]
     pub(crate) fn read_u8(&mut self, core: usize, address: u32) -> u8 {
         self.observe_sl2(core, address, Sl2Access::Load);
         self.memory(core).read_u8(address)
@@ -2563,16 +2761,37 @@ impl Fabric {
         self.memory(core).write_u8(address, value);
     }
 
-    #[inline(always)]
+    #[cfg(test)]
     pub(crate) fn read_u16(&mut self, core: usize, address: u32) -> u16 {
         self.observe_sl2(core, address, Sl2Access::Load);
         self.memory(core).read_u16(address)
     }
 
+    // The CPU's own byte and halfword loads and stores, which `check_access` has admitted,
+    // strict physical-memory check included (see `read32_admitted`).
+
     #[inline(always)]
-    pub(crate) fn write_u16(&mut self, core: usize, address: u32, value: u16) {
+    pub(crate) fn read_u8_admitted(&mut self, core: usize, address: u32) -> u8 {
+        self.observe_sl2(core, address, Sl2Access::Load);
+        self.memory(core).read_u8_unchecked(address)
+    }
+
+    #[inline(always)]
+    pub(crate) fn write_u8_admitted(&mut self, core: usize, address: u32, value: u8) {
         self.observe_sl2(core, address, Sl2Access::Store);
-        self.memory(core).write_u16(address, value);
+        self.memory(core).write_u8_unchecked(address, value);
+    }
+
+    #[inline(always)]
+    pub(crate) fn read_u16_admitted(&mut self, core: usize, address: u32) -> u16 {
+        self.observe_sl2(core, address, Sl2Access::Load);
+        self.memory(core).read_u16_unchecked(address)
+    }
+
+    #[inline(always)]
+    pub(crate) fn write_u16_admitted(&mut self, core: usize, address: u32, value: u16) {
+        self.observe_sl2(core, address, Sl2Access::Store);
+        self.memory(core).write_u16_unchecked(address, value);
     }
 
     #[cfg(test)]
@@ -2788,23 +3007,41 @@ impl<'a> CoreBus<'a> {
     }
 
     #[inline(always)]
-    pub(crate) fn read_u8(&mut self, address: u32) -> u8 {
-        self.fabric.read_u8(self.core, address)
-    }
-
-    #[inline(always)]
     pub(crate) fn write_u8(&mut self, address: u32, value: u8) {
         self.fabric.write_u8(self.core, address, value);
     }
 
+    // The CPU's own loads and stores, once `check_access` has admitted them (see
+    // `Fabric::read32_admitted`). Every other user of the bus takes the accessors above.
+
     #[inline(always)]
-    pub(crate) fn read_u16(&mut self, address: u32) -> u16 {
-        self.fabric.read_u16(self.core, address)
+    pub(crate) fn read32_admitted(&mut self, address: u32) -> u32 {
+        self.fabric.read32_admitted(self.core, address)
     }
 
     #[inline(always)]
-    pub(crate) fn write_u16(&mut self, address: u32, value: u16) {
-        self.fabric.write_u16(self.core, address, value);
+    pub(crate) fn write32_admitted(&mut self, address: u32, value: u32) {
+        self.fabric.write32_admitted(self.core, address, value);
+    }
+
+    #[inline(always)]
+    pub(crate) fn read_u8_admitted(&mut self, address: u32) -> u8 {
+        self.fabric.read_u8_admitted(self.core, address)
+    }
+
+    #[inline(always)]
+    pub(crate) fn write_u8_admitted(&mut self, address: u32, value: u8) {
+        self.fabric.write_u8_admitted(self.core, address, value);
+    }
+
+    #[inline(always)]
+    pub(crate) fn read_u16_admitted(&mut self, address: u32) -> u16 {
+        self.fabric.read_u16_admitted(self.core, address)
+    }
+
+    #[inline(always)]
+    pub(crate) fn write_u16_admitted(&mut self, address: u32, value: u16) {
+        self.fabric.write_u16_admitted(self.core, address, value);
     }
 
     pub(crate) fn read_bytes(&mut self, address: u32, length: usize) -> Vec<u8> {
@@ -2836,6 +3073,32 @@ impl<'a> CoreBus<'a> {
     #[inline(always)]
     pub(crate) fn l1p_epoch(&self) -> u64 {
         self.fabric.mm[self.core].memory.l1p_epoch()
+    }
+
+    /// Whether the strict physical-memory diagnostic is on.
+    #[inline(always)]
+    pub(crate) fn strict_on(&self) -> bool {
+        self.fabric.shared.backing.strict_physical_memory()
+    }
+
+    /// See `Backing::strict_sram_moved`.
+    pub(crate) fn strict_sram_moved(&mut self) -> bool {
+        self.fabric.shared.backing.strict_sram_moved(self.core)
+    }
+
+    #[inline(always)]
+    pub(crate) fn strict_stopped(&self) -> bool {
+        self.fabric.strict_stopped()
+    }
+
+    #[inline(always)]
+    pub(crate) fn strict_refusals(&self) -> u64 {
+        self.fabric.shared.backing.strict_refusals()
+    }
+
+    /// This core takes the recorded strict violation as its fault, if it is reported on it.
+    pub(crate) fn latch_strict_stop(&mut self, pc: u32, cycles: u64) -> Option<&StrictViolation> {
+        self.fabric.latch_strict_stop(self.core, pc, cycles)
     }
 
     #[inline(always)]
@@ -2908,9 +3171,10 @@ impl<'a> CoreBus<'a> {
         address: u32,
         permission: Permission,
         user: bool,
+        length: usize,
     ) -> bool {
         self.fabric
-            .check_access(self.core, address, permission, user)
+            .check_access(self.core, address, permission, user, length)
     }
 
     /// Advance the shared peripherals, once per device cycle, and answer whether this ask was
@@ -3132,7 +3396,7 @@ impl Fabric {
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
                 Ok(Some(json!(
-                    self.check_access(core, address, permission, user)
+                    self.check_access(core, address, permission, user, 4)
                 )))
             }
             "tick" => {
@@ -4066,7 +4330,7 @@ mod tests {
                         }
                         claimed_by = Some(name);
                     };
-                    let taken = SlavePort::read(&mut fabric.mm[0].idma, address, context).is_some();
+                    let taken = fabric.mm[0].idma.read(address).is_some();
                     claim("IDMA".to_owned(), taken);
                     for index in 0..fabric.shared.ports.len() {
                         let which = fabric.shared.ports[index];
@@ -4304,8 +4568,8 @@ mod tests {
         // L1DMPPA0 covers the first kilobyte of L1D SRAM: supervisor everything, user nothing.
         fabric.write32(0, 0x0184_ae00, 0x0000_0138);
         let address = 0x00f0_0010;
-        assert!(fabric.check_access(0, address, Permission::Read, false));
-        assert!(!fabric.check_access(0, address, Permission::Read, true));
+        assert!(fabric.check_access(0, address, Permission::Read, false, 4));
+        assert!(!fabric.check_access(0, address, Permission::Read, true, 4));
         assert_eq!(fabric.read32(0, 0x0184_ac00), address); // L1DMPFAR
         assert_eq!(fabric.read32(0, 0x0184_ac04), 0x104); // L1DMPFSR: LOCAL and UR
         assert_eq!(
@@ -4314,7 +4578,7 @@ mod tests {
         ); // event 122
 
         // The neighbouring page is untouched, and a fully open page never even looks.
-        assert!(fabric.check_access(0, 0x00f0_0400, Permission::Read, true));
+        assert!(fabric.check_access(0, 0x00f0_0400, Permission::Read, true, 4));
         // A write that misses the command bit leaves the fault standing; the command bit
         // clears the address as well as the status.
         fabric.write32(0, 0x0184_ac08, 0x104);
@@ -4334,9 +4598,9 @@ mod tests {
             .into_iter()
             .chain((0..256).map(|index| MAR_BASE + index * 4))
         {
-            assert!(fabric.check_access(0, address, Permission::Read, true));
-            assert!(fabric.check_access(0, address, Permission::Write, false));
-            assert!(!fabric.check_access(0, address, Permission::Write, true));
+            assert!(fabric.check_access(0, address, Permission::Read, true, 4));
+            assert!(fabric.check_access(0, address, Permission::Write, false, 4));
+            assert!(!fabric.check_access(0, address, Permission::Write, true, 4));
         }
         for address in [
             0x0184_0024,
@@ -4361,7 +4625,7 @@ mod tests {
             0x0184_5040,
             0x0184_5044, // L1PINV, L1DWB, L1DWBINV
         ] {
-            assert!(fabric.check_access(0, address, Permission::Write, true));
+            assert!(fabric.check_access(0, address, Permission::Write, true, 4));
         }
         // Section 2.9.1.2 explicitly specifies a fault for the L1P register write.
         assert_eq!(fabric.read32(0, 0x0184_a400), L1PCFG);
@@ -4390,8 +4654,8 @@ mod tests {
         assert_eq!(fabric.fetch32(0, 0x0080_0000), 0x0210_a358);
         // L2MPPA0 covers the first 64 KB of L2 SRAM: read and write, no execute.
         fabric.write32(0, 0x0184_a200, 0x0000_0130);
-        assert!(fabric.check_access(0, 0x0080_0000, Permission::Read, false));
-        assert!(!fabric.check_access(0, 0x0080_0000, Permission::Execute, false));
+        assert!(fabric.check_access(0, 0x0080_0000, Permission::Read, false, 4));
+        assert!(!fabric.check_access(0, 0x0080_0000, Permission::Execute, false, 4));
         assert_eq!(
             fabric.megamodule(0).event_flag_registers()[3] & (1 << 28),
             1 << 28
@@ -4593,6 +4857,288 @@ mod tests {
             raised[0] > 200 && raised[1] > 20,
             "matches seen: {raised:?}"
         );
+    }
+
+    /// IDMA channel 1 on `core`: copy `bytes` from `source` to `destination`, and run the
+    /// device until the channel is idle.
+    fn idma_copy(fabric: &mut Fabric, core: usize, source: u32, destination: u32, bytes: u32) {
+        idma_copy_as(fabric, core, false, source, destination, bytes);
+    }
+
+    /// The same, programmed by a CPU in user mode when `user` is set: every register write
+    /// crosses the CPU's access check first, as an `STW` would.
+    fn idma_copy_as(
+        fabric: &mut Fabric,
+        core: usize,
+        user: bool,
+        source: u32,
+        destination: u32,
+        bytes: u32,
+    ) {
+        idma_copy_in_modes(fabric, core, [user, user], source, destination, bytes);
+    }
+
+    /// The same, with SOURCE and DEST written in mode `modes[0]` and the COUNT write that
+    /// starts the transfer in mode `modes[1]` (`true` is user mode).
+    fn idma_copy_in_modes(
+        fabric: &mut Fabric,
+        core: usize,
+        modes: [bool; 2],
+        source: u32,
+        destination: u32,
+        bytes: u32,
+    ) {
+        for (address, value, user) in [
+            (0x0182_0108, source, modes[0]),
+            (0x0182_010c, destination, modes[0]),
+            (0x0182_0110, bytes, modes[1]),
+        ] {
+            assert!(fabric.check_access(core, address, Permission::Write, user, 4));
+            fabric.write32(core, address, value);
+        }
+        for _ in 0..1000 {
+            if !fabric.mm[core].idma.active() {
+                return;
+            }
+            fabric.tick_once();
+        }
+        panic!("IDMA on core {core} did not finish");
+    }
+
+    /// The IDMA "provides data move services only within the megamodule (L1P, L1D, L2, and
+    /// CFG)" (SPRU871K section 1.2.5): a local window address is its own megamodule's memory.
+    /// On the C6472 that makes core 3's copy land in core 3's L2 - visible through its local
+    /// window and its global alias, and not in core 0's or in sparse memory - and on the C6455
+    /// it is the one L2. Strict mode accepts the copy on both, because it is all memory.
+    #[test]
+    fn idma_copies_within_its_own_megamodules_local_memory() {
+        const SOURCE: u32 = 0x0080_1000;
+        const DESTINATION: u32 = 0x0080_2000;
+        const WORDS: u32 = 16;
+        for strict in [false, true] {
+            for (profile, core) in [
+                (&crate::device::C6455, 0),
+                (&crate::device::C6472, 0),
+                (&crate::device::C6472, 3),
+            ] {
+                let context = format!("{} core {core} strict {strict}", profile.name);
+                let mut fabric = Fabric::new(profile);
+                fabric.shared.backing.set_strict_physical_memory(strict);
+                for word in 0..WORDS {
+                    fabric.write32(core, SOURCE + 4 * word, 0x0101_0101 * (word + 1));
+                }
+                idma_copy(&mut fabric, core, SOURCE, DESTINATION, 4 * WORDS);
+                let alias = profile.map.global_alias_base(core);
+                for word in 0..WORDS {
+                    let expected = 0x0101_0101 * (word + 1);
+                    let local = DESTINATION + 4 * word;
+                    assert_eq!(fabric.read32(core, local), expected, "{context}");
+                    if let Some(base) = alias {
+                        assert_eq!(
+                            fabric.read_word(HOST, base + local),
+                            Some(expected),
+                            "{context}"
+                        );
+                    }
+                }
+                if profile.map.has_global_aliases() {
+                    let other = (core + 1) % profile.map.cores;
+                    assert_eq!(fabric.read32(other, DESTINATION), 0, "{context}");
+                }
+                assert_eq!(fabric.shared.backing.sparse_bytes(), 0, "{context}");
+            }
+        }
+    }
+
+    /// L2MPPA0 and the L2 fault registers, and the page bits the IDMA tests use (SPRU871K
+    /// Figure 8-1).
+    const L2MPPA0: u32 = 0x0184_a200;
+    const L2MPFAR: u32 = 0x0184_a000;
+    const L2MPFSR: u32 = 0x0184_a004;
+    const AID0: u32 = 1 << 10;
+    const AID3: u32 = 1 << 13;
+    const LOCAL_BIT: u32 = 1 << 8;
+    const SUPERVISOR_RW: u32 = (1 << 5) | (1 << 4);
+    const EVERY_ACCESS: u32 = 0x3f;
+
+    /// Core 3's IDMA copying a word within core 3's L2 under a page attribute for the first
+    /// page of that L2: the destination word afterwards.
+    fn core3_idma_copy_under(page: u32, user: bool) -> (Fabric, u32) {
+        core3_idma_copy_in_modes(page, [user, user])
+    }
+
+    /// The same, with the setup and the starting COUNT write in the modes of
+    /// [`idma_copy_in_modes`].
+    fn core3_idma_copy_in_modes(page: u32, modes: [bool; 2]) -> (Fabric, u32) {
+        let mut fabric = Fabric::new(&crate::device::C6472);
+        fabric.load_bytes(3, 0x0080_1000, &0x1234_5678u32.to_le_bytes());
+        fabric.write32(3, L2MPPA0, page);
+        idma_copy_in_modes(&mut fabric, 3, modes, 0x0080_1000, 0x0080_2000, 4);
+        let copied = fabric.read32(3, 0x0080_2000);
+        (fabric, copied)
+    }
+
+    /// "When a requestor triggers an IDMA transfer directly by writing to IDMA registers, the
+    /// IDMA engine will provide that ID alongside the transfer" (SPRU871K section 8.3.2.1): CPU
+    /// 3's transfer is PrivID 3, judged by AID3. LOCAL is the CPU's own access to its memories
+    /// and admits nothing for the IDMA, and AID0 does not stand in for core 3.
+    #[test]
+    fn a_c6472_idma_transfer_carries_the_initiating_cores_id() {
+        let (_, copied) = core3_idma_copy_under(AID3 | LOCAL_BIT | EVERY_ACCESS, false);
+        assert_eq!(copied, 0x1234_5678, "AID3 admits core 3's IDMA");
+        let (mut fabric, copied) = core3_idma_copy_under(AID0 | LOCAL_BIT | EVERY_ACCESS, false);
+        assert_eq!(copied, 0, "AID0 without AID3 refuses core 3's IDMA");
+        // The refused read is a remote fault by PrivID 3, in supervisor mode.
+        assert_eq!(fabric.read32(3, L2MPFAR), 0x1380_1000);
+        assert_eq!(fabric.read32(3, L2MPFSR), (3 << 9) | (1 << 5));
+    }
+
+    /// "The Internal DMA accesses that are initiated by the CPU inherit the CPU's privilege level
+    /// at the time they are initiated" (SPRU871K section 8.1.2).
+    #[test]
+    fn an_idma_transfer_carries_the_privilege_mode_it_was_started_in() {
+        let page = AID3 | SUPERVISOR_RW;
+        let (_, copied) = core3_idma_copy_under(page, false);
+        assert_eq!(
+            copied, 0x1234_5678,
+            "a supervisor's transfer may use a supervisor page"
+        );
+        let (mut fabric, copied) = core3_idma_copy_under(page, true);
+        assert_eq!(copied, 0, "a user's transfer may not");
+        assert_eq!(fabric.read32(3, L2MPFSR), (3 << 9) | (1 << 2));
+        // The transfer is initiated by the COUNT write, so its mode is the one that counts,
+        // whatever mode SOURCE and DEST were written in.
+        let (_, copied) = core3_idma_copy_in_modes(page, [true, false]);
+        assert_eq!(
+            copied, 0x1234_5678,
+            "a supervisor's COUNT starts a supervisor transfer"
+        );
+        let (mut fabric, copied) = core3_idma_copy_in_modes(page, [false, true]);
+        assert_eq!(copied, 0, "a user's COUNT starts a user transfer");
+        assert_eq!(fabric.read32(3, L2MPFSR), (3 << 9) | (1 << 2));
+    }
+
+    /// Whether `core`'s megamodule has latched the IDMA error event, 97 (SPRS276M Table 7-9,
+    /// SPRS612G Table 7-10).
+    fn idma_error_latched(fabric: &Fabric, core: usize) -> bool {
+        fabric.mm[core].event_flag_registers()[3] & (1 << 1) != 0
+    }
+
+    /// The IDMA's local windows are the device's: a C6472 megamodule has 608 KB of L2, ending
+    /// at 0089 8000h (SPRS612G Table 2-2), so a channel 1 transfer that reaches past it is
+    /// refused when it is submitted - the error event, nothing moved - exactly as an address
+    /// outside every local window always was, whether or not strict mode is on.
+    #[test]
+    fn a_c6472_idma_past_its_608_kb_l2_is_refused_as_out_of_range() {
+        for strict in [false, true] {
+            for (source, destination, bytes) in [
+                (0x0080_1000, 0x0089_8000, 16),
+                (0x0089_8000, 0x0080_1000, 16),
+                (0x0080_1000, 0x0089_7ff8, 16),
+                (0x0080_1000, 0x009f_f000, 16),
+                // The same out-of-range kind of address the IDMA always refused.
+                (0x0080_1000, 0x0100_0000, 16),
+            ] {
+                let context = format!("strict {strict} 0x{source:08x} -> 0x{destination:08x}");
+                let mut fabric = Fabric::new(&crate::device::C6472);
+                fabric.shared.backing.set_strict_physical_memory(strict);
+                fabric.write32(2, 0x0080_1000, 0xabcd_0123);
+                idma_copy(&mut fabric, 2, source, destination, bytes);
+                assert!(idma_error_latched(&fabric, 2), "{context}");
+                assert!(!fabric.mm[2].idma.active(), "{context}");
+                assert_eq!(fabric.shared.backing.sparse_bytes(), 0, "{context}");
+                assert!(fabric.strict_violation().is_none(), "{context}");
+                assert_eq!(fabric.read32(2, 0x0089_7ff8), 0, "{context}");
+                for core in [0, 1, 3, 4, 5] {
+                    assert!(!idma_error_latched(&fabric, core), "{context} core {core}");
+                }
+            }
+        }
+    }
+
+    /// The last bytes of each device's L2 are still the IDMA's: the C6455's 2 MB and the
+    /// C6472's 608 KB, with strict mode off and on. Past the C6455's, the error event.
+    #[test]
+    fn an_idma_copy_reaches_the_top_of_each_devices_l2() {
+        for strict in [false, true] {
+            for (profile, top) in [
+                (&crate::device::C6455, 0x00a0_0000),
+                (&crate::device::C6472, 0x0089_8000),
+            ] {
+                let context = format!("{} strict {strict}", profile.name);
+                let mut fabric = Fabric::new(profile);
+                fabric.shared.backing.set_strict_physical_memory(strict);
+                for word in 0..4 {
+                    fabric.write32(0, 0x0080_1000 + 4 * word, 0x1111_1111 * (word + 1));
+                }
+                idma_copy(&mut fabric, 0, 0x0080_1000, top - 16, 16);
+                assert!(!idma_error_latched(&fabric, 0), "{context}");
+                for word in 0..4 {
+                    assert_eq!(
+                        fabric.read32(0, top - 16 + 4 * word),
+                        0x1111_1111 * (word + 1),
+                        "{context}"
+                    );
+                }
+                assert!(fabric.strict_violation().is_none(), "{context}");
+                idma_copy(&mut fabric, 0, 0x0080_1000, top, 16);
+                assert!(idma_error_latched(&fabric, 0), "{context}");
+            }
+        }
+    }
+
+    /// SRAM a cache configuration has converted is still inside the IDMA's window, so the
+    /// transfer is accepted; strict mode then refuses its first step under the IDMA's own name,
+    /// blamed on the megamodule that owns it, and the step moves nothing and raises nothing -
+    /// neither the error event nor the completion interrupt.
+    #[test]
+    fn strict_mode_refuses_an_idma_step_into_carved_sram() {
+        let mut fabric = Fabric::new(&crate::device::C6472);
+        fabric.shared.backing.set_strict_physical_memory(true);
+        // A 256 KB L2 cache leaves core 2 with 352 KB of SRAM, ending at 0085 8000h.
+        fabric.write32(2, 0x0184_0000, 4);
+        fabric.write32(2, 0x0080_1000, 0x5555_aaaa);
+        for (address, value) in [
+            (0x0182_0108, 0x0080_1000),
+            (0x0182_010c, 0x0085_8000),
+            // Four bytes, with the completion interrupt asked for.
+            (0x0182_0110, (1 << 28) | 4),
+        ] {
+            fabric.write32(2, address, value);
+        }
+        assert!(fabric.mm[2].idma.active());
+        for _ in 0..10 {
+            fabric.tick_once();
+        }
+        assert!(!fabric.mm[2].idma.active());
+        let violation = fabric.strict_violation().expect("a strict violation");
+        assert_eq!(violation.core(), Some(2));
+        assert_eq!(
+            violation.message(),
+            "strict physical-memory: IDMA write of 4 bytes by the IDMA of Core(2) at 0x12858000 \
+             enters a reserved, unsupported, or cache-converted range at 0x12858000"
+        );
+        assert!(!idma_error_latched(&fabric, 2));
+        // IDMA1's completion event is 14 (SPRU871K Table 5-1): not raised for a refused step.
+        assert_eq!(fabric.mm[2].event_flag_registers()[0] & (1 << 14), 0);
+        assert_eq!(fabric.shared.backing.sparse_bytes(), 0);
+        fabric.shared.backing.set_strict_physical_memory(false);
+        fabric.write32(2, 0x0184_0000, 0);
+        assert_eq!(fabric.host_read_bytes(2, 0x0085_8000, 4), [0; 4]);
+    }
+
+    /// A fill names only a destination, which is local to the IDMA's megamodule too.
+    #[test]
+    fn idma_fill_lands_in_its_own_c6472_l1d() {
+        const DESTINATION: u32 = 0x00f0_0100;
+        let mut fabric = Fabric::new(&crate::device::C6472);
+        fabric.shared.backing.set_strict_physical_memory(true);
+        idma_copy(&mut fabric, 5, 0x00c0_ffee, DESTINATION, (1 << 16) | 8);
+        assert_eq!(
+            fabric.host_read_bytes(5, DESTINATION, 8),
+            [0xee, 0xff, 0xc0, 0x00].repeat(2)
+        );
+        assert_eq!(fabric.host_read_bytes(0, DESTINATION, 8), [0; 8]);
     }
 
     mod utopia_pdma {
@@ -5229,7 +5775,7 @@ mod tests {
         /// One CPU store as the core issues it: the access check precedes it, and carries the
         /// core's privilege to the EDMA3.
         fn store(fabric: &mut Fabric, core: usize, user: bool, address: u32, value: u32) {
-            assert!(fabric.check_access(core, address, Permission::Write, user));
+            assert!(fabric.check_access(core, address, Permission::Write, user, 4));
             fabric.write32(core, address, value);
         }
 
@@ -5255,7 +5801,7 @@ mod tests {
             store(&mut fabric, core, user, ESR, 1);
             // The CPU changes privilege - an exception, or a return from one - while the request
             // waits; a lookup at execution time would see this and not the submitter.
-            assert!(fabric.check_access(core, SOURCE, Permission::Read, then_user));
+            assert!(fabric.check_access(core, SOURCE, Permission::Read, then_user, 4));
             for _ in 0..16 {
                 fabric.tick_once();
             }
@@ -5504,13 +6050,13 @@ mod tests {
             let mut fabric = c6472();
             let event = crate::device::C6472.events.smc_fault.unwrap();
             // Section 5.1: readable in every mode, writable only in supervisor mode.
-            assert!(fabric.check_access(2, SL2PFCPEN, Permission::Read, true));
-            assert!(fabric.check_access(2, SL2PFCPEN, Permission::Write, false));
+            assert!(fabric.check_access(2, SL2PFCPEN, Permission::Read, true, 4));
+            assert!(fabric.check_access(2, SL2PFCPEN, Permission::Write, false, 4));
             assert_eq!(fabric.read32(0, SL2MPFSR), 7 << 2, "no fault recorded yet");
             fabric.tick_once();
             assert!((0..6).all(|core| !flagged(&fabric, core, event)));
 
-            assert!(!fabric.check_access(2, SL2PFCPEN, Permission::Write, true));
+            assert!(!fabric.check_access(2, SL2PFCPEN, Permission::Write, true, 4));
             // Section 5.3: the accessing megamodule id, the mode (nonsecure: 1) and the address.
             assert_eq!(fabric.read32(5, SL2MPFSR), (2 << 2) | (1 << 1));
             assert_eq!(fabric.read32(5, SL2MPFAR), SL2PFCPEN);
@@ -5524,7 +6070,7 @@ mod tests {
                 );
             }
             // The latest fault overwrites the previous one, whatever core it came from.
-            assert!(!fabric.check_access(4, SL2PDSLEEP0 + 0x14, Permission::Write, true));
+            assert!(!fabric.check_access(4, SL2PDSLEEP0 + 0x14, Permission::Write, true, 4));
             assert_eq!(fabric.read32(0, SL2MPFSR), (4 << 2) | (1 << 1));
             assert_eq!(fabric.read32(0, SL2MPFAR), SL2PDSLEEP0 + 0x14);
             // Writing 1 to CLEAR drops the level and the status.
@@ -5537,9 +6083,9 @@ mod tests {
         fn only_a_cpu_in_user_mode_faults_and_only_a_device_with_a_controller_has_one() {
             let mut fabric = c6472();
             // Read-only registers and the supervisor's own writes do not fault.
-            assert!(fabric.check_access(0, SL2PDSTAT, Permission::Write, true));
-            assert!(fabric.check_access(0, SL2AMLSTAT0, Permission::Write, true));
-            assert!(fabric.check_access(0, SL2PFCPEN, Permission::Write, false));
+            assert!(fabric.check_access(0, SL2PDSTAT, Permission::Write, true, 4));
+            assert!(fabric.check_access(0, SL2AMLSTAT0, Permission::Write, true, 4));
+            assert!(fabric.check_access(0, SL2PFCPEN, Permission::Write, false, 4));
             assert_eq!(fabric.read32(0, SL2MPFSR), 7 << 2);
             // A DMA master writing the register is not a megamodule with an id to record.
             fabric.write_word(Privilege::ID0_USER, SL2PFCPEN, 0xf);
@@ -5547,7 +6093,7 @@ mod tests {
             assert_eq!(fabric.read32(0, SL2MPFSR), 7 << 2);
             // The C6455 has no SMC at that address, so there is nothing to fault.
             let mut c6455 = Fabric::default();
-            assert!(c6455.check_access(0, SL2PFCPEN, Permission::Write, true));
+            assert!(c6455.check_access(0, SL2PFCPEN, Permission::Write, true, 4));
         }
 
         #[test]

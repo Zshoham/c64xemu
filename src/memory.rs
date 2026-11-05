@@ -384,6 +384,110 @@ struct CoreSram {
     l1d: u32,
 }
 
+/// Who made an access strict mode refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StrictOrigin {
+    /// A core's own access: a load, store or fetch its CPU issued, or a boot-ROM or debug-port
+    /// read made on its behalf through its memory hierarchy.
+    Core(usize),
+    /// A step of a core's IDMA.
+    Idma(usize),
+    /// A system bus master - EDMA3, HPI, EMAC, UTOPIA or a host - with no core of its own.
+    Master,
+}
+
+/// The first access `C64XEMU_STRICT_PHYSICAL_MEMORY=1` refused.
+///
+/// It is an emulator diagnostic, not a hardware event: nothing guest-visible records it - no
+/// exception, interrupt, IERR bit, MPU fault or error event - and the refused access has no
+/// effect (a read returns zeros, a write and a fetch do nothing). It ends the run instead: the
+/// device finishes the cycle the access was made in, no core starts another, and the core the
+/// violation is reported on takes it as its fault, which the batch runner, the debugger, the
+/// GDB stub and the dashboard all report the way they report any other fault.
+///
+/// Everything a report says about it is fixed once: the core it is reported on when the access
+/// is refused, and where that core stopped when it first takes the fault. Moving the debugger's
+/// focus afterwards changes none of it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StrictViolation {
+    pub(crate) operation: &'static str,
+    pub(crate) length: usize,
+    pub(crate) origin: StrictOrigin,
+    /// The access's first byte.
+    pub(crate) start: u32,
+    /// The first byte of it that is in a hole or a carve, or `None` for a span that wraps past
+    /// the top of the address space.
+    pub(crate) first: Option<u32>,
+    /// The core it is reported on: the core whose access or IDMA made it, or - for a system
+    /// master, which has no core - the core that was focused when the master made the access.
+    pub(crate) reported_core: usize,
+    /// That core's PC and cycle count when it took the violation as its fault; `None` until it
+    /// has (`Backing::latch_strict_stop`).
+    pub(crate) stopped: Option<(u32, u64)>,
+}
+
+impl StrictViolation {
+    /// The core whose instruction, fetch or IDMA made the access; `None` for a system master.
+    #[cfg(test)]
+    pub(crate) fn core(&self) -> Option<usize> {
+        match self.origin {
+            StrictOrigin::Core(core) | StrictOrigin::Idma(core) => Some(core),
+            StrictOrigin::Master => None,
+        }
+    }
+
+    /// Who made the access, as the message names it.
+    pub(crate) fn requester(&self) -> String {
+        match self.origin {
+            StrictOrigin::Core(core) => format!("Core({core})"),
+            StrictOrigin::Idma(core) => format!("the IDMA of Core({core})"),
+            StrictOrigin::Master => "Dma".to_owned(),
+        }
+    }
+
+    /// What was refused, and where.
+    pub(crate) fn message(&self) -> String {
+        let (operation, length, start) = (self.operation, self.length, self.start);
+        let requester = self.requester();
+        match self.first {
+            Some(first) => format!(
+                "strict physical-memory: {operation} of {length} bytes by {requester} at \
+                 0x{start:08x} enters a reserved, unsupported, or cache-converted range at \
+                 0x{first:08x}"
+            ),
+            None => format!(
+                "strict physical-memory: {operation} of {length} bytes by {requester} at \
+                 0x{start:08x} spans past the 32-bit address space"
+            ),
+        }
+    }
+
+    /// What the core the violation is reported on is to it: the one that made the access, the
+    /// one whose IDMA did, or - for a system master - merely the core that was focused when the
+    /// master made the access, whose PC says where the program was rather than what made it.
+    pub(crate) fn role(&self) -> &'static str {
+        match self.origin {
+            StrictOrigin::Core(_) => "the core that made the access",
+            StrictOrigin::Idma(_) => "the core whose IDMA made the access",
+            StrictOrigin::Master => {
+                "the focused core; a system bus master made the access, not this core"
+            }
+        }
+    }
+
+    /// The fault the reporting core takes: the message, the core, its role, and where that core
+    /// stopped. `None` until the stop is latched.
+    pub(crate) fn fault_text(&self) -> Option<String> {
+        let (pc, cycles) = self.stopped?;
+        Some(format!(
+            "{} (reported on core {}, {}; stopped at PC 0x{pc:08x}, cycle {cycles})",
+            self.message(),
+            self.reported_core,
+            self.role()
+        ))
+    }
+}
+
 /// The storage every master shares: each megamodule's SRAM, the shared L2 RAM and ROM, the
 /// DDR2 window and everything sparse. Addresses arrive as the requester issued them and are
 /// resolved through the device's address map, so a core's local window and the global alias of
@@ -423,13 +527,38 @@ pub(crate) struct Backing {
     /// stamps live with the bytes they describe, and only a word some core has linked is tracked.
     memory_versions: BTreeMap<u32, u64>,
     write_serial: u64,
+    /// The `C64XEMU_STRICT_PHYSICAL_MEMORY` switch, the only part of the diagnostic every access
+    /// reads. Changed through `set_strict_physical_memory`, which keeps `strict` in step.
+    strict_physical_memory: bool,
+    /// The core front ends are focused on, which a system master's violation is reported on
+    /// (`set_strict_focus`). Kept whether or not the diagnostic is on, so turning it on later
+    /// still knows the focus.
+    strict_focus: u8,
+    /// Everything else the diagnostic keeps. It is allocated only when the diagnostic is turned
+    /// on: with it off the storage makes no allocation the device without the diagnostic would
+    /// not, so the heap - and the relative placement of the hot CPU, megamodule and fabric
+    /// state the run touches every cycle - is laid out exactly as without it.
+    strict: Option<Box<StrictState>>,
+}
+
+/// The strict physical-memory diagnostic's bookkeeping (`Backing::strict`).
+struct StrictState {
+    /// Moves whenever any core's cache configuration changes how much of its SRAM is left, so a
+    /// strict-mode CPU can tell that a packet it already holds may now name cache-converted
+    /// memory - another core's, through its global alias, included.
+    sram_epoch: u64,
+    /// The SRAM epoch each core's CPU last fetched a packet under (`strict_sram_moved`).
+    seen_sram_epoch: Box<[u64]>,
+    /// The first access strict mode refused, and how many it has refused in all.
+    violation: Option<StrictViolation>,
+    refusals: u64,
 }
 
 impl Backing {
     pub(crate) fn new(map: &'static AddressMap, endian: Endian) -> Self {
         let (l2_base, _) = map.local_l2();
         let core_stride = (map.l2_bytes() + map.l1p_bytes() + map.l1d_bytes()) as usize;
-        Self {
+        let mut backing = Self {
             map,
             endian,
             l2_base,
@@ -454,7 +583,221 @@ impl Backing {
             sparse: BTreeMap::new(),
             memory_versions: BTreeMap::new(),
             write_serial: 0,
+            strict_physical_memory: false,
+            strict_focus: 0,
+            strict: None,
+        };
+        backing.set_strict_physical_memory(
+            std::env::var("C64XEMU_STRICT_PHYSICAL_MEMORY").is_ok_and(|value| value == "1"),
+        );
+        backing
+    }
+
+    /// Turn the strict physical-memory diagnostic on or off. Turning it on allocates its
+    /// bookkeeping the first time; turning it off keeps whatever it recorded.
+    pub(crate) fn set_strict_physical_memory(&mut self, on: bool) {
+        self.strict_physical_memory = on;
+        if on && self.strict.is_none() {
+            self.strict = Some(Box::new(StrictState {
+                // One ahead of what every core has seen, so a packet a CPU held before the
+                // diagnostic was turned on is fetched again, and checked.
+                sram_epoch: 1,
+                seen_sram_epoch: vec![0; self.map.cores].into_boxed_slice(),
+                violation: None,
+                refusals: 0,
+            }));
         }
+    }
+
+    /// Whether the diagnostic is on.
+    #[inline(always)]
+    pub(crate) fn strict_physical_memory(&self) -> bool {
+        self.strict_physical_memory
+    }
+
+    /// The `C64XEMU_STRICT_PHYSICAL_MEMORY=1` diagnostic: whether an access of `length` bytes
+    /// at `address` is refused because it enters a documented on-chip hole
+    /// (`AddressMap::known_hole`) or SRAM the cache configuration has converted into cache, or
+    /// wraps past the top of the address space. A refused access must have no effect: the
+    /// caller returns zeros for a read and drops a write, before any cache or storage is
+    /// touched. The first refusal is kept as the device's `StrictViolation`, which stops the
+    /// run (see `StrictViolation`). Disabled, it is one flag test.
+    #[inline]
+    pub(crate) fn strict_refuses(
+        &mut self,
+        requester: Requester,
+        address: u32,
+        length: usize,
+        operation: &'static str,
+    ) -> bool {
+        if !self.strict_physical_memory {
+            return false;
+        }
+        let origin = match requester {
+            Requester::Core(core) => StrictOrigin::Core(core),
+            Requester::Dma => StrictOrigin::Master,
+        };
+        self.refuse_strict_span(requester, origin, address, length, operation)
+    }
+
+    /// The same check for a step of `core`'s IDMA, which resolves its (already global) address
+    /// as a master does but is blamed on the megamodule that owns it.
+    #[inline]
+    pub(crate) fn strict_refuses_idma(
+        &mut self,
+        core: usize,
+        address: u32,
+        length: usize,
+        operation: &'static str,
+    ) -> bool {
+        if !self.strict_physical_memory {
+            return false;
+        }
+        self.refuse_strict_span(
+            Requester::Dma,
+            StrictOrigin::Idma(core),
+            address,
+            length,
+            operation,
+        )
+    }
+
+    /// Whether any core's SRAM/cache split has moved since `core` last asked. A CPU that reuses
+    /// a fetched packet without fetching it again asks at every packet with strict checks on,
+    /// so a carve by any core is checked on the next packet rather than skipped
+    /// (`Cpu::strict_packet_start`). The epoch each core last saw lives here rather than in the
+    /// CPU, out of the hot CPU state.
+    pub(crate) fn strict_sram_moved(&mut self, core: usize) -> bool {
+        let Some(strict) = self.strict.as_deref_mut() else {
+            return false;
+        };
+        let seen = &mut strict.seen_sram_epoch[core];
+        let moved = *seen != strict.sram_epoch;
+        *seen = strict.sram_epoch;
+        moved
+    }
+
+    /// Whether a strict violation has been recorded, which ends the run at the next cycle
+    /// boundary and keeps it ended until the device is rebuilt.
+    #[inline(always)]
+    pub(crate) fn strict_stopped(&self) -> bool {
+        self.strict_violation().is_some()
+    }
+
+    /// How many accesses strict mode has refused: a CPU compares it across its packet fetch to
+    /// tell whether that fetch was the one refused.
+    #[inline(always)]
+    pub(crate) fn strict_refusals(&self) -> u64 {
+        self.strict.as_ref().map_or(0, |strict| strict.refusals)
+    }
+
+    /// The first strict violation, if any.
+    pub(crate) fn strict_violation(&self) -> Option<&StrictViolation> {
+        self.strict.as_ref()?.violation.as_ref()
+    }
+
+    /// The core front ends are focused on, which a system master's violation is reported on.
+    /// The device keeps it current (`Device::set_focus`); the violation reads it once, when the
+    /// access is refused.
+    pub(crate) fn set_strict_focus(&mut self, core: usize) {
+        self.strict_focus = core as u8;
+    }
+
+    /// `core` takes the recorded violation as its fault, stopped at `pc` and `cycles`: answered
+    /// only when the violation is reported on `core`, and the stop is recorded the first time
+    /// only, so a second latch - by the same core or any other - changes nothing.
+    pub(crate) fn latch_strict_stop(
+        &mut self,
+        core: usize,
+        pc: u32,
+        cycles: u64,
+    ) -> Option<&StrictViolation> {
+        let violation = self.strict.as_mut()?.violation.as_mut()?;
+        if violation.reported_core != core {
+            return None;
+        }
+        violation.stopped.get_or_insert((pc, cycles));
+        Some(violation)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn refuse_strict_span(
+        &mut self,
+        requester: Requester,
+        origin: StrictOrigin,
+        address: u32,
+        length: usize,
+        operation: &'static str,
+    ) -> bool {
+        let Some(first) = self.strict_hole(requester, address, length) else {
+            return false;
+        };
+        let focus = usize::from(self.strict_focus);
+        let strict = self
+            .strict
+            .as_deref_mut()
+            .expect("the diagnostic's state exists while it is on");
+        strict.refusals += 1;
+        if strict.violation.is_none() {
+            let reported_core = match origin {
+                StrictOrigin::Core(core) | StrictOrigin::Idma(core) => core,
+                StrictOrigin::Master => focus,
+            };
+            strict.violation = Some(StrictViolation {
+                operation,
+                length,
+                origin,
+                start: address,
+                first,
+                reported_core,
+                stopped: None,
+            });
+        }
+        true
+    }
+
+    /// Where an access first leaves physical memory: `Some(Some(address))` for the first byte
+    /// in a hole or a carve, `Some(None)` for a span that wraps past the top of the address
+    /// space, `None` when the whole access is memory.
+    fn strict_hole(
+        &self,
+        requester: Requester,
+        address: u32,
+        length: usize,
+    ) -> Option<Option<u32>> {
+        let start = u64::from(address);
+        let address_space_end = u64::from(u32::MAX) + 1;
+        if length as u64 > address_space_end - start {
+            return Some(None);
+        }
+        let end = start + length as u64;
+        // Every window, alias slot, reserved range and cache carve starts and ends on a 4 KB
+        // boundary, so probing the first byte and then each page the span reaches finds any
+        // hole without a byte-by-byte scan.
+        let mut at = start;
+        while at < end {
+            let probe = at as u32;
+            if self.map.known_hole(requester, probe)
+                || self.placement(requester, probe) == Placement::ConvertedToCache
+            {
+                return Some(Some(probe));
+            }
+            at = ((at & !0xfff) + 0x1000).min(end);
+        }
+        None
+    }
+
+    /// Forget the recorded violation, so a test can judge the next access on its own.
+    #[cfg(test)]
+    pub(crate) fn take_strict_violation(&mut self) -> Option<StrictViolation> {
+        self.strict.as_mut()?.violation.take()
+    }
+
+    /// How many bytes sparse storage holds, for tests that check an access stored nothing.
+    #[cfg(test)]
+    pub(crate) fn sparse_bytes(&self) -> usize {
+        self.sparse.len()
     }
 
     pub(crate) fn set_endian(&mut self, endian: Endian) {
@@ -493,6 +836,9 @@ impl Backing {
     /// hands back memory that reads as nothing rather than as what used to be there.
     pub(crate) fn set_core_sram(&mut self, core: usize, l2: u32, l1p: u32, l1d: u32) {
         self.sram[core] = CoreSram { l2, l1p, l1d };
+        if let Some(strict) = self.strict.as_deref_mut() {
+            strict.sram_epoch = strict.sram_epoch.wrapping_add(1);
+        }
         let base = core * self.core_stride;
         let l1p_base = base + self.map.l2_bytes() as usize;
         let l1d_base = l1p_base + self.map.l1p_bytes() as usize;
@@ -1398,22 +1744,85 @@ pub(crate) struct BoundHierarchy<'a> {
 }
 
 impl BoundHierarchy<'_> {
+    /// The strict physical-memory check for one of this core's accesses, made before any cache
+    /// is consulted: a refused access touches no cache, replacement state or storage.
+    #[inline(always)]
+    fn strict_refuses(&mut self, address: u32, length: usize, operation: &'static str) -> bool {
+        self.backing
+            .strict_refuses(self.hierarchy.requester(), address, length, operation)
+    }
+    // Loads and stores. Each checked one is the access itself behind one flag test, with the
+    // checked access a separate cold function, so with the diagnostic off the inlined code is
+    // what it would be without it. The `_unchecked` ones are for an access the CPU's
+    // `Fabric::check_access` has already judged, strict check included (`Fabric::read32_admitted`
+    // and its kin): the CPU's own loads and stores pay no test here at all.
     #[inline]
     pub(crate) fn read_u8(&mut self, address: u32) -> u8 {
+        if self.backing.strict_physical_memory() {
+            return self.read_u8_checked(address);
+        }
+        self.read_data_byte(address)
+    }
+    #[inline(always)]
+    pub(crate) fn read_u8_unchecked(&mut self, address: u32) -> u8 {
+        self.read_data_byte(address)
+    }
+    #[inline(always)]
+    pub(crate) fn write_u8_unchecked(&mut self, address: u32, value: u8) {
+        self.write_data_byte(address, value);
+    }
+    #[cold]
+    #[inline(never)]
+    fn read_u8_checked(&mut self, address: u32) -> u8 {
+        if self.strict_refuses(address, 1, "read") {
+            return 0;
+        }
         self.read_data_byte(address)
     }
     #[inline]
     pub(crate) fn write_u8(&mut self, address: u32, value: u8) {
+        if self.backing.strict_physical_memory() {
+            return self.write_u8_checked(address, value);
+        }
         self.write_data_byte(address, value);
     }
+    #[cold]
+    #[inline(never)]
+    fn write_u8_checked(&mut self, address: u32, value: u8) {
+        if !self.strict_refuses(address, 1, "write") {
+            self.write_data_byte(address, value);
+        }
+    }
+    #[cfg(test)]
     pub(crate) fn write_u16(&mut self, address: u32, value: u16) {
+        if !(self.backing.strict_physical_memory() && self.strict_refuses(address, 2, "write")) {
+            self.write_u16_unchecked(address, value);
+        }
+    }
+    #[inline(always)]
+    pub(crate) fn write_u16_unchecked(&mut self, address: u32, value: u16) {
         let bytes = match self.backing.endian {
             Endian::Little => value.to_le_bytes(),
             Endian::Big => value.to_be_bytes(),
         };
         self.write_data_bytes(address, bytes);
     }
+    #[cfg(test)]
     pub(crate) fn read_u16(&mut self, address: u32) -> u16 {
+        if self.backing.strict_physical_memory() {
+            return self.read_u16_checked(address);
+        }
+        self.read_u16_unchecked(address)
+    }
+    #[cfg(test)]
+    fn read_u16_checked(&mut self, address: u32) -> u16 {
+        if self.strict_refuses(address, 2, "read") {
+            return 0;
+        }
+        self.read_u16_unchecked(address)
+    }
+    #[inline(always)]
+    pub(crate) fn read_u16_unchecked(&mut self, address: u32) -> u16 {
         let bytes = self.read_data_bytes(address);
         match self.backing.endian {
             Endian::Little => u16::from_le_bytes(bytes),
@@ -1422,6 +1831,21 @@ impl BoundHierarchy<'_> {
     }
     #[inline]
     pub(crate) fn read_u32(&mut self, address: u32) -> u32 {
+        if self.backing.strict_physical_memory() {
+            return self.read_u32_checked(address);
+        }
+        self.read_u32_unchecked(address)
+    }
+    #[cold]
+    #[inline(never)]
+    fn read_u32_checked(&mut self, address: u32) -> u32 {
+        if self.strict_refuses(address, 4, "read") {
+            return 0;
+        }
+        self.read_u32_unchecked(address)
+    }
+    #[inline(always)]
+    pub(crate) fn read_u32_unchecked(&mut self, address: u32) -> u32 {
         let bytes = self.read_data_bytes(address);
         match self.backing.endian {
             Endian::Little => u32::from_le_bytes(bytes),
@@ -1430,6 +1854,20 @@ impl BoundHierarchy<'_> {
     }
     #[inline]
     pub(crate) fn write_u32(&mut self, address: u32, value: u32) {
+        if self.backing.strict_physical_memory() {
+            return self.write_u32_checked(address, value);
+        }
+        self.write_u32_unchecked(address, value);
+    }
+    #[cold]
+    #[inline(never)]
+    fn write_u32_checked(&mut self, address: u32, value: u32) {
+        if !self.strict_refuses(address, 4, "write") {
+            self.write_u32_unchecked(address, value);
+        }
+    }
+    #[inline(always)]
+    pub(crate) fn write_u32_unchecked(&mut self, address: u32, value: u32) {
         let bytes = match self.backing.endian {
             Endian::Little => value.to_le_bytes(),
             Endian::Big => value.to_be_bytes(),
@@ -1446,6 +1884,22 @@ impl BoundHierarchy<'_> {
     }
     pub(crate) fn fetch_packet(&mut self, address: u32) -> [u8; 32] {
         debug_assert_eq!(address & 0x1f, 0);
+        // The checked fetch is out of line: an early return of a refused packet inlined here
+        // would cost every caller - `Cpu::step` above all - stack for a second packet even with
+        // the diagnostic off.
+        if self.backing.strict_physical_memory() {
+            return self.fetch_packet_checked(address);
+        }
+        self.fetch_bytes(address)
+    }
+    /// A fetch under strict physical-memory checks: a refused packet reads as zeros and
+    /// touches no cache.
+    #[cold]
+    #[inline(never)]
+    fn fetch_packet_checked(&mut self, address: u32) -> [u8; 32] {
+        if self.strict_refuses(address, 32, "fetch") {
+            return [0; 32];
+        }
         self.fetch_bytes(address)
     }
     fn fetch_bytes<const N: usize>(&mut self, address: u32) -> [u8; N] {
@@ -1875,6 +2329,9 @@ impl BoundHierarchy<'_> {
         self.write_l2_lines(l2_lines);
     }
     pub(crate) fn read_bytes(&mut self, address: u32, length: usize) -> Vec<u8> {
+        if self.strict_refuses(address, length, "read") {
+            return vec![0; length];
+        }
         (0..length)
             .map(|offset| self.read_u8(address.wrapping_add(offset as u32)))
             .collect()
@@ -1887,9 +2344,9 @@ fn mar_index(address: u32) -> Option<usize> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
-    use crate::space::C6455_MAP;
+    use crate::space::{C6455_MAP, C6472_MAP};
 
     /// The C6455's L1D window, and four external lines that index the same set of a 4 KB
     /// two-way L1D: 4096 / 64 per line / 2 ways is 32 sets, so the stride is 2048 bytes.
@@ -1901,6 +2358,336 @@ mod tests {
             MemoryHierarchy::new(0, &C6455_MAP),
             Backing::new(&C6455_MAP, Endian::Little),
         )
+    }
+
+    /// The message of the strict violation recorded so far, cleared so the next access is
+    /// judged afresh, or a test failure if nothing was refused.
+    pub(crate) fn take_strict_message(backing: &mut Backing) -> String {
+        backing
+            .take_strict_violation()
+            .expect("strict physical-memory mode accepted the access")
+            .message()
+    }
+
+    fn strict_backing(map: &'static AddressMap) -> Backing {
+        let mut backing = Backing::new(map, Endian::Little);
+        backing.set_strict_physical_memory(true);
+        backing
+    }
+
+    fn assert_accepted(backing: &mut Backing, requester: Requester, address: u32, length: usize) {
+        assert!(
+            !backing.strict_refuses(requester, address, length, "read"),
+            "{requester:?} 0x{address:08x}+{length}: {:?}",
+            backing.strict_violation().map(StrictViolation::message)
+        );
+    }
+
+    /// Assert one access is refused, and that the message names the operation, the requester,
+    /// the access and the first address of it that is in a hole.
+    fn assert_refused(
+        backing: &mut Backing,
+        requester: Requester,
+        address: u32,
+        length: usize,
+        probe: u32,
+    ) {
+        assert!(backing.strict_refuses(requester, address, length, "read"));
+        assert_eq!(
+            take_strict_message(backing),
+            format!(
+                "strict physical-memory: read of {length} bytes by {requester:?} at \
+                 0x{address:08x} enters a reserved, unsupported, or cache-converted range at \
+                 0x{probe:08x}"
+            )
+        );
+    }
+
+    #[test]
+    fn strict_memory_is_opt_in_and_checks_cached_cpu_accesses() {
+        let (mut mm, mut backing) = hierarchy();
+        mm.bind(&mut backing).cache_register_write(L1DCFG, 1);
+        // Off, a reserved address is ordinary sparse memory, and L1D caches it.
+        assert_eq!(mm.bind(&mut backing).read_u32(0), 0);
+        assert!(mm.l1d.read_bytes::<4>(0).is_some());
+        assert!(backing.strict_violation().is_none());
+        backing.set_strict_physical_memory(true);
+        // On, the cached line does not answer for it: the check runs before the lookup.
+        mm.bind(&mut backing).write_u32(0, 0x1234_5678);
+        assert!(backing.strict_stopped());
+        assert_eq!(
+            take_strict_message(&mut backing),
+            "strict physical-memory: write of 4 bytes by Core(0) at 0x00000000 enters a \
+             reserved, unsupported, or cache-converted range at 0x00000000"
+        );
+        // The refused store did not reach the line L1D holds.
+        assert_eq!(mm.l1d.read_bytes::<4>(0), Some([0; 4]));
+    }
+
+    /// A refused read answers zeros, and neither allocates a line nor moves replacement state
+    /// or the miss counters; the first violation is the one kept.
+    #[test]
+    fn a_refused_cpu_read_answers_zeros_and_leaves_the_caches_alone() {
+        let (mut mm, mut backing) = hierarchy();
+        mm.bind(&mut backing).cache_register_write(L1DCFG, 1);
+        backing.set_strict_physical_memory(true);
+        let before = mm.cache_views().map(|view| view.lines.len());
+        let mut bound = mm.bind(&mut backing);
+        assert_eq!(bound.read_u32(0x0000_1000), 0);
+        assert_eq!(bound.read_u16(0x0000_2000), 0);
+        assert_eq!(bound.read_u8(0x0000_3000), 0);
+        assert_eq!(bound.fetch_packet(0x0000_4000), [0; 32]);
+        assert_eq!(bound.read_bytes(0x0000_5000, 3), [0; 3]);
+        assert_eq!(mm.cache_views().map(|view| view.lines.len()), before);
+        assert_eq!(backing.strict_refusals(), 5);
+        assert_eq!(
+            take_strict_message(&mut backing),
+            "strict physical-memory: read of 4 bytes by Core(0) at 0x00001000 enters a \
+             reserved, unsupported, or cache-converted range at 0x00001000"
+        );
+        assert_eq!(backing.sparse_bytes(), 0);
+    }
+
+    #[test]
+    fn strict_memory_rejects_holes_carves_and_wrapping_spans() {
+        let (mut mm, mut backing) = hierarchy();
+        backing.set_strict_physical_memory(true);
+        // A 32 KB L2 cache takes 009F 8000h-009F FFFFh.
+        mm.bind(&mut backing).cache_register_write(L2CFG, 1);
+        {
+            let mut bound = mm.bind(&mut backing);
+            bound.write_u32(0x009f_7ffc, 0x1234_5678);
+            assert_eq!(bound.read_u32(0x009f_7ffc), 0x1234_5678);
+        }
+        assert!(!backing.strict_stopped());
+        assert_accepted(&mut backing, Requester::Dma, 0x009f_7ffc, 4);
+        assert_refused(&mut backing, Requester::Core(0), 0, 4, 0);
+        assert_refused(
+            &mut backing,
+            Requester::Core(0),
+            0x009f_8000,
+            4,
+            0x009f_8000,
+        );
+        assert_refused(&mut backing, Requester::Dma, 0x009f_8000, 4, 0x009f_8000);
+        // A span that starts in SRAM and crosses a page boundary into the carve.
+        assert_refused(&mut backing, Requester::Dma, 0x009f_7ff0, 0x20, 0x009f_8000);
+        assert!(backing.strict_refuses(Requester::Core(0), 0xffff_fff0, 32, "fetch"));
+        assert_eq!(
+            take_strict_message(&mut backing),
+            "strict physical-memory: fetch of 32 bytes by Core(0) at 0xfffffff0 spans past the \
+             32-bit address space"
+        );
+        // The last bytes of the address space and an empty access are fine.
+        assert_accepted(&mut backing, Requester::Core(0), 0xffff_fffc, 4);
+        assert_accepted(&mut backing, Requester::Core(0), 0xffff_ffff, 1);
+        assert_accepted(&mut backing, Requester::Core(0), 0xffff_fff0, 0);
+        assert!(backing.strict_refuses(Requester::Core(0), 0xffff_fffd, 4, "read"));
+        let message = take_strict_message(&mut backing);
+        assert!(
+            message.contains("spans past the 32-bit address space"),
+            "{message}"
+        );
+    }
+
+    /// A refused CPU store stores nothing, and later violations do not replace the first.
+    #[test]
+    fn strict_memory_rejects_a_cpu_store_before_it_lands() {
+        let (mut mm, mut backing) = hierarchy();
+        backing.set_strict_physical_memory(true);
+        mm.bind(&mut backing).write_u32(0x00a0_0000, 0xdead_beef);
+        mm.bind(&mut backing).write_u16(0x00a0_1000, 0xbeef);
+        mm.bind(&mut backing).write_u8(0x00a0_2000, 0xef);
+        assert_eq!(backing.strict_refusals(), 3);
+        assert_eq!(
+            backing
+                .strict_violation()
+                .map(StrictViolation::message)
+                .as_deref(),
+            Some(
+                "strict physical-memory: write of 4 bytes by Core(0) at 0x00a00000 enters a \
+                 reserved, unsupported, or cache-converted range at 0x00a00000"
+            )
+        );
+        assert_eq!(backing.strict_violation().unwrap().core(), Some(0));
+        assert!(backing.sparse.is_empty());
+        assert_eq!(
+            backing.read_bytes(Requester::Core(0), 0x00a0_0000, 4),
+            [0; 4]
+        );
+    }
+
+    /// SPRS276M Table 2-2: everything below the configuration space that is not L2, L1P, L1D
+    /// or the 32 KB boot ROM is reserved on the C6455, the same for the CPU and for a master.
+    #[test]
+    fn strict_memory_covers_the_c6455_reserved_ranges() {
+        let mut backing = strict_backing(&C6455_MAP);
+        for requester in [Requester::Core(0), Requester::Dma] {
+            for hole in [
+                0x0000_0000,
+                0x0001_0000,
+                0x000f_f000,
+                0x0010_8000,
+                0x007f_f000,
+                0x00a0_0000,
+                0x00df_f000,
+                0x00e0_8000,
+                0x00ef_f000,
+                0x00f0_8000,
+                0x0100_0000,
+                0x017f_f000,
+            ] {
+                assert_refused(&mut backing, requester, hole, 4, hole);
+            }
+            // The last word of L2 SRAM and the word past it, one access.
+            assert_refused(&mut backing, requester, 0x009f_fffc, 8, 0x00a0_0000);
+            for memory in [
+                0x0010_0000,
+                0x0010_7ffc,
+                0x0080_0000,
+                0x009f_fffc,
+                0x00e0_7ffc,
+                0x00f0_7ffc,
+                // Configuration space, external memory and the unused space between them stay
+                // permissive.
+                0x0180_0000,
+                0x1080_0000,
+                0xa000_0000,
+                0xe000_0000,
+            ] {
+                assert_accepted(&mut backing, requester, memory, 4);
+            }
+        }
+    }
+
+    /// SPRS612G Table 2-2, with ROM where section 5.1 puts it: a core's local view, a
+    /// master's view of the same local-only addresses, and the global alias region.
+    #[test]
+    fn strict_memory_covers_the_c6472_reserved_ranges() {
+        let mut backing = strict_backing(&C6472_MAP);
+        for core in [0, 5] {
+            let requester = Requester::Core(core);
+            for hole in [
+                0x0000_0000,
+                0x000f_f000,
+                0x001c_0000,
+                0x002c_0000,
+                0x007f_f000,
+                0x0089_8000,
+                0x00df_f000,
+                0x00e0_8000,
+                0x00f0_8000,
+                0x0100_0000,
+                0x017f_f000,
+                0x1089_8000,
+                // The shared ROM has no global alias, so its offset in a slot is a gap.
+                0x1010_0000,
+                0x1310_0000,
+                0x15f0_8000,
+                0x1600_0000,
+                0x1fff_f000,
+            ] {
+                assert_refused(&mut backing, requester, hole, 4, hole);
+            }
+            for memory in [
+                0x0010_0000,
+                0x001b_fffc,
+                0x0020_0000,
+                0x002b_fffc,
+                0x0080_0000,
+                0x0089_7ffc,
+                0x00e0_7ffc,
+                0x00f0_7ffc,
+                0x1020_0000,
+                0x1580_0000,
+                0x15f0_7ffc,
+                0x2000_0000,
+                0xe000_0000,
+            ] {
+                assert_accepted(&mut backing, requester, memory, 4);
+            }
+        }
+        // A master names a core's memories only by their aliases: every local-only address is
+        // a hole for it, the shared ROM and RAM windows included.
+        for hole in [
+            0x0010_0000,
+            0x0020_0000,
+            0x0080_0000,
+            0x00e0_0000,
+            0x00f0_0000,
+            0x1010_0000,
+        ] {
+            assert_refused(&mut backing, Requester::Dma, hole, 4, hole);
+        }
+        for memory in [
+            0x1020_0000,
+            0x1380_0000,
+            0x13e0_0000,
+            0x13f0_0000,
+            0x2000_0000,
+        ] {
+            assert_accepted(&mut backing, Requester::Dma, memory, 4);
+        }
+    }
+
+    /// A core's carve applies to every name for its memory: core 3 with a 256 KB L2 cache keeps
+    /// 352 KB of SRAM, and its global alias ends there for a master as it does for any core.
+    #[test]
+    fn strict_memory_rejects_a_carve_through_the_global_alias() {
+        let mut backing = strict_backing(&C6472_MAP);
+        backing.set_core_sram(3, 352 * 1024, 32 * 1024, 32 * 1024);
+        for requester in [Requester::Dma, Requester::Core(0), Requester::Core(3)] {
+            assert_accepted(&mut backing, requester, 0x1385_7ffc, 4);
+            assert_refused(&mut backing, requester, 0x1385_8000, 4, 0x1385_8000);
+            assert_refused(&mut backing, requester, 0x1385_7ffc, 8, 0x1385_8000);
+        }
+        assert_accepted(&mut backing, Requester::Core(3), 0x0085_7ffc, 4);
+        assert_refused(
+            &mut backing,
+            Requester::Core(3),
+            0x0085_8000,
+            4,
+            0x0085_8000,
+        );
+        // Another core's local window is its own, uncarved L2.
+        assert_accepted(&mut backing, Requester::Core(2), 0x0085_8000, 4);
+    }
+
+    /// The violation names who made the access and what the core it is reported on is to it.
+    #[test]
+    fn a_strict_violation_names_its_origin_and_the_reporting_cores_role() {
+        let mut backing = strict_backing(&C6472_MAP);
+        assert!(backing.strict_refuses_idma(4, 0x1489_8000, 4, "IDMA write"));
+        let violation = backing.take_strict_violation().unwrap();
+        assert_eq!(violation.core(), Some(4));
+        assert_eq!(
+            violation.message(),
+            "strict physical-memory: IDMA write of 4 bytes by the IDMA of Core(4) at 0x14898000 \
+             enters a reserved, unsupported, or cache-converted range at 0x14898000"
+        );
+        assert_eq!(violation.role(), "the core whose IDMA made the access");
+        assert_eq!(violation.reported_core, 4);
+        // A master's violation is reported on the core focused when it is made.
+        backing.set_strict_focus(2);
+        assert!(backing.strict_refuses(Requester::Dma, 0x0080_0000, 4, "DMA read"));
+        backing.set_strict_focus(5);
+        assert_eq!(backing.strict_violation().unwrap().reported_core, 2);
+        // Only that core takes it, and only its first stop counts.
+        assert!(backing.latch_strict_stop(5, 0, 0).is_none());
+        assert!(backing.latch_strict_stop(2, 0x0080_1234, 99).is_some());
+        assert!(backing.latch_strict_stop(2, 0x0080_9999, 1234).is_some());
+        let violation = backing.take_strict_violation().unwrap();
+        assert_eq!(violation.core(), None);
+        assert_eq!(violation.stopped, Some((0x0080_1234, 99)));
+        assert!(violation.role().starts_with("the focused core"));
+        assert_eq!(
+            violation.fault_text().unwrap(),
+            format!(
+                "{} (reported on core 2, the focused core; a system bus master made the access, \
+                 not this core; stopped at PC 0x00801234, cycle 99)",
+                violation.message()
+            )
+        );
     }
 
     /// Cache the DDR2 region and turn on a 4 KB L1D cache and a 32 KB L2 cache.

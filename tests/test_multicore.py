@@ -13,6 +13,7 @@ this file pins what the command line does with it.
 from __future__ import annotations
 
 import json
+import os
 import re
 import select
 import socket
@@ -440,6 +441,13 @@ def test_c6472_firmware_leaves_cores_held_without_a_release(
     the boot controller doing its job, not from the cores having been running all along.
     """
     answered_at, total_at = result_addresses(multicore_firmware)
+    # The C6472 firmware's shared-L2 mailbox at 0020 0000h is reserved on the C6455, which is the
+    # point of this control, so the strict physical-memory diagnostic would rightly stop it.
+    environment = {
+        name: value
+        for name, value in os.environ.items()
+        if name != "C64XEMU_STRICT_PHYSICAL_MEMORY"
+    }
     completed = subprocess.run(
         [
             str(candidate_binary),
@@ -458,6 +466,7 @@ def test_c6472_firmware_leaves_cores_held_without_a_release(
         capture_output=True,
         text=True,
         timeout=300,
+        env=environment,
     )
     (answered,) = dumped(completed.stderr, answered_at)
     (total,) = dumped(completed.stderr, total_at)

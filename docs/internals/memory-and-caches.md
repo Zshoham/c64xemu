@@ -85,6 +85,139 @@ The shared ROM is the one place SPRS612G contradicts itself: Table 2-2 calls
 0010 0000h — which is also where Table 2-4 starts core 0 for every ROM boot mode. `C6472_MAP`
 models it where the two sections that describe it say it is.
 
+### Strict physical memory
+
+`C64XEMU_STRICT_PHYSICAL_MEMORY=1` (exactly `1`; any other value, or none, leaves it off) turns
+two kinds of silent sparse access into a fault that stops the run: an access to a documented
+on-chip hole, and an access to SRAM the cache configuration has converted into cache.
+`Backing::strict_refuses` makes the check (`strict_refuses_idma` for an IDMA step).
+
+Off, it costs the CPU's hot paths nothing: a CPU load or store pays no test of its own (see
+below), a fetch or a master transfer one flag test that branches to a separate cold function,
+and the run loops ask whether the diagnostic is on once per batch. Its bookkeeping
+(`StrictState`: the violation, the refusal count, the SRAM epochs) is allocated only when it is
+turned on, so with it off the device makes no allocation it would not otherwise make and its hot
+state is laid out as it would be without it - which matters: the six-core C6472's throughput
+moves by several per cent with the placement of the CPU, megamodule and fabric state on the
+heap, and of the hot code.
+
+What counts as a hole is derived from the address map (`AddressMap::known_hole`): an address is
+one when it lies in a range the datasheet reserves wherever no memory answers, and
+`placement` gives `Sparse` for the requester making the access. The ranges are:
+
+- the internal range below the configuration space, 0000 0000h–017F FFFFh, on both devices.
+  On the C6455 that flags everything but L2, L1P, L1D and the 32 KB boot ROM at
+  0010 0000h–0010 7FFFh, which is real memory the model serves sparsely (SPRS276M Table 2-2).
+  On the C6472 it flags everything but the shared ROM and RAM and the requesting core's L2, L1P
+  and L1D, so the tail of the 608 KB L2 window through 00DF FFFFh and the L1P and L1D tails are
+  holes; the shared ROM is where section 5.1 puts it, as above (SPRS612G Table 2-2);
+- on the C6472, the global alias region 1000 0000h–1FFF FFFFh: the gaps in each core's slot,
+  and 15F0 8000h onwards, past the sixth core's L1D.
+
+Because the requester decides the placement, a C6472 DMA master — which has no local view —
+finds every local-only address a hole: a core's L2, L1P or L1D window, and the shared ROM and
+RAM windows at 0010 0000h and 0020 0000h. A master names the shared RAM by any core's
+1*n*20 0000h alias. The shared ROM has no global alias — Table 2-2 lists none, and
+`C6472_MAP` models none — so a master cannot reach it, and 1*n*10 0000h is a hole in each alias
+slot like any other gap. The same local addresses stay valid for a CPU core, and on the C6455 a
+master shares core 0's view. Cache-converted SRAM is caught under every name for it: core 3 of a C6472 with a 256 KB
+L2 cache keeps 352 KB of SRAM, so 1385 7FFCh is accepted and 1385 8000h refused, for a master
+and for any core. Spans are checked from their first byte through each 4 KB page they reach
+(every window, carve and reserved range is page-aligned), and a span wrapping past
+FFFF FFFFh is refused; a zero-length access, and one ending exactly at the top, is not.
+
+The CPU's loads and stores are checked by `Fabric::check_access`, the memory protection check
+every one of them already crosses, before the cache lookup: the megamodule's `cpu_checks` bits
+say whether memory protection or the diagnostic applies, so with both off that check is the one
+test it always was, and with the diagnostic on its slow path makes the strict check after the
+protection check. The access itself then goes through the `_admitted` accessors
+(`Fabric::read32_admitted` and its kin), which do not check again. Instruction fetches are
+checked in `BoundHierarchy::fetch_packet`, also before any cache. Every other route into the
+memory hierarchy - the boot ROM's word and byte accesses and reads, the `read_bytes` operation,
+anything else that uses the bus rather than executing on the CPU - takes the checked
+`BoundHierarchy` accessors. A cache hit or the decode cache cannot hide a violation on any of
+them. The CPU keeps the fetch packet
+it last read and runs later execute packets in it without fetching again; with the check on, it
+drops that packet whenever any core's cache configuration moves (`Backing::strict_sram_moved`),
+so a carve - including another core's, of memory this core is executing through a global alias -
+is checked on the next packet. With the check off the packet stays, as core 0's L1P copy would
+on silicon, since one core's cache configuration does not invalidate another's L1P. System
+masters are checked at the fabric's memory transfer (`memory_bytes` and `store_memory_bytes` in
+`src/system/master.rs`) as `Requester::Dma`, after memory protection has admitted the transfer; accesses routed to peripheral registers and data
+ports are not memory and are outside the check. The IDMA is a megamodule's own: "it provides
+data move services only within the megamodule (L1P, L1D, L2, and CFG)" (SPRU871K section 1.2.5),
+so `Fabric::tick_idma` carries a local window address as the owning core's global alias of it
+(`AddressMap::global_of_local`) before it reaches the fabric, under the starting CPU's PrivID and
+mode (see memory protection below). Its copies therefore land in its
+own core's memory, under its own core's carve, rather than being refused or lost to sparse
+storage. Each IDMA word is checked at both ends, under the IDMA's own name, before either moves. The debug port (`host_read_bytes`, `host_write_bytes`) and the image loader
+(`load_bytes`) are not checked.
+
+#### What a refused access does, and how the run stops
+
+The check refuses an access before it has any effect, and records the first one as the device's
+`StrictViolation`; later refusals are refused too but do not replace it.
+
+- A refused CPU load returns 0 without touching L1D, L2 or their replacement state and
+  statistics. The value never reaches its register: the run stops before the load's write-back.
+- A refused CPU store, a byte, halfword or word, stores nothing, in any cache or in memory. Like
+  a store memory protection refuses, it is not counted in the `stores` statistic, traced as a
+  store or seen by a stack observation window.
+- A refused fetch issues nothing: the execute packet whose fetch was refused is not executed, the
+  core does not finish that cycle, and its PC stays on that packet. The zeros the refused fetch
+  answered are not kept for reuse. The strict refetch of a held fetch packet after a carve is the
+  same fetch, refused the same way.
+- A refused master read (`memory_bytes`) answers zeros and a refused master write stores
+  nothing. Neither is a protection denial, which the master would see as an error: the master
+  carries on with its transfer as though the access had happened, until the run stops.
+- A refused IDMA step reads and writes nothing and raises neither its completion interrupt nor
+  the IDMA error event.
+- A refused boot-ROM or `read_bytes` read answers zeros.
+
+Nothing guest-visible records a violation: no exception, interrupt, IERR bit, memory protection
+fault or error event. It is the emulator's diagnostic, not the device's.
+
+The run stops at the next cycle boundary: the device cycle the access was made in completes for
+every core - the violating core's other instructions in the same execute packet, and its cycle
+boundary, included; a later core's turn in the same device cycle too - and no core starts another
+(`Cpu::run_cycles`, `Device::run_cycles` and `Device::step_cycle` check the flag every cycle). A
+refused fetch is the exception: that core stops before it issues. Once stopped, the device does
+not run again until it is rebuilt (`reload`).
+
+The violation then becomes one core's fault, through the path every other fault takes
+(`Cpu::latch_strict_violation`): the core that made the access, the core whose IDMA made it, or -
+for a system master, which has no core of its own - the core that was focused when the master
+made the access, whose PC says only where the program was. Both are fixed once and kept with the
+violation (`StrictViolation::reported_core`, `stopped`): the reporting core when the access is
+refused - the device tells the backing store its focus on every `set_focus` - and that core's PC
+and cycle count the first time it takes the fault (`Backing::latch_strict_stop`). Moving the
+focus afterwards, before or after the run loop latches it, changes neither, and latching again
+never hands the violation to a second core. If that core had already faulted - its IDMA runs on
+while it is stopped - the strict message comes first and the original follows it after
+`; original fault: `, so neither is lost. `Machine::fault` reports that core's fault even
+when it is not the focused one, so the batch runner, the console debugger, the dashboard and the
+GDB stub stop on it as they do on any fault. The fault text is the violation's message - the
+operation, its length, the requester (`Core(n)`, `the IDMA of Core(n)` or `Dma`), the start
+address and the first address in a hole, or that the span wraps - followed by the core it is
+reported on, what that core is to it, and the PC and cycle it stopped at:
+
+```text
+strict physical-memory: read of 4 bytes by Core(0) at 0x00a00000 enters a reserved, unsupported, or cache-converted range at 0x00a00000 (reported on core 0, the core that made the access; stopped at PC 0x00800870, cycle 17)
+```
+
+The batch runner's state report carries it in `fault` and in that core's entry in `cores`, and
+adds a `strict_violation` member with the parts separately - `message`, `operation`, `length`,
+`requester`, `start`, `first`, `core`, `role`, `pc` and `cycles` - which a report without a
+violation does not have. The runner writes the report, prints the fault on stderr and exits with
+its fault status, 1. The fault does not count in IERR or raise an exception, though the
+`faults` statistic counts it and a trace records it with `ierr` 0.
+
+Sparse addresses outside these ranges
+— external asynchronous memory, unmodelled space above the configuration registers, anything
+past the alias region — stay permissive, because a board may populate them: the check
+diagnoses known holes and carves, and does not qualify the whole physical map or prove that a
+DMA range is fitted memory. Without the variable, behaviour is unchanged.
+
 Not every address is memory. `is_memory` excludes the configuration space,
 0180 0000h–03FF FFFFh, and the three peripheral data ports outside it: the UTOPIA cell queues at
 3C00 0000h and the two McBSP data buses at 3000 0000h and 3400 0000h (SPRS276M Tables 7-105,
@@ -444,15 +577,19 @@ for the shared L2 in 64 KB pages, and 16 pages of 2 KB over each L1 at MPPA16–
 
 An MPPA register carries LOCAL in bit 8, SR SW SX UR UW UX in bits 5–0, and the AID enables above
 them. Reset is 0000 FFFFh, which grants everything, so firmware that never programs a unit sees
-no page faults; `mpu_restrictive` and `mpu_dma_restrictive` are recomputed on every MPPA write so
-the common page-check case is one boolean test on the access path.
+no page faults; the MPU bit in `cpu_checks` and `mpu_dma_restrictive` are recomputed on every MPPA
+write so the common page-check case is one bit test on the access path.
 
 `Fabric::check_access` checks a CPU access against the page of whichever local memory holds it,
 consulting LOCAL plus the supervisor or user permission bit — the AID fields gate DMA masters by
 requester id, and the CPU is the local requester. `check_dma_access` checks the AID bit for the
 requester id (IDs 0–5 have their own bit, 6 and above share AIDX) and the permission bit for the
-requester's privilege mode: IDMA and the HPI's DMA are ID 0 supervisor, the EMACs and the UTOPIA
-PDMA ID 0 user (SPRS612G section 5.2 and Table 5-3); `Privilege` carries the pair, and
+requester's privilege mode: the HPI's DMA is ID 0 supervisor, the EMACs and the UTOPIA
+PDMA ID 0 user (SPRS612G section 5.2 and Table 5-3). An IDMA transfer carries the ID of the CPU
+that started it - its core index - and that CPU's privilege mode at the write to the COUNT
+register that started it, which `check_access` notes for the IDMA (SPRU871K sections 8.1.2 and
+8.3.2.1); LOCAL admits none of it, since LOCAL is the CPU's own access and an IDMA fault is a
+remote one; `Privilege` carries the pair, and
 `Privilege::allowed_id_bit` is the one AID decode both this check and the EDMA3's use. The
 EDMA3's transfers are made for whoever programmed them: every write of a PaRAM word stamps PRIV
 and PRIVID into the set's OPT (bit 31, bits 27–24) from the identity the fabric last presented

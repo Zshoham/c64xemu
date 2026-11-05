@@ -14,7 +14,8 @@ there, and the host's DSPINT releases the held core.
 
 C6472 (--device c6472): all six cores are held in reset (SPRUEC6G section 4.3.2) and DSPINT does
 not release any. The host writes --cores' images to their global aliases (local L2 at
-0x1n800000 for core n; shared addresses unchanged), writes each core's DSP_BOOT_ADDRn with the
+0x1n800000 for core n; shared L2 at its global alias 0x10200000, which is the address a master
+must use for it; DDR2 unchanged), writes each core's DSP_BOOT_ADDRn with the
 ELF entry >> 10, and sets those cores' BCn bits in BOOT_COMPLETE_STAT. The entry must therefore
 be 1 KB aligned in local L2. --no-release stops before the BCn write, and --dspint raises DSPINT
 as well, to show that alone starts nothing.
@@ -175,9 +176,23 @@ def load_boot_image(path: str, device: str = "c6455") -> tuple[Image, str]:
     return image, elf.byteorder
 
 
+# The C6472's shared L2 RAM window. 0020 0000h is "SL2 RAM (Local address map)" (SPRS612G
+# Table 2-2): only a core resolves it, so the HPI - a master - writes it through core 0's global
+# alias, 1020 0000h, which names the same RAM.
+SL2_LOCAL = (0x0020_0000, 768 * 1024)
+SL2_ALIAS = 0x1020_0000
+
+
+def shared_alias(address: int) -> int:
+    """The address the HPI uses for a non-local segment: SL2 by its global alias, DDR2 as is."""
+    base, size = SL2_LOCAL
+    return SL2_ALIAS + address - base if base <= address < base + size else address
+
+
 def place_segments(image: Image, cores: tuple[int, ...]) -> list[tuple[int, bytes]]:
     """Where each segment goes on a C6472: a core-local segment at every selected core's global
-    alias, anything else - shared L2, DDR2 - once, at the address the ELF gives.
+    alias, a shared L2 segment once at its global alias, and anything else - DDR2 - once, at the
+    address the ELF gives.
 
     A segment is local only if it lies wholly in one local window. One that starts in a window
     and runs past its end is refused: its tail would not be local memory at all, and the alias
@@ -188,7 +203,8 @@ def place_segments(image: Image, cores: tuple[int, ...]) -> list[tuple[int, byte
         start, end = segment.address, segment.address + len(segment.data)
         overlapped = [(base, size) for base, size in LOCAL_WINDOWS if start < base + size and end > base]
         if not overlapped:
-            placements.append((global_alias(0, start, rom_scratch=False), segment.data))
+            address = shared_alias(global_alias(0, start, rom_scratch=False))
+            placements.append((address, segment.data))
         elif any(base <= start and end <= base + size for base, size in overlapped):
             placements.extend(
                 (global_alias(core, start, rom_scratch=False), segment.data) for core in cores
