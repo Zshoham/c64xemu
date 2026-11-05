@@ -259,9 +259,9 @@ programmable divider, D1, which generates SYSCLK1 for the EMAC.
 
 ## DDR2 and EMIFA
 
-`src/ddr2.rs` at `7800 0000h` ([SPRU970G](../reference/spru970g.pdf) §4) and `src/emifa.rs` at
-`7000 0000h` ([SPRU971E](../reference/spru971e.pdf) §12, C6455 only — the C6472 has no
-asynchronous EMIF, DDR2 is its only external memory).
+`src/ddr2.rs` at `7800 0000h` implements the device-specific C6455 ([SPRU970G](../reference/spru970g.pdf)
+§4) and C6472 ([SPRU894J](../reference/spru894j.pdf) §4) register contracts. `src/emifa.rs` at
+`7000 0000h` is C6455 only — the C6472 has no asynchronous EMIF, DDR2 is its only external memory.
 
 Both are register contracts, not data paths: the memory behind them is plain backing store, and
 DDR2 latency, refresh and EMIFA strobe timing are deliberately not simulated. What is modelled is
@@ -271,6 +271,25 @@ floor the controller substitutes when software programs one that is too small. E
 burst priority, four chip-enable configuration registers, the asynchronous wait configuration and
 the time-out interrupt; with no external device to hold ARDY the time-out has no injectable
 source, but the mask registers and their write-one-to-clear pairing are exactly as documented.
+
+The two DDR2 profiles share an address window, not register values. C6455 remains the default
+profile; C6472 selects its own MIDR and reset values, and its SDCFG includes EBANK at bit 3 plus
+BOOT_UNLOCK-gated DDR2 fields. C6472 DMCCTL exposes RL in bits 2:0; its other bits retain the
+documented reset value.
+
+SPRU894J §4.3's introduction says bits 0-14 are writable when TIMUNLOCK is 0, and Table 20's CL row
+says CL needs TIMUNLOCK unlocked; but the C6472 TIMUNLOCK row (unlike TCI6484's) and §2.11.3 say
+TIMUNLOCK=1 unlocks only SDTIM1/SDTIM2. The model follows the C6472 row: CL is writable regardless
+of TIMUNLOCK, as the C6455 model already treats SPRU970G's identical CL sentence. Figure 21 marks
+several configuration fields read-only, contrary to §2.11.3 and TI IBL; they remain writable. Both
+devices accept protected fields when BOOT_UNLOCK was already set or is set by the incoming write,
+supporting the manuals' set-then-program sequence and IBL.
+
+C6472 DMCCTL reserved bits keep reset values (Table 25 requires software to preserve them); IBL's
+0x50001906 therefore reads back as 0x50006426. Reset assumes DDREN=1; DDREN=0 would give 0x50006437.
+DEVSTAT.DDREN is not strapped here. SPRU894J contradicts itself: Figure 19 gives MIDR bits 31:28 as
+4, Table 18 as 0; Figure 24 gives SDTIM2 bits 31:25 as 0x1E, Table 23 as 0. The model follows the
+tables.
 
 ## Device configuration
 
