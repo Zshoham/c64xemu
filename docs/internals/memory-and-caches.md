@@ -85,6 +85,21 @@ The shared ROM is the one place SPRS612G contradicts itself: Table 2-2 calls
 0010 0000h — which is also where Table 2-4 starts core 0 for every ROM boot mode. `C6472_MAP`
 models it where the two sections that describe it say it is.
 
+For diagnostic runs, set `C64XEMU_STRICT_PHYSICAL_MEMORY=1` before starting `c64xemu`. CPU
+memory requests, including instruction fetches and cache hits, and DMA transfers then panic when
+they reach a known on-chip hole or memory converted from SRAM to cache: addresses below 0001
+0000h, C6472 reserved addresses below shared ROM/RAM, the unused tail of the C6472 local L2
+aperture, gaps in its global alias slots, C6472 DMA requests through a core's local SRAM window,
+and any `ConvertedToCache` placement. The check runs before cache lookup. C6472 shared ROM and
+normal global SRAM aliases remain valid. Spans wrapping past `0xFFFFFFFF` also fail. DMA checks
+cover memory transfers at the fabric; accesses routed to peripheral registers and data ports are
+outside their scope. Failures report requester, operation and address, without guest PC or cycle.
+This diagnoses selected known holes and cache-converted placements. It does not qualify the full
+physical map or establish whether unmodeled sparse space exists on a board. General sparse
+addresses remain permissive because a board may populate external asynchronous memory there,
+so the check cannot prove that an arbitrary DMA range is fitted memory or belongs to a codec
+allocation. Without the variable, existing sparse-memory behavior is unchanged.
+
 Not every address is memory. `is_memory` excludes the configuration space,
 0180 0000h–03FF FFFFh, and the three peripheral data ports outside it: the UTOPIA cell queues at
 3C00 0000h and the two McBSP data buses at 3000 0000h and 3400 0000h (SPRS276M Tables 7-105,

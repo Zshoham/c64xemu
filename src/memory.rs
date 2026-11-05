@@ -423,6 +423,7 @@ pub(crate) struct Backing {
     /// stamps live with the bytes they describe, and only a word some core has linked is tracked.
     memory_versions: BTreeMap<u32, u64>,
     write_serial: u64,
+    pub(crate) strict_physical_memory: bool,
 }
 
 impl Backing {
@@ -454,6 +455,42 @@ impl Backing {
             sparse: BTreeMap::new(),
             memory_versions: BTreeMap::new(),
             write_serial: 0,
+            strict_physical_memory: std::env::var("C64XEMU_STRICT_PHYSICAL_MEMORY")
+                .is_ok_and(|value| value == "1"),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn check_strict_access(
+        &self,
+        requester: Requester,
+        address: u32,
+        length: usize,
+        operation: &str,
+    ) {
+        if !self.strict_physical_memory {
+            return;
+        }
+        let start = u64::from(address);
+        let address_space_end = u64::from(u32::MAX) + 1;
+        if length as u64 > address_space_end - start {
+            panic!("strict physical-memory: {operation} by {requester:?} at 0x{address:08x} spans past the 32-bit address space");
+        }
+        let end = start + length as u64;
+        if length == 0 {
+            return;
+        }
+        // Modeled windows and cache carves have page-aligned boundaries. Probe each page,
+        // including the first byte, so large transfers do not require a byte-by-byte scan.
+        let mut at = u64::from(address);
+        while at < end {
+            let address = at as u32;
+            if self.map.known_hole(requester, address)
+                || self.placement(requester, address) == Placement::ConvertedToCache
+            {
+                panic!("strict physical-memory: {operation} by {requester:?} at 0x{address:08x} enters a reserved, unsupported, or cache-converted range");
+            }
+            at = ((at & !0xfff) + 0x1000).min(end);
         }
     }
 
@@ -1400,13 +1437,19 @@ pub(crate) struct BoundHierarchy<'a> {
 impl BoundHierarchy<'_> {
     #[inline]
     pub(crate) fn read_u8(&mut self, address: u32) -> u8 {
+        self.backing
+            .check_strict_access(self.hierarchy.requester(), address, 1, "read");
         self.read_data_byte(address)
     }
     #[inline]
     pub(crate) fn write_u8(&mut self, address: u32, value: u8) {
+        self.backing
+            .check_strict_access(self.hierarchy.requester(), address, 1, "write");
         self.write_data_byte(address, value);
     }
     pub(crate) fn write_u16(&mut self, address: u32, value: u16) {
+        self.backing
+            .check_strict_access(self.hierarchy.requester(), address, 2, "write");
         let bytes = match self.backing.endian {
             Endian::Little => value.to_le_bytes(),
             Endian::Big => value.to_be_bytes(),
@@ -1414,6 +1457,8 @@ impl BoundHierarchy<'_> {
         self.write_data_bytes(address, bytes);
     }
     pub(crate) fn read_u16(&mut self, address: u32) -> u16 {
+        self.backing
+            .check_strict_access(self.hierarchy.requester(), address, 2, "read");
         let bytes = self.read_data_bytes(address);
         match self.backing.endian {
             Endian::Little => u16::from_le_bytes(bytes),
@@ -1422,6 +1467,8 @@ impl BoundHierarchy<'_> {
     }
     #[inline]
     pub(crate) fn read_u32(&mut self, address: u32) -> u32 {
+        self.backing
+            .check_strict_access(self.hierarchy.requester(), address, 4, "read");
         let bytes = self.read_data_bytes(address);
         match self.backing.endian {
             Endian::Little => u32::from_le_bytes(bytes),
@@ -1430,6 +1477,8 @@ impl BoundHierarchy<'_> {
     }
     #[inline]
     pub(crate) fn write_u32(&mut self, address: u32, value: u32) {
+        self.backing
+            .check_strict_access(self.hierarchy.requester(), address, 4, "write");
         let bytes = match self.backing.endian {
             Endian::Little => value.to_le_bytes(),
             Endian::Big => value.to_be_bytes(),
@@ -1445,6 +1494,8 @@ impl BoundHierarchy<'_> {
         }
     }
     pub(crate) fn fetch_packet(&mut self, address: u32) -> [u8; 32] {
+        self.backing
+            .check_strict_access(self.hierarchy.requester(), address, 32, "fetch");
         debug_assert_eq!(address & 0x1f, 0);
         self.fetch_bytes(address)
     }
@@ -1875,6 +1926,8 @@ impl BoundHierarchy<'_> {
         self.write_l2_lines(l2_lines);
     }
     pub(crate) fn read_bytes(&mut self, address: u32, length: usize) -> Vec<u8> {
+        self.backing
+            .check_strict_access(self.hierarchy.requester(), address, length, "read");
         (0..length)
             .map(|offset| self.read_u8(address.wrapping_add(offset as u32)))
             .collect()
@@ -1889,7 +1942,7 @@ fn mar_index(address: u32) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::space::C6455_MAP;
+    use crate::space::{C6455_MAP, C6472_MAP};
 
     /// The C6455's L1D window, and four external lines that index the same set of a 4 KB
     /// two-way L1D: 4096 / 64 per line / 2 ways is 32 sets, so the stride is 2048 bytes.
@@ -1901,6 +1954,54 @@ mod tests {
             MemoryHierarchy::new(0, &C6455_MAP),
             Backing::new(&C6455_MAP, Endian::Little),
         )
+    }
+
+    #[test]
+    fn strict_memory_is_opt_in_and_checks_cached_cpu_accesses() {
+        let (mut mm, mut backing) = hierarchy();
+        mm.bind(&mut backing).cache_register_write(L1DCFG, 1);
+        assert_eq!(mm.bind(&mut backing).read_u32(0), 0);
+        assert!(mm.l1d.read_bytes::<4>(0).is_some());
+        backing.strict_physical_memory = true;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            mm.bind(&mut backing).read_u32(0);
+        }));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn strict_memory_rejects_holes_carves_and_wrapping_spans() {
+        let (mut mm, mut backing) = hierarchy();
+        backing.strict_physical_memory = true;
+        mm.bind(&mut backing).cache_register_write(L2CFG, 1);
+        {
+            let mut bound = mm.bind(&mut backing);
+            bound.write_u32(0x009f_7ffc, 0x1234_5678);
+            assert_eq!(bound.read_u32(0x009f_7ffc), 0x1234_5678);
+        }
+        backing.check_strict_access(Requester::Dma, 0x009f_7ffc, 4, "DMA read");
+        for (requester, address, length) in [
+            (Requester::Core(0), 0, 4),
+            (Requester::Core(0), 0x009f_8000, 4),
+            (Requester::Dma, 0x009f_8000, 4),
+            (Requester::Core(0), 0xffff_fff0, 32),
+        ] {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                backing.check_strict_access(requester, address, length, "read");
+            }));
+            assert!(result.is_err());
+        }
+    }
+
+    #[test]
+    fn strict_memory_accepts_c6472_shared_rom_and_rejects_dma_local_alias() {
+        let mut backing = Backing::new(&C6472_MAP, Endian::Little);
+        backing.strict_physical_memory = true;
+        backing.check_strict_access(Requester::Core(0), 0x0010_0000, 4, "read");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            backing.check_strict_access(Requester::Dma, 0x0080_0000, 4, "DMA read");
+        }));
+        assert!(result.is_err());
     }
 
     /// Cache the DDR2 region and turn on a 4 KB L1D cache and a 32 KB L2 cache.
