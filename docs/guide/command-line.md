@@ -116,6 +116,7 @@ Shared by `run` and `debug`.
 | `--net-port PORT` | MAC 0, or the strapped boot port | Which of the device's MACs the backend's frames are delivered to. A port beyond the profile's MAC count is refused. |
 | `--hpi-unix PATH` | none | Bind a Unix datagram socket for the HPI host side. |
 | `--hpi-peer PATH` | none | The Unix datagram socket HPI replies are sent to. Host requests carry an HCNTL code as [SPRU969B](../reference/spru969b.pdf) Table 4 numbers it. |
+| `--hpi-replay FILE` | none | Replay a sorted CSV schedule of HPI host register transactions at machine event-clock ticks before the front end starts. Each non-comment line is `tick,port,read|write,value`; ticks are decimal or `0x`. Ports are `control`, `data-auto`, `address`, `data` or HCNTL codes `0`-`3`. Writes take a decimal or `0x` word; reads use `-` and print the returned word to stderr. Satisfies the HPI host requirement for HPI boot modes. |
 | `--hpi-poll CYCLES` | `1024` | How often the run loop looks for host accesses. |
 | `--utopia-unix PATH` | none | Bind the external ATM master's Unix datagram socket: addressed polls, cell writes and cell reads, with replies to the sender; see [The UTOPIA ATM master](networking-and-host-io.md#the-utopia-atm-master). Required for C6472 boot modes 5-8. |
 | `--utopia-poll CYCLES` | `1024` | How often the run loop services ATM master requests; at least one cycle. |
@@ -156,6 +157,22 @@ c64xemu run [OPTIONS] <IMAGE>
 
 `--pc-trail` and `--trap-oob` share one stop-condition closure, so asking for the trail is what
 makes a `--trap-oob` diagnostic useful.
+
+An HPI replay uses the modeled HPI host path, including posted-write flushes and address fences.
+It advances to each tick and performs transactions there before the selected front end starts.
+For example, this HPI boot schedule selects an address, posts a data word, fences with another
+address write, then reads the word back:
+
+```text
+0,address,write,0x200400
+0,data-auto,write,0x12345678
+1,address,write,0x200400
+1,address,write,0x200400
+1,data-auto,read,-
+```
+
+Pass it with `c64xemu run IMAGE --boot-mode 1 --hpi-replay schedule.csv`. Readbacks are printed
+to stderr as `hpi-replay tick=... port=... read=...` lines.
 
 ## Session options
 

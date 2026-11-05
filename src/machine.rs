@@ -121,6 +121,9 @@ pub struct MachineArgs {
     /// Unix datagram socket HPI replies are sent to
     #[arg(long, value_name = "PATH")]
     pub hpi_peer: Option<PathBuf>,
+    /// Replay scheduled HPI host register transactions from a CSV file before the front end runs
+    #[arg(long, value_name = "FILE")]
+    pub hpi_replay: Option<PathBuf>,
     /// How often, in cycles, the run loop looks for host accesses
     #[arg(long, default_value_t = 1_024, value_parser = non_zero_cycles, value_name = "CYCLES")]
     pub hpi_poll: u64,
@@ -254,6 +257,8 @@ pub struct Machine {
     /// The board the device sits on: what it straps, fuses and supplies, and so which boot
     /// runs. Held so a reload builds the same board again.
     board: Board,
+    /// The parsed host schedule, retained so a debugger reload repeats the same HPI boot input.
+    hpi_replay: Option<crate::hpi_replay::Schedule>,
 }
 
 /// One member of the stop-condition set `resume` evaluates on every cycle. The machine-native
@@ -332,6 +337,11 @@ impl Machine {
         let profile = DeviceProfile::named(&args.device)
             .ok_or_else(|| format!("unknown device {}", args.device))?;
         let board = Board::from_args(profile, args)?;
+        let hpi_replay = args
+            .hpi_replay
+            .as_deref()
+            .map(crate::hpi_replay::Schedule::load)
+            .transpose()?;
         // A boot builds the memory image from the host, wire or bus, so the ELF supplies only
         // symbols (SPRS276M section 2.4, SPRUEC6G sections 2.3.4 and 4.3.5).
         let load = if board.source() != BootSource::Image {
@@ -393,6 +403,7 @@ impl Machine {
             breakpoints: Vec::new(),
             initial_breakpoints: Vec::new(),
             board,
+            hpi_replay,
         };
         // A boot table replaces the ELF's memory image entirely: the ELF is only there for the
         // symbols a debugger and the CIO handshake need (SPRUEC6G section 6.2.2).
@@ -417,6 +428,7 @@ impl Machine {
             .iter()
             .map(|token| machine.resolve(token))
             .collect::<Result<_, _>>()?;
+        machine.replay_hpi()?;
         Ok(machine)
     }
 
@@ -470,6 +482,7 @@ impl Machine {
             breakpoints: Vec::new(),
             initial_breakpoints: Vec::new(),
             board: Board::pins(&crate::device::C6455, 0),
+            hpi_replay: None,
         }
     }
 
@@ -508,6 +521,24 @@ impl Machine {
         }
         self.cio_output.clear();
         result?;
+        self.replay_hpi()?;
+        Ok(())
+    }
+
+    fn replay_hpi(&mut self) -> Result<(), String> {
+        if let Some(schedule) = self.hpi_replay.clone() {
+            // A replay can run guest code between scheduled transactions. Debugger breakpoints
+            // must not turn that deterministic input schedule into a stop condition, but remain
+            // armed once replay completes (including when a transaction returns an error).
+            let breakpoints = std::mem::take(&mut self.breakpoints);
+            self.install_halt(false);
+            let result = schedule.replay(self);
+            self.breakpoints = breakpoints;
+            self.install_halt(false);
+            for readback in result? {
+                eprintln!("hpi-replay {readback}");
+            }
+        }
         Ok(())
     }
 
@@ -586,6 +617,63 @@ impl Machine {
         } else {
             self.device.cpu().cycles()
         }
+    }
+
+    /// The monotonic clock used by the run budget and host polling for the current boot mode.
+    /// This is emulator event time, not guest TSCL or host wall time.
+    pub(crate) fn event_time(&self) -> u64 {
+        self.run_clock()
+    }
+
+    /// Deliver a sorted schedule of host-side releases at exact emulator event-clock boundaries.
+    /// The machine advances to each tick and invokes the callback before executing that cycle.
+    /// Equal ticks are delivered in input order. A callback may update memory or use a device
+    /// host interface, but must not advance the machine clock itself.
+    pub(crate) fn replay_release_ticks<F>(
+        &mut self,
+        release_ticks: &[u64],
+        mut on_release: F,
+    ) -> Result<(), String>
+    where
+        F: FnMut(&mut Machine, usize, u64) -> Result<(), String>,
+    {
+        if release_ticks.windows(2).any(|pair| pair[0] > pair[1]) {
+            return Err("release ticks must be sorted".into());
+        }
+        let start = self.event_time();
+        if let Some(tick) = release_ticks.first().filter(|tick| **tick < start) {
+            return Err(format!(
+                "release tick {tick} precedes current event time {start}"
+            ));
+        }
+
+        for (index, &tick) in release_ticks.iter().enumerate() {
+            let current = self.event_time();
+            if tick < current {
+                return Err(format!(
+                    "release tick {tick} precedes current event time {current}"
+                ));
+            }
+            if tick > current {
+                let mut conditions = [StopCondition::Budget(tick - current)];
+                let reason = self.resume(&mut conditions)?;
+                if reason != StopReason::Budget || self.event_time() != tick {
+                    return Err(format!(
+                        "failed to reach release {index} at tick {tick}: stopped at {} ({reason:?})",
+                        self.event_time()
+                    ));
+                }
+            }
+            on_release(self, index, tick)
+                .map_err(|error| format!("release callback {index} at tick {tick}: {error}"))?;
+            let after_callback = self.event_time();
+            if after_callback != tick {
+                return Err(format!(
+                    "release callback {index} advanced event time from tick {tick} to {after_callback}"
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// The host connections with the device's fabric and the run clock they measure by. The
@@ -1473,6 +1561,50 @@ mod tests {
     }
 
     #[test]
+    fn release_replay_delivers_exact_ticks_in_input_order() {
+        let ticks = [5, 5, 19, 43];
+        let mut machine = Machine::bare(Cpu::new(0));
+        machine.device.cpu_mut().write_words(0, &[0; 200]);
+        let mut delivered = Vec::new();
+        machine
+            .replay_release_ticks(&ticks, |machine, index, tick| {
+                delivered.push((index, tick, machine.event_time()));
+                machine.write_memory(0x100 + index as u32 * 4, &tick.to_le_bytes());
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(
+            delivered,
+            vec![(0, 5, 5), (1, 5, 5), (2, 19, 19), (3, 43, 43)]
+        );
+        assert_eq!(machine.event_time(), 43);
+        assert_eq!(
+            machine.read_memory(0x100, 16),
+            [5, 0, 0, 0, 5, 0, 0, 0, 19, 0, 0, 0, 43, 0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn release_replay_rejects_invalid_schedule_and_callback_clock_changes() {
+        let mut machine = Machine::bare(Cpu::new(0));
+        machine.device.cpu_mut().write_words(0, &[0; 32]);
+        assert!(machine
+            .replay_release_ticks(&[4, 3], |_, _, _| Ok(()))
+            .is_err());
+        assert_eq!(machine.event_time(), 0);
+
+        let error = machine
+            .replay_release_ticks(&[2], |machine, _, _| {
+                let mut one_cycle = [StopCondition::Budget(1)];
+                assert_eq!(machine.resume(&mut one_cycle).unwrap(), StopReason::Budget);
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(error.contains("advanced event time from tick 2 to 3"));
+    }
+
+    #[test]
     fn packets_condition_counts_executed_packets() {
         let mut machine = Machine::bare(Cpu::new(0));
         machine.device.cpu_mut().write_words(0, &[0; 200]);
@@ -1703,6 +1835,33 @@ mod tests {
             })
         );
         assert_eq!(machine.resume(&mut []).unwrap(), StopReason::Exit);
+    }
+
+    #[test]
+    fn hpi_replay_is_reapplied_after_each_reload() {
+        let directory =
+            std::env::temp_dir().join(format!("c64xemu-hpi-reload-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let schedule_path = directory.join("schedule.csv");
+        std::fs::write(&schedule_path, "0,control,write,2\n10,control,read,-\n").unwrap();
+
+        let mut machine = Machine::bare(Cpu::new(0));
+        machine.board = Board::pins(&crate::device::C6455, crate::hpi::BOOTMODE_HPI);
+        machine.hpi_replay = Some(crate::hpi_replay::Schedule::load(&schedule_path).unwrap());
+        let breakpoint = crate::hpi::HPI_BOOT_ENTRY + 4;
+        machine.arm_halt(&[breakpoint]);
+        for _ in 0..2 {
+            machine.reload().unwrap();
+            assert!(!machine.core_held_in_reset(0));
+            assert_eq!(machine.event_time(), 10);
+            assert!(
+                machine.pc() > breakpoint,
+                "schedule did not run past guest breakpoint"
+            );
+            assert_eq!(machine.breakpoints, [breakpoint]);
+        }
+
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     /// The core that reached the CIO handshake answers it, whichever one that is, and both the

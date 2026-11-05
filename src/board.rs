@@ -116,9 +116,9 @@ impl Board {
             );
         }
         if source == BootSource::Hpi {
-            if args.hpi_unix.is_none() {
+            if args.hpi_unix.is_none() && args.hpi_replay.is_none() {
                 return Err(format!(
-                    "boot mode {} is the {}'s HPI host boot; give it the host with --hpi-unix",
+                    "boot mode {} is the {}'s HPI host boot; give it a host with --hpi-unix or --hpi-replay",
                     args.boot_mode, profile.name
                 ));
             }
