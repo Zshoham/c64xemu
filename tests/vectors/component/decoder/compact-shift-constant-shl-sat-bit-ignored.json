@@ -1,0 +1,15 @@
+{
+  "domain": "decoder",
+  "expected": {
+    "mnemonic": "shl"
+  },
+  "request": {
+    "action": "decode",
+    "address": 0,
+    "endian": "little",
+    "header": 16384,
+    "id": "decoder:compact-shift-constant-shl-sat-bit-ignored",
+    "width": 16,
+    "word": 5506
+  }
+}

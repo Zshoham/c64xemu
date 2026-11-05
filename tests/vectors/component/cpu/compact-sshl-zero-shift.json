@@ -1,0 +1,38 @@
+{
+  "domain": "cpu",
+  "expected": {
+    "registers": {
+      "A3": 2147483647
+    },
+    "controls": {
+      "1": 268435712,
+      "21": 0
+    }
+  },
+  "request": {
+    "action": "execute",
+    "cycles": 2,
+    "endian": "little",
+    "id": "cpu:compact-sshl-zero-shift",
+    "memory": [],
+    "observe_controls": [
+      1,
+      21
+    ],
+    "pc": 0,
+    "registers": {
+      "A3": 2147483647
+    },
+    "words": [
+      208537026,
+      208538734,
+      208538734,
+      208538734,
+      208538734,
+      208538734,
+      208538734,
+      3760209920,
+      32768
+    ]
+  }
+}

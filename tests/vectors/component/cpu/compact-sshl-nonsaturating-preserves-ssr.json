@@ -1,0 +1,41 @@
+{
+  "domain": "cpu",
+  "expected": {
+    "controls": {
+      "1": 268435712,
+      "21": 4
+    },
+    "registers": {
+      "A3": 2
+    }
+  },
+  "request": {
+    "action": "execute",
+    "controls": {
+      "21": 4
+    },
+    "cycles": 2,
+    "endian": "little",
+    "id": "cpu:compact-sshl-nonsaturating-preserves-ssr",
+    "memory": [],
+    "observe_controls": [
+      1,
+      21
+    ],
+    "pc": 0,
+    "registers": {
+      "A3": 1
+    },
+    "words": [
+      208545218,
+      208538734,
+      208538734,
+      208538734,
+      208538734,
+      208538734,
+      208538734,
+      3760209920,
+      32768
+    ]
+  }
+}
