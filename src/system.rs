@@ -1098,7 +1098,7 @@ impl Shared {
                 TransferController::new(3, 0x02a3_8000),
             ],
             hpi: Hpi::new(hpi_boot),
-            ddr2: Ddr2::default(),
+            ddr2: Ddr2::new(profile.ddr2),
             emifa: profile.has_emifa.then(Emifa::default),
             utopia: profile
                 .utopia

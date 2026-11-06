@@ -11,6 +11,7 @@
 use crate::board::{Board, Boot};
 use crate::cache::CacheView;
 use crate::cpu::Cpu;
+use crate::ddr2::Ddr2Profile;
 use crate::events::{EventMap, C6455_EVENTS, C6472_EVENTS};
 use crate::hpi::HPI_BOOT_ENTRY;
 use crate::memory::CoherenceHazard;
@@ -54,6 +55,8 @@ pub(crate) struct DeviceProfile {
     pub(crate) mpu_regions: &'static [MpuRegion],
     /// Peripherals a device either has or does not.
     pub(crate) has_mcbsp: bool,
+    /// DDR2 register contract: SPRU970G (C6455).
+    pub(crate) ddr2: &'static Ddr2Profile,
     /// The UTOPIA 2 port and what it has: CPU queue windows, or the SPRUEG2E PDMA.
     pub(crate) utopia: Option<&'static UtopiaProfile>,
     pub(crate) has_emifa: bool,
@@ -186,6 +189,7 @@ pub(crate) const C6455: DeviceProfile = DeviceProfile {
     megamodule_timers: 0,
     mpu_regions: C6455_MPU_REGIONS,
     has_mcbsp: true,
+    ddr2: &crate::ddr2::C6455_DDR2,
     utopia: Some(&C6455_UTOPIA),
     has_emifa: true,
     has_device_config: true,
@@ -210,6 +214,8 @@ pub(crate) const C6472: DeviceProfile = DeviceProfile {
     mpu_regions: C6472_MPU_REGIONS,
     // Three TSIPs replace the McBSPs, and the UTOPIA is a slave port with its own PDMA.
     has_mcbsp: false,
+    // Shares the C6455 DDR2 contract until its own SPRU894J contract is modelled.
+    ddr2: &crate::ddr2::C6455_DDR2,
     utopia: Some(&C6472_UTOPIA),
     // The C6472 has no asynchronous EMIF: DDR2 is its only external memory.
     has_emifa: false,

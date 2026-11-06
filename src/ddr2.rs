@@ -49,14 +49,47 @@ const SDTIM2_RESET: u32 = (0x3 << 23) | (0x7f << 16) | (0xff << 8) | (0x7 << 5) 
 const BPRIO_RESET: u32 = 0xff;
 const DMCCTL_RESET: u32 = (0x5000 << 16) | (0x190 << 6) | DMCCTL_IFRESET | 0x7;
 const DMCCTL_IFRESET: u32 = 1 << 5;
-/// SDCFG locks: BOOT_UNLOCK guards bits 22-16 and TIMUNLOCK the timing registers.
+/// BOOT_UNLOCK guards each profile's `boot_locked` SDCFG bits; TIMUNLOCK guards SDTIM1/SDTIM2.
 const SDCFG_BOOT_UNLOCK: u32 = 1 << 23;
 const SDCFG_TIMUNLOCK: u32 = 1 << 15;
 /// A refresh rate below 100h is replaced by twice the refresh cycle time SDTIM1 holds
 /// (SPRU970G Table 21).
 const REFRESH_FLOOR: u32 = 0x0100;
 
+/// A device's DDR2 register contract (SPRU970G §4 for the C6455).
+#[derive(Debug)]
+pub(crate) struct Ddr2Profile {
+    /// Module identification (SPRU970G Figure 19).
+    midr: u32,
+    /// SDCFG reset (SPRU970G Figure 21).
+    sdcfg_reset: u32,
+    /// SDRFC reset (SPRU970G Figure 22).
+    sdrfc_reset: u32,
+    /// SDTIM1 reset (SPRU970G Figure 23).
+    sdtim1_reset: u32,
+    /// SDTIM2 reset (SPRU970G Figure 24).
+    sdtim2_reset: u32,
+    /// SDCFG bits writable without BOOT_UNLOCK (SPRU970G Table 20).
+    writable: u32,
+    /// SDCFG bits requiring BOOT_UNLOCK (SPRU970G Table 20).
+    boot_locked: u32,
+    /// DMCCTL writable bits (SPRU970G Table 25).
+    control_mask: u32,
+}
+/// C6455 DDR2 register contract (SPRU970G §4).
+pub(crate) static C6455_DDR2: Ddr2Profile = Ddr2Profile {
+    midr: MIDR_VALUE,
+    sdcfg_reset: SDCFG_RESET,
+    sdrfc_reset: SDRFC_RESET,
+    sdtim1_reset: SDTIM1_RESET,
+    sdtim2_reset: SDTIM2_RESET,
+    writable: SDCFG_BOOT_UNLOCK | SDCFG_TIMUNLOCK | (1 << 14) | 0xe77,
+    boot_locked: 1 << 18,
+    control_mask: 0xffff,
+};
+
 pub struct Ddr2 {
+    profile: &'static Ddr2Profile,
     config: u32,
     refresh: u32,
     timing1: u32,
@@ -67,11 +100,18 @@ pub struct Ddr2 {
 
 impl Default for Ddr2 {
     fn default() -> Self {
+        Self::new(&C6455_DDR2)
+    }
+}
+
+impl Ddr2 {
+    pub(crate) fn new(profile: &'static Ddr2Profile) -> Self {
         Self {
-            config: SDCFG_RESET,
-            refresh: SDRFC_RESET,
-            timing1: SDTIM1_RESET,
-            timing2: SDTIM2_RESET,
+            profile,
+            config: profile.sdcfg_reset,
+            refresh: profile.sdrfc_reset,
+            timing1: profile.sdtim1_reset,
+            timing2: profile.sdtim2_reset,
             priority: BPRIO_RESET,
             control: DMCCTL_RESET,
         }
@@ -81,7 +121,7 @@ impl Default for Ddr2 {
 impl SlavePort for Ddr2 {
     fn read(&mut self, address: u32, context: PortContext) -> Option<u32> {
         let value = match address {
-            MIDR => MIDR_VALUE,
+            MIDR => self.profile.midr,
             DMCSTAT => {
                 // The interface logic is ready once software has released its reset.
                 DMCSTAT_ONES
@@ -103,12 +143,11 @@ impl SlavePort for Ddr2 {
         match address {
             MIDR | DMCSTAT => {}
             SDCFG => {
-                // The writable fields are BOOT_UNLOCK, DDR_DRIVE, TIMUNLOCK, NM, CL, IBANK and
-                // PAGESIZE; the reserved fields keep their reset values, and DDR_DRIVE only
-                // moves when the same write unlocks it (SPRU970G Table 20).
-                let mut writable = SDCFG_BOOT_UNLOCK | SDCFG_TIMUNLOCK | (1 << 14) | 0xe77;
+                // Profile masks select writable fields; reserved fields retain reset values, and
+                // the boot-locked fields only move when the same write sets BOOT_UNLOCK.
+                let mut writable = self.profile.writable;
                 if value & SDCFG_BOOT_UNLOCK != 0 {
-                    writable |= 1 << 18;
+                    writable |= self.profile.boot_locked;
                 }
                 self.config = (self.config & !writable) | (value & writable);
             }
@@ -133,7 +172,10 @@ impl SlavePort for Ddr2 {
                 }
             }
             BPRIO => self.priority = value & 0xff,
-            DMCCTL => self.control = (DMCCTL_RESET & 0xffff_0000) | (value & 0xffff),
+            DMCCTL => {
+                let writable = self.profile.control_mask;
+                self.control = (DMCCTL_RESET & !writable) | (value & writable);
+            }
             _ => return PortWrite::Unhandled,
         }
         PortWrite::Done
