@@ -382,6 +382,55 @@ mod tests {
     }
 
     #[test]
+    fn ti_ibl_register_sequence() {
+        // TI IBL hwEmif3p1Enable: tests/build/ibl/src/hw/ddrs/emif31/emif31.c, using
+        // c6472_ibl_config/c6455_ibl_config in tests/build/ibl/src/util/iblConfig/src/device.c.
+        // C6455 ends at 0x00530822: SPRU970G Figure 21 reserved defaults 0x00530000
+        // plus CL=4 (0x800), IBANK=2 (0x20), PAGESIZE=2; both unlocks are cleared.
+        for (profile, cfg, refresh, t1, t2, control, expected) in [
+            (
+                &C6472_DDR2,
+                0x00538832,
+                0x073b,
+                0x47245bd2,
+                0x0125dc44,
+                0x50001906,
+                0x00530832,
+            ),
+            (
+                &C6455_DDR2,
+                0x00538822,
+                0x07a2,
+                0x3edb4b91,
+                0x00a2c722,
+                5,
+                0x00530822,
+            ),
+        ] {
+            let mut d = Ddr2::new(profile);
+            for (reg, value) in [
+                (SDCFG, cfg | SDCFG_BOOT_UNLOCK | SDCFG_TIMUNLOCK),
+                (SDRFC, refresh),
+                (SDTIM1, t1),
+                (SDTIM2, t2),
+                (DMCCTL, control),
+            ] {
+                d.write(reg, value, LITTLE_CONTEXT);
+            }
+            d.write(SDCFG, d.config & !SDCFG_BOOT_UNLOCK, LITTLE_CONTEXT);
+            d.write(SDCFG, d.config & !SDCFG_TIMUNLOCK, LITTLE_CONTEXT);
+            assert_eq!(d.config, expected);
+            assert_eq!(d.refresh, refresh);
+            assert_eq!(d.timing1, t1);
+            assert_eq!(d.timing2, t2);
+            assert_eq!(
+                d.read(DMCSTAT, LITTLE_CONTEXT),
+                Some(DMCSTAT_ONES | DMCSTAT_IFRDY)
+            );
+        }
+    }
+
+    #[test]
     fn c6472_has_its_own_spru894j_reset_contract() {
         // SPRU894J Figures 19-26 and Tables 18-25, C6472 row where the guide distinguishes
         // device defaults. Keep this separate from the C6455/SPRU970G reset fixture above.
