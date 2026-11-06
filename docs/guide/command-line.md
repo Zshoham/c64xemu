@@ -150,6 +150,8 @@ c64xemu run [OPTIONS] <IMAGE>
 | `--max-cycles CYCLES` | `10000000` | Cycle budget for the whole run; `0` runs without a limit. Measured against the device cycle while a ROM boot is running and against the focused core's cycle counter afterwards (`run_clock`), because a held core retires nothing and could not pace a budget. Exhausting it is an error, not a clean finish. |
 | `--state-out FILE` | stdout | Write the state report here instead of printing it. Dumps, the perf report and diagnostics stay on stderr either way. |
 | `--dump ADDR:LEN` | none | Print a memory window on stderr when the run ends. Repeatable; windows print in the order given, before the state report. |
+| `--stack-window START:END` | none | Passively observe the focused core's B15 and its committed stores against a non-empty, word-aligned stack window. Adds `stack_observation` to the state report; see [Stack observation](#stack-observation). |
+| `--stack-window-all START:END` | none | The same observation on every core, held ones included. Adds `stack_observations`, one entry per core in ascending core order, instead of `stack_observation`. Mutually exclusive with `--stack-window`. |
 | `--pc-trail N` | `0` | Keep the last N execute-packet addresses, collapsing runs of the same address. Printed under `last N execute packets:` when the run faults, and used to annotate a `--trap-oob` stop. Zero keeps nothing: the trail costs a push per cycle, so a plain batch run does not install the hook at all. |
 | `--trap-oob` | off | Stop as soon as the program counter leaves every loaded segment. The check runs once per cycle against the ranges `Machine::loaded_ranges` reports, prints `fetch left the image at ...` plus up to twelve trail entries on stderr, and stops with `OutOfBounds`. An image whose memory came off the wire reports no ranges at all, so on an Ethernet or I2C boot the first cycle already looks out of bounds. |
 | `--perf` | off | Print the performance report on stderr after the state report. |
@@ -256,7 +258,61 @@ stdout or stderr according to the file descriptor the request named, and also ac
 | `utopia_boot` | Present for C6472 UTOPIA boot, cold or handed over from an I2C boot: `cells_accepted`, `cells_discarded`, `table_bytes` (32 per accepted cell, including final padding), `entry`, `error`. |
 | `hpi_boot` | Present when strapped to HPI boot: `entries` holds each core's release entry, null until released; `entry` is core 0's entry. The C6455 entry is fixed at `0x00800000`; C6472 entries come from `DSP_BOOT_ADDRn`. |
 | `profile` | Present with `--profile`: the 32 hottest execute-packet addresses as `{pc, where, packets}`, `where` being the covering symbol as `name+0x1c`. |
+| `stack_observation` | Present with `--stack-window`: what the observer saw on the core focused when the run started. See [Stack observation](#stack-observation). |
+| `stack_observations` | Present with `--stack-window-all`, in place of `stack_observation`: the same object for every core, in ascending `core` order. |
 | `cache_stats` | Present with `--profile`: per cache, its name, `enabled`, `frozen`, `capacity_bytes`, `line_size`, `ways`, `sets`, `resident_lines`, `dirty_lines` and its hit/miss/fill/eviction counters. |
+
+## Stack observation
+
+`--stack-window START:END` watches a stack the linker placed at `[START, END)` without touching it:
+no watermark is written, no guest memory is read, and the cache and pipeline see nothing they
+would not see anyway, so the rest of the state report is exactly what the same run without the
+option produces. It watches two things the core commits — guest writes to B15, and CPU store
+instructions — and reports:
+
+| Field | Meaning |
+|---|---|
+| `core` | The core observed. |
+| `start`, `end` | The window. |
+| `sp_written` | The core committed at least one guest write to B15. |
+| `armed` | B15 has held a value in `[start, end]`; SP tracking starts with that write. |
+| `min_sp`, `min_sp_cycle` | The lowest B15 since arming, including values below `start`, and the cycle it was first reached on. `null` until armed. |
+| `out_of_bounds_sp` | After arming, B15 took a value outside `[start, end]`. |
+| `lowest_write`, `lowest_write_cycle` | The lowest in-window byte a store overlapping the window committed, and when. `null` if none did. |
+| `out_of_bounds_write` | A store overlapping the window committed a byte outside it. |
+
+The two endpoints differ on purpose. A byte belongs to the stack when `start <= address < end`,
+but B15 may equal `end`: an empty descending stack points one past its top, and that is where
+startup code puts it.
+
+**Arming.** Startup code builds B15 in two instructions (`MVKL`/`MVK` then `MVKH`), and the value
+between them is nowhere near the stack. B15 writes before the first one that lands in
+`[start, end]` therefore only set `sp_written`; that write arms the observer and becomes the
+first `min_sp`. After it every B15 write counts, so a later out-of-window value — an overflow, but
+equally a deliberate switch to another stack, or the same two-instruction construction run again —
+sets `out_of_bounds_sp`, and a low one becomes `min_sp`. B15 written by the debugger or GDB is the
+host's doing, not the program's, and is not observed.
+
+**Stores.** A store is judged on the whole access its instruction makes: a doubleword is one
+eight-byte access even though memory takes it as two words, and addresses wrap at 32 bits as they do
+in memory. Only accesses that overlap the window count; of those, every byte that actually reaches
+memory is classified as in the window or out of it. A predicated-off store commits nothing, and
+neither does a store or half of a doubleword the memory protection refuses. A store entirely
+outside the window is ignored whatever it overwrites, and DMA, the EMAC, and stores through another
+core's global alias are not observed at all.
+
+**Reading false flags.** They are only as strong as what was observed. With `sp_written` false the
+core never wrote B15 (a held core, or one that never ran its startup); with `sp_written` true but
+`armed` false, B15 never entered the window, which usually means the window is not this core's stack.
+In either case `out_of_bounds_sp` false proves nothing. Even armed, false flags do not exclude a
+stack overflow that only reached memory through a store wholly below `start` or through DMA.
+
+**Cycles.** `min_sp_cycle` and `lowest_write_cycle` count the observed core's own pipeline cycles,
+starting at 0 when that core first steps: the clock instruction tracing stamps events with. It
+advances on every cycle the pipeline moves — executing a packet, a multicycle NOP, `IDLE`, draining
+into an interrupt — but not on cycles the core spends frozen on memory stalls or parked at the exit
+point, so it is neither the device clock nor the core's `cycles` in the state report, and
+cores released at different times number their cycles from different origins.
 
 ## Memory dumps
 
