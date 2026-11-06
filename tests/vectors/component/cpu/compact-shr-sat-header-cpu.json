@@ -1,0 +1,38 @@
+{
+  "domain": "cpu",
+  "expected": {
+    "registers": {
+      "A3": 4294967295
+    },
+    "controls": {
+      "1": 268435712,
+      "21": 0
+    }
+  },
+  "request": {
+    "action": "execute",
+    "cycles": 2,
+    "endian": "little",
+    "id": "cpu:compact-shr-sat-header-cpu",
+    "memory": [],
+    "observe_controls": [
+      1,
+      21
+    ],
+    "pc": 0,
+    "registers": {
+      "A3": 4294901760
+    },
+    "words": [
+      208541090,
+      208538734,
+      208538734,
+      208538734,
+      208538734,
+      208538734,
+      208538734,
+      3760209920,
+      32768
+    ]
+  }
+}

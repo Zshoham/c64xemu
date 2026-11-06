@@ -3551,18 +3551,21 @@ impl Cpu {
                 let register = compact_register((word >> 7) as u32, header);
                 let count = compact_constant5(word);
                 let value = self.read_register(side, register);
-                let result = match kind {
-                    ShiftKind::Shl => value.checked_shl(count).unwrap_or(0),
+                let (result, saturated) = match kind {
+                    ShiftKind::Shl => (value.checked_shl(count).unwrap_or(0), false),
                     ShiftKind::Shr => {
                         if count >= 32 {
-                            u32::from((value as i32) < 0).wrapping_neg()
+                            (u32::from((value as i32) < 0).wrapping_neg(), false)
                         } else {
-                            ((value as i32) >> count) as u32
+                            (((value as i32) >> count) as u32, false)
                         }
                     }
-                    ShiftKind::Shru => value.checked_shr(count).unwrap_or(0),
-                    ShiftKind::Sshl => unreachable!("constant shift forms never encode Sshl"),
+                    ShiftKind::Shru => (value.checked_shr(count).unwrap_or(0), false),
+                    ShiftKind::Sshl => saturate_i32(i64::from(value as i32) << count.min(40)),
                 };
+                if saturated {
+                    self.note_saturation(b'S', side);
+                }
                 self.schedule(side, register, result, 0);
             }
             CompactOpcode::Spkernel => {
@@ -6754,7 +6757,7 @@ mod tests {
             }
         }
         let frozen: BTreeMap<&str, u64> = BTreeMap::from([
-            ("<none>", 407_040),
+            ("<none>", 357_888),
             ("add", 396_288),
             ("addaw", 36_864),
             ("addk", 32_768),
@@ -6789,8 +6792,8 @@ mod tests {
             ("or", 32_768),
             ("sadd", 98_304),
             ("set", 32_768),
-            ("shl", 90_112),
-            ("shr", 90_112),
+            ("shl", 106_496),
+            ("shr", 106_496),
             ("shru", 24_576),
             ("smpy", 32_768),
             ("smpyh", 32_768),
@@ -6801,7 +6804,7 @@ mod tests {
             ("sploopd", 3_072),
             ("spmask", 4_096),
             ("spmaskr", 4_096),
-            ("sshl", 8_192),
+            ("sshl", 24_576),
             ("ssub", 65_536),
             ("stb", 86_016),
             ("stdw", 61_440),
