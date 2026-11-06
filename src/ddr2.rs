@@ -143,10 +143,13 @@ impl SlavePort for Ddr2 {
         match address {
             MIDR | DMCSTAT => {}
             SDCFG => {
-                // Profile masks select writable fields; reserved fields retain reset values, and
-                // the boot-locked fields only move when the same write sets BOOT_UNLOCK.
+                // Profile masks select writable fields; reserved fields retain reset values.
                 let mut writable = self.profile.writable;
-                if value & SDCFG_BOOT_UNLOCK != 0 {
+                // Accept prior or incoming BOOT_UNLOCK: SPRU970G §2.11.3 sets it and then programs
+                // DDR_DRIVE in the write that clears it, while existing callers and TI IBL also
+                // program fields in the unlock write.
+                let boot_unlocked = (self.config | value) & SDCFG_BOOT_UNLOCK != 0;
+                if boot_unlocked {
                     writable |= self.profile.boot_locked;
                 }
                 self.config = (self.config & !writable) | (value & writable);
@@ -231,7 +234,7 @@ mod tests {
         assert_eq!(ddr2.read(SDRFC, LITTLE_CONTEXT), Some(0x3e));
         ddr2.write(SDRFC, (1 << 31) | 0x79e, LITTLE_CONTEXT);
         assert_eq!(ddr2.read(SDRFC, LITTLE_CONTEXT), Some((1 << 31) | 0x79e));
-        // The boot-locked fields need BOOT_UNLOCK in the same write.
+        // A locked field stays fixed until a prior or incoming write unlocks it.
         ddr2.write(SDCFG, SDCFG_RESET | (1 << 18), LITTLE_CONTEXT);
         assert_eq!(ddr2.read(SDCFG, LITTLE_CONTEXT).unwrap() & (1 << 18), 0);
         ddr2.write(
@@ -243,5 +246,47 @@ mod tests {
             ddr2.read(SDCFG, LITTLE_CONTEXT).unwrap() & (1 << 18),
             1 << 18
         );
+    }
+
+    #[test]
+    fn boot_unlock_accepts_prior_and_incoming_unlocks() {
+        // SPRU970G §2.11.3 and Table 20: accept prior and incoming unlocks.
+        for prior in [false, true] {
+            let mut d = Ddr2::default();
+            let initial = d.config;
+            if prior {
+                d.write(SDCFG, initial | SDCFG_BOOT_UNLOCK, LITTLE_CONTEXT);
+            }
+            d.write(
+                SDCFG,
+                initial | (1 << 18) | if prior { 0 } else { SDCFG_BOOT_UNLOCK },
+                LITTLE_CONTEXT,
+            );
+            assert_ne!(d.config & (1 << 18), 0);
+        }
+    }
+
+    #[test]
+    fn c6455_reserved_sdcfg_fields_keep_figure_21_defaults() {
+        // SPRU970G Figure 21: reserved 31:24, 22:19=A, 17:16=3, 13:12, 8:7, 3.
+        const RESERVED: u32 = 0xff00_0000 | (0xf << 19) | (3 << 16) | 0x3000 | 0x180 | 8;
+        for prior in [false, true] {
+            for value in [0, u32::MAX] {
+                let mut d = Ddr2::default();
+                if prior {
+                    d.write(SDCFG, SDCFG_BOOT_UNLOCK, LITTLE_CONTEXT);
+                }
+                let value = value & !SDCFG_BOOT_UNLOCK;
+                d.write(
+                    SDCFG,
+                    value | if prior { 0 } else { SDCFG_BOOT_UNLOCK },
+                    LITTLE_CONTEXT,
+                );
+                assert_eq!(d.config & RESERVED, 0x0053_0000);
+                // Only DDR_DRIVE is boot-locked; the ordinary fields remain writable.
+                assert_eq!(d.config & 0x004e77, value & 0x004e77);
+                assert_eq!(d.config & (1 << 18), value & (1 << 18));
+            }
+        }
     }
 }
