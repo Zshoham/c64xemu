@@ -70,8 +70,10 @@ def image(tmp_path_factory: pytest.TempPathFactory) -> Path:
     return built
 
 
-def run_device(candidate: Path, image: Path, device: str) -> dict:
-    state = image.parent / f"state-{device}.json"
+def run_device(
+    candidate: Path, image: Path, device: str, *extra: str, tag: str = ""
+) -> dict:
+    state = image.parent / f"state-{device}{tag}.json"
     completed = subprocess.run(
         [
             str(candidate),
@@ -83,6 +85,7 @@ def run_device(candidate: Path, image: Path, device: str) -> dict:
             "2000000",
             "--state-out",
             str(state),
+            *extra,
         ],
         cwd=ROOT,
         capture_output=True,
@@ -137,6 +140,58 @@ def test_c6472_runs_every_core(candidate_binary: Path, image: Path) -> None:
     assert single["device"] == "c6455"
     assert len(single["cores"]) == 1
     assert single["exit_code"] == EXPECTED_EXIT_CODE
+
+
+def test_stack_windows_report_per_core_and_change_nothing_else(
+    candidate_binary: Path, image: Path
+) -> None:
+    """`--stack-window-all` adds one entry per core in core order, `--stack-window` one for the
+    focused core, and the rest of the report is exactly a plain run's.
+
+    The program's crt0 builds B15 with MVKL then MVKH, so for one cycle B15 holds the stack top's
+    low half, far outside the stack: the observer must arm on the completed value without
+    calling that an excursion. The stack is the 2 KB `stack_base` reserves, and B15 starts eight
+    bytes below its top.
+    """
+    base = symbol_address(image, ("stack_base",), kinds=(0, 1))
+    assert base is not None, "crt.asm's stack_base is not in the symbol table"
+    window = f"{base:#x}:{base + 2048:#x}"
+    for device, cores in (("c6455", 1), ("c6472", CORES)):
+        plain = run_device(candidate_binary, image, device)
+        every = run_device(
+            candidate_binary, image, device, "--stack-window-all", window, tag="-all"
+        )
+        one = run_device(
+            candidate_binary, image, device, "--stack-window", window, tag="-one"
+        )
+        observations = every.pop("stack_observations")
+        assert "stack_observation" not in every
+        assert [entry["core"] for entry in observations] == list(range(cores))
+        single = one.pop("stack_observation")
+        assert "stack_observations" not in one
+        assert single == observations[0]
+        assert every == plain and one == plain, device
+        for entry in observations:
+            assert entry["start"] == base and entry["end"] == base + 2048
+            assert entry["sp_written"] and entry["armed"], entry
+            assert entry["min_sp"] == base + 2040, entry
+            assert entry["min_sp_cycle"] == 1, entry  # the MVKH, one cycle after the MVKL
+            assert not entry["out_of_bounds_sp"] and not entry["out_of_bounds_write"], entry
+
+    # The two modes exclude each other, and a window must be non-empty and word aligned.
+    for arguments in (
+        ["--stack-window", window, "--stack-window-all", window],
+        ["--stack-window", f"{base + 2048:#x}:{base:#x}"],
+        ["--stack-window-all", f"{base + 2:#x}:{base + 2048:#x}"],
+    ):
+        completed = subprocess.run(
+            [str(candidate_binary), "run", str(image), *arguments],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert completed.returncode == 2, (arguments, completed.stderr)
 
 
 def test_c6472_shared_memory_is_shared_and_local_memory_is_not(
