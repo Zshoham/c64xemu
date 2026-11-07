@@ -188,6 +188,16 @@ The mailbox exchange of `tests/firmware/hpi_mailbox`, as a file:
 +0,data-auto,read,9
 ```
 
+`hpi_host.py --boot --image <image> --emit-replay FILE` writes the boot that the tool would
+serve from a socket as such a file instead, without starting anything: for each contiguous run
+of words it selects HPIA, writes the words with autoincrement, fences with a second HPIA write
+and reads them back as checked reads, then raises DSPINT (C6455) or programs `DSP_BOOT_ADDRn`
+and `BOOT_COMPLETE_STAT` (C6472). Transfers and checks are at tick 0, the release at tick 1. The
+edges of an unaligned segment come from what the tool has already placed (cold RAM reads zero),
+and each partly covered word is checked before it is written over, so a wrong assumption fails
+the run rather than clobbering memory. `--no-dspint`, `--no-release`, `--dspint` and `--cores`
+mean what they mean for a live boot.
+
 ## The UTOPIA ATM master
 
 The UTOPIA slave's master is a process on a third Unix datagram socket: `--utopia-unix PATH`

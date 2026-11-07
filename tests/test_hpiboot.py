@@ -4,6 +4,9 @@ On the C6455 the host writes PT_LOAD code/data over --hpi-unix and releases the 
 DSPINT; there is no boot table or entry field, so execution starts at L2 base. On the C6472 all
 six cores are held, DSPINT releases none, and the host writes each chosen core's image at its
 global alias, DSP_BOOT_ADDRn (entry >> 10) and the BCn bits of BOOT_COMPLETE_STAT.
+
+Every boot runs twice: once with the host a live process on --hpi-unix, and once with the same
+host written down by `hpi_host.py --emit-replay` and replayed with --hpi-replay.
 """
 
 from __future__ import annotations
@@ -19,7 +22,7 @@ import pytest
 
 from common import ROOT, RTS_INCLUDE_DIR
 from target_programs import Program, build_target_program, load_programs
-from tools.hpi_host import L2_BASE, load_boot_image, place_segments
+from tools.hpi_host import L2_BASE, emulator_failure, load_boot_image, parse_dumps, place_segments
 from tools.emac_boot import BootError, Image, Segment, parse_elf
 
 pytestmark = [pytest.mark.slow, pytest.mark.host]
@@ -68,17 +71,76 @@ def image(request: pytest.FixtureRequest, tmp_path_factory: pytest.TempPathFacto
     return built
 
 
+@pytest.fixture(params=["socket", "file"])
+def transport(request: pytest.FixtureRequest) -> str:
+    """How the host reaches the emulator: a live process, or a replayed file."""
+    return request.param
+
+
+def emulator_options(extra: tuple[str, ...]) -> tuple[list[str], list[str]]:
+    """Split the host tool's options into the host's own and the emulator's `--device` and
+    `--dump`, which a replayed boot passes to the emulator itself."""
+    host, emulator = [], []
+    arguments = iter(extra)
+    for argument in arguments:
+        if argument in ("--device", "--dump"):
+            value = next(arguments)
+            emulator += [argument, value]
+            if argument == "--device":
+                host += [argument, value]
+        elif argument == "--cores":
+            host += [argument, next(arguments)]
+        else:
+            host.append(argument)
+    return host, emulator
+
+
+def emit_replay(image: Path, workdir: Path, host: list[str]) -> tuple[Path, dict]:
+    """The boot written as an --hpi-replay file, and the boot report the emitter gives."""
+    replay = workdir / "boot.csv"
+    result = subprocess.run(
+        [sys.executable, str(TOOL), "--image", str(image), "--boot", "--report",
+         "--emit-replay", str(replay), *host],
+        cwd=ROOT, capture_output=True, text=True, timeout=60,
+    )
+    assert result.returncode == 0, f"emitter failed: {result.stderr}{result.stdout}"
+    return replay, json.loads(result.stdout)
+
+
+def replay_boot(
+    candidate: Path, image: Path, replay: Path, state: Path, emulator: list[str],
+) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [str(candidate), "run", str(image), "--boot-mode", "1", "--hpi-replay", str(replay),
+         "--max-cycles", "100000000", "--state-out", str(state), *emulator],
+        cwd=ROOT, capture_output=True, text=True, timeout=180,
+    )
+
+
 def hpiboot(
     candidate: Path, image: Path, workdir: Path, release: bool = True, extra: tuple[str, ...] = (),
+    transport: str = "socket",
 ) -> tuple[dict, dict]:
     state = workdir / "state.json"
+    options = (*([] if release else ["--no-dspint"]), *extra)
+    if transport == "file":
+        host, emulator = emulator_options(options)
+        replay, report = emit_replay(image, workdir, host)
+        result = replay_boot(candidate, image, replay, state, emulator)
+        # The emulator's exit status is the application's exit code (sum_loop exits 55), or 1
+        # for a held boot that ran out of cycles: the state decides, as it does for the socket.
+        failure = emulator_failure(str(state), result.returncode, require_exit=report["boot"]["released"])
+        assert failure is None, f"{failure}: {result.stderr[-2000:]}"
+        report["dumps"] = parse_dumps(result.stderr)
+        state_json = json.loads(state.read_text())
+        assert state_json["hpi_replay"]["complete"] is True
+        assert state_json["hpi_replay"]["failure"] is None
+        return report, state_json
     result = subprocess.run(
         [
             sys.executable, str(TOOL), "--emulator", str(candidate), "--image", str(image),
             "--boot", "--report", "--hpi-poll", "256", "--max-cycles", "100000000",
-            "--state-out", str(state), "--timeout", "120",
-            *([] if release else ["--no-dspint"]),
-            *extra,
+            "--state-out", str(state), "--timeout", "120", *options,
         ],
         cwd=ROOT, capture_output=True, text=True, timeout=180,
     )
@@ -88,9 +150,9 @@ def hpiboot(
 
 
 def test_c6455_boots_code_and_data_from_external_hpi_host(
-    candidate_binary: Path, image: Path, tmp_path: Path,
+    candidate_binary: Path, image: Path, tmp_path: Path, transport: str,
 ) -> None:
-    report, state = hpiboot(candidate_binary, image, tmp_path)
+    report, state = hpiboot(candidate_binary, image, tmp_path, transport=transport)
     loaded, order = load_boot_image(str(image))
     assert loaded.entry == L2_BASE
     assert loaded.segments[-1].address == PROBE_ADDRESS
@@ -114,9 +176,9 @@ def test_c6455_boots_code_and_data_from_external_hpi_host(
 
 
 def test_c6455_hpi_load_without_dspint_executes_nothing(
-    candidate_binary: Path, image: Path, tmp_path: Path,
+    candidate_binary: Path, image: Path, tmp_path: Path, transport: str,
 ) -> None:
-    report, state = hpiboot(candidate_binary, image, tmp_path, release=False)
+    report, state = hpiboot(candidate_binary, image, tmp_path, release=False, transport=transport)
     assert report["boot"]["verified"] is True
     assert report["boot"]["released"] is False
     assert state["hpi_boot"]["entry"] is None
@@ -177,11 +239,11 @@ def c6472_image(request: pytest.FixtureRequest, tmp_path_factory: pytest.TempPat
 
 def c6472_boot(
     candidate: Path, image: Path, workdir: Path, cores: tuple[int, ...] | None = None,
-    extra: tuple[str, ...] = (),
+    extra: tuple[str, ...] = (), transport: str = "socket",
 ) -> tuple[dict, dict, list[int]]:
     """Boot over the HPI and return the report, the state and the shared mailbox at exit. The
     dump reads memory as little-endian words; the mailbox holds words in the image's order."""
-    report, state = hpiboot(candidate, image, workdir, extra=(
+    report, state = hpiboot(candidate, image, workdir, transport=transport, extra=(
         "--device", "c6472", "--dump", f"{RESULTS:#010x}:{4 * CORES}",
         *(["--cores", ",".join(map(str, cores))] if cores else []), *extra,
     ))
@@ -207,10 +269,10 @@ def assert_only_these_cores_ran(state: dict, cores: tuple[int, ...], entry: int)
 
 
 def test_c6472_boots_all_six_cores_independently(
-    candidate_binary: Path, c6472_image: tuple[Path, int], tmp_path: Path,
+    candidate_binary: Path, c6472_image: tuple[Path, int], tmp_path: Path, transport: str,
 ) -> None:
     image, entry = c6472_image
-    report, state, mailbox = c6472_boot(candidate_binary, image, tmp_path)
+    report, state, mailbox = c6472_boot(candidate_binary, image, tmp_path, transport=transport)
     loaded, order = load_boot_image(str(image), "c6472")
     assert loaded.entry == entry
     assert report["boot"]["cores"] == list(range(CORES))
@@ -225,9 +287,10 @@ def test_c6472_boots_all_six_cores_independently(
 @pytest.mark.parametrize("cores", [(0, 3), (2, 4)])
 def test_c6472_releases_only_the_selected_cores(
     candidate_binary: Path, c6472_image: tuple[Path, int], tmp_path: Path, cores: tuple[int, ...],
+    transport: str,
 ) -> None:
     image, entry = c6472_image
-    report, state, mailbox = c6472_boot(candidate_binary, image, tmp_path, cores)
+    report, state, mailbox = c6472_boot(candidate_binary, image, tmp_path, cores, transport=transport)
     assert report["boot"]["cores"] == list(cores)
     assert state["cores"][min(cores)]["halted"], "the selected leader reached the exit"
     assert mailbox == [EXPECTED[core] if core in cores else 0 for core in range(CORES)]
@@ -237,9 +300,12 @@ def test_c6472_releases_only_the_selected_cores(
 @pytest.mark.parametrize("extra", [(), ("--dspint",)], ids=["loaded", "dspint-only"])
 def test_c6472_hpi_load_and_dspint_do_not_release_a_core(
     candidate_binary: Path, c6472_image: tuple[Path, int], tmp_path: Path, extra: tuple[str, ...],
+    transport: str,
 ) -> None:
     image, entry = c6472_image
-    report, state, mailbox = c6472_boot(candidate_binary, image, tmp_path, extra=("--no-release", *extra))
+    report, state, mailbox = c6472_boot(
+        candidate_binary, image, tmp_path, extra=("--no-release", *extra), transport=transport,
+    )
     assert report["boot"]["verified"] is True
     assert report["boot"]["released"] is False
     assert mailbox == [0] * CORES
@@ -280,3 +346,48 @@ def test_c6472_host_replicates_local_segments_and_writes_shared_ones_once() -> N
     # Shared L2's 0020 0000h is local-only (SPRS612G Table 2-2); the HPI names it by its alias.
     assert placements == [(0x1180_0400, b"code"), (0x1480_0400, b"code"), (0x1020_0000, b"data")]
 
+
+
+# ---- replay files ------------------------------------------------------------------------------
+
+
+def test_a_replayed_boot_places_the_unaligned_probe_exactly(
+    candidate_binary: Path, image: Path, tmp_path: Path,
+) -> None:
+    """The ten-byte probe at 0x00860001 covers two words partly: the emitter checks each against
+    what it knows is there before writing over it, and the bytes around the probe survive."""
+    base = PROBE_ADDRESS & ~3
+    report, state = hpiboot(
+        candidate_binary, image, tmp_path, transport="file", extra=("--dump", f"{base:#010x}:16"),
+    )
+    memory = b"".join(word.to_bytes(4, "little") for word in report["dumps"][f"{base:#010x}"])
+    offset = PROBE_ADDRESS - base
+    assert memory[offset : offset + len(PROBE)] == PROBE
+    assert memory[:offset] == bytes(offset)
+    assert memory[offset + len(PROBE) :] == bytes(len(memory) - offset - len(PROBE))
+    rows = (tmp_path / "boot.csv").read_text().splitlines()
+    assert f"0,address,write,0x{base >> 2:08x}" in rows
+    assert "0,data,read,0x00000000" in rows, "a guard on a partly covered word"
+
+
+def test_a_corrupted_replay_word_fails_the_boot_at_its_line(
+    candidate_binary: Path, image: Path, tmp_path: Path,
+) -> None:
+    replay, report = emit_replay(image, tmp_path, [])
+    rows = replay.read_text().splitlines()
+    # The first checked read of transferred data: expect a word the host did not write.
+    number = next(index for index, row in enumerate(rows) if ",data-auto,read,0x" in row)
+    tick, port, direction, value = rows[number].split(",")
+    rows[number] = f"{tick},{port},{direction},0x{int(value, 16) ^ 1:08x}"
+    replay.write_text("\n".join(rows) + "\n")
+    state = tmp_path / "state.json"
+    result = replay_boot(candidate_binary, image, replay, state, [])
+    assert result.returncode == 1, result.stderr
+    assert state.is_file(), "the state is written on a failure too"
+    report = json.loads(state.read_text())
+    line = number + 1
+    assert f"boot.csv line {line} tick 0: data-auto read {value}, expected" in report["fault"]
+    assert report["hpi_replay"]["failure"]["line"] == line
+    assert report["hpi_replay"]["complete"] is False
+    assert report["cores"][0]["held_in_reset"] is True, "nothing was released"
+    assert report["cycles"] == 0

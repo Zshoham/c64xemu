@@ -9,6 +9,9 @@ is all a host needs to reach DSP memory and to exchange interrupts with the CPU.
 By default this script drives the firmware mailbox. With --boot it instead loads ELF code and
 data directly through the HPI (not a boot table) and verifies the transferred bytes.
 
+With --emit-replay FILE it starts nothing: it writes the same boot as a timed file for the
+emulator's --hpi-replay instead, every transfer and check at tick 0 and the release at tick 1.
+
 C6455 (--device c6455): host boot always starts at 0x00800000, so the ELF must place its entry
 there, and the host's DSPINT releases the held core.
 
@@ -128,6 +131,13 @@ class Host:
             int.from_bytes(padded[index : index + 4], byteorder)
             for index in range(0, len(padded), 4)
         ])
+
+    def check_word(self, address: int, expected: int, what: str) -> None:
+        if self.get_word(address) != expected:
+            raise RuntimeError(f"{what} did not take 0x{expected:x}")
+
+    def release_point(self) -> None:
+        """Where a boot's release begins; a live host just carries on."""
 
     def raise_dspint(self) -> None:
         self.write(HPIC, HPIC_DSPINT)
@@ -253,11 +263,115 @@ def start_cores(host: Host, entry: int, cores: tuple[int, ...], release: bool) -
     for core in cores:
         register = DSP_BOOT_ADDR0 + DSP_BOOT_ADDR_STRIDE * core
         host.put_words(register, [entry >> 10])
-        if host.get_word(register) != entry >> 10:
-            raise RuntimeError(f"DSP_BOOT_ADDR{core} did not take 0x{entry >> 10:x}")
+        host.check_word(register, entry >> 10, f"DSP_BOOT_ADDR{core}")
     if release:
+        host.release_point()
         mask = sum(1 << core for core in cores)
         host.put_words(BOOT_COMPLETE_STAT, [mask])
+
+
+PORT_NAMES = {HPIC: "control", HPID_AUTO: "data-auto", HPIA: "address", HPID: "data"}
+
+
+class ReplayRecorder:
+    """The host side written down instead of performed: a timed file for --hpi-replay.
+
+    It offers the operations a boot uses, the same as `Host`, and turns each into rows. With no
+    device to ask, it keeps a byte shadow of everything it has placed - cold RAM reads zero - for
+    the edges of an unaligned segment, and checks each such word before writing over it, so a
+    wrong assumption fails the run instead of clobbering memory. Everything is at tick 0 until
+    `release_point`, and at tick 1 after it.
+    """
+
+    def __init__(self, byteorder: str):
+        self.byteorder = byteorder
+        self.tick = 0
+        self.rows: list[str] = ["tick,port,direction,value", "0,control,write,0"]
+        self.shadow: dict[int, int] = {}
+
+    def row(self, port: int, direction: str, value: int | None) -> None:
+        text = "-" if value is None else f"0x{value & 0xFFFFFFFF:08x}"
+        self.rows.append(f"{self.tick},{PORT_NAMES[port]},{direction},{text}")
+
+    def write(self, port: int, value: int = 0) -> None:
+        self.row(port, "write", value)
+
+    def shadow_word(self, address: int) -> int:
+        data = bytes(self.shadow.get(address + offset, 0) for offset in range(4))
+        return int.from_bytes(data, self.byteorder)
+
+    def put_words(self, address: int, words: list[int]) -> None:
+        self.write(HPIA, address >> 2)
+        for word in words:
+            self.write(HPID_AUTO, word)
+        # The HPIA write is the fence that flushes a partial burst (SPRU969B section 6.3).
+        self.write(HPIA, address >> 2)
+
+    def check_words(self, address: int, words: list[int]) -> None:
+        """Read back what was placed: HPID alone for one word, so nothing is prefetched past
+        it, and with autoincrement for a run."""
+        self.write(HPIA, address >> 2)
+        port = HPID if len(words) == 1 else HPID_AUTO
+        for word in words:
+            self.row(port, "read", word)
+
+    def check_word(self, address: int, expected: int, what: str) -> None:
+        self.check_words(address, [expected])
+
+    def put_bytes(self, address: int, data: bytes, byteorder: str) -> None:
+        if not data:
+            return
+        base = address & ~3
+        end = (address + len(data) + 3) & ~3
+        for edge in sorted({base, end - 4}):
+            if edge < address or edge + 4 > address + len(data):
+                self.check_words(edge, [self.shadow_word(edge)])
+        for offset, byte in enumerate(data):
+            self.shadow[address + offset] = byte
+        words = [self.shadow_word(word) for word in range(base, end, 4)]
+        self.put_words(base, words)
+        self.check_words(base, words)
+
+    def release_point(self) -> None:
+        self.tick = 1
+
+    def raise_dspint(self) -> None:
+        self.write(HPIC, HPIC_DSPINT)
+
+    def text(self) -> str:
+        return "\n".join(self.rows) + "\n"
+
+
+def emit_boot(path: str, image: Image, byteorder: str, device: str, cores: tuple[int, ...],
+              release: bool, dspint: bool) -> dict:
+    """Write a boot as a replay file, and answer the report a live boot would give."""
+    recorder = ReplayRecorder(byteorder)
+    placements = (
+        place_segments(image, cores) if device == "c6472"
+        else [(segment.address, segment.data) for segment in image.segments]
+    )
+    for address, data in placements:
+        recorder.put_bytes(address, data, byteorder)
+    boot = {
+        "entry": image.entry,
+        "bytes": sum(len(data) for _, data in placements),
+        "segments": len(image.segments),
+        "verified": True,
+        "released": release,
+        "byteorder": byteorder,
+    }
+    if device == "c6472":
+        boot["cores"] = list(cores)
+        if dspint:
+            recorder.release_point()
+            recorder.raise_dspint()
+        start_cores(recorder, image.entry, cores, release)
+    elif release:
+        recorder.release_point()
+        recorder.raise_dspint()
+    with open(path, "w") as replay:
+        replay.write(recorder.text())
+    return boot
 
 
 def emulator_failure(state_path: str, returncode: int, require_exit: bool) -> str | None:
@@ -301,6 +415,10 @@ def main() -> int:
     parser.add_argument("--dspint", action="store_true", help="C6472: also raise DSPINT, which releases no core")
     parser.add_argument("--dump", action="append", default=[], metavar="ADDR:LEN", help="print this memory when the run ends")
     parser.add_argument("--state-out", help="write the emulator's final machine state")
+    parser.add_argument(
+        "--emit-replay", metavar="FILE",
+        help="write the host's accesses as an --hpi-replay file instead of running the emulator",
+    )
     arguments = parser.parse_args()
     c6472 = arguments.device == "c6472"
     for flag, given in (
@@ -321,6 +439,17 @@ def main() -> int:
     boot_image, byteorder = (
         load_boot_image(arguments.image, arguments.device) if arguments.boot else (None, "little")
     )
+    if arguments.emit_replay:
+        # Offline: no socket and no emulator. The file is the host.
+        if boot_image is None:
+            parser.error("--emit-replay requires --boot")
+        boot = emit_boot(
+            arguments.emit_replay, boot_image, byteorder, arguments.device, cores,
+            release=not (arguments.no_dspint or arguments.no_release), dspint=arguments.dspint,
+        )
+        if arguments.report:
+            print(json.dumps({"boot": boot}))
+        return 0
 
     directory = tempfile.mkdtemp(prefix="c64xemu-hpi-")
     emulator_socket = os.path.join(directory, "emu.sock")

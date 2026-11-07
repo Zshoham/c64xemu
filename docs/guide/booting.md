@@ -130,7 +130,8 @@ that leaves words in the write FIFO leaves them unwritten.
 `tests/tools/hpi_host.py --boot --image IMAGE` is a host for the C6455 boot. It writes each
 `PT_LOAD` segment, padded with zeros to its memory size, and reads it back to verify it.
 It flushes the final partial FIFO burst by rewriting HPIA, then raises DSPINT.
-`--no-dspint` stops before release.
+`--no-dspint` stops before release. With `--emit-replay FILE` it writes the same boot as a
+replay file and starts nothing.
 
 ### C6472 host boot
 
@@ -184,7 +185,8 @@ inside the C6472's 608 KB local L2. `--no-release` loads without releasing; addi
 demonstrates that DSPINT does not end this boot. `--state-out FILE` records
 `hpi_boot.entries`, one entry per core (null while held), and `hpi_boot.entry` for core 0.
 
-`tests/test_hpiboot.py` checks the C6455 in both byte orders and the C6472 with all six cores,
+`tests/test_hpiboot.py` runs every boot twice, from a live host and from an emitted replay file.
+It checks the C6455 in both byte orders and the C6472 with all six cores,
 selected subsets, nondefault entries in both byte orders, and no release. Away from the L2 base
 the probe links a guard there, so a core started at the default address instead of its
 programmed one fails the run. The multicore probe disables L1D before using its shared result
