@@ -196,7 +196,9 @@ and `BOOT_COMPLETE_STAT` (C6472). Transfers and checks are at tick 0, the releas
 edges of an unaligned segment come from what the tool has already placed (cold RAM reads zero),
 and each partly covered word is checked before it is written over, so a wrong assumption fails
 the run rather than clobbering memory. `--no-dspint`, `--no-release`, `--dspint` and `--cores`
-mean what they mean for a live boot.
+mean what they mean for a live boot. Without `--boot`, `--emit-replay FILE` writes the mailbox
+host instead, every answer a checked read; `tests/test_host.py` replays it batched and stepped
+and requires the same state from both.
 
 ## The UTOPIA ATM master
 

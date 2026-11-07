@@ -9,8 +9,10 @@ is all a host needs to reach DSP memory and to exchange interrupts with the CPU.
 By default this script drives the firmware mailbox. With --boot it instead loads ELF code and
 data directly through the HPI (not a boot table) and verifies the transferred bytes.
 
-With --emit-replay FILE it starts nothing: it writes the same boot as a timed file for the
-emulator's --hpi-replay instead, every transfer and check at tick 0 and the release at tick 1.
+With --emit-replay FILE it starts nothing: it writes the same host as a timed file for the
+emulator's --hpi-replay instead. A boot has every transfer and check at tick 0 and the release
+at tick 1; the mailbox waits for HRDY, then runs each exchange as soon as the last completed,
+checking every answer.
 
 C6455 (--device c6455): host boot always starts at 0x00800000, so the ELF must place its entry
 there, and the host's DSPINT releases the held core.
@@ -273,6 +275,18 @@ def start_cores(host: Host, entry: int, cores: tuple[int, ...], release: bool) -
 PORT_NAMES = {HPIC: "control", HPID_AUTO: "data-auto", HPIA: "address", HPID: "data"}
 
 
+def mailbox_exchange(index: int) -> tuple[list[int], int, int]:
+    """Exchange `index`'s payload, command and the answer the firmware must give."""
+    payload = [(index * 0x01010101 + step * 7 + 1) & 0xFFFFFFFF for step in range(4)]
+    command = COMMAND_SUM if index % 2 == 0 else COMMAND_SWAP
+    expected = (
+        sum(payload) & 0xFFFFFFFF
+        if command == COMMAND_SUM
+        else int.from_bytes(payload[0].to_bytes(4, "little"), "big")
+    )
+    return payload, command, expected
+
+
 class ReplayRecorder:
     """The host side written down instead of performed: a timed file for --hpi-replay.
 
@@ -280,18 +294,28 @@ class ReplayRecorder:
     device to ask, it keeps a byte shadow of everything it has placed - cold RAM reads zero - for
     the edges of an unaligned segment, and checks each such word before writing over it, so a
     wrong assumption fails the run instead of clobbering memory. Everything is at tick 0 until
-    `release_point`, and at tick 1 after it.
+    `release_point`, and at tick 1 after it. A `relative` recorder - the mailbox, whose pace
+    the firmware sets - instead runs each row as soon as the one before it completed (`+0`).
     """
 
-    def __init__(self, byteorder: str):
+    def __init__(self, byteorder: str, relative: bool = False):
         self.byteorder = byteorder
         self.tick = 0
-        self.rows: list[str] = ["tick,port,direction,value", "0,control,write,0"]
+        self.relative = relative
+        self.rows: list[str] = ["tick,port,direction,value,mask,within"]
         self.shadow: dict[int, int] = {}
+
+    def when(self) -> str:
+        # The first row of a relative file is at tick 0: there is nothing before it to follow.
+        return "+0" if self.relative and len(self.rows) > 1 else str(self.tick)
 
     def row(self, port: int, direction: str, value: int | None) -> None:
         text = "-" if value is None else f"0x{value & 0xFFFFFFFF:08x}"
-        self.rows.append(f"{self.tick},{PORT_NAMES[port]},{direction},{text}")
+        self.rows.append(f"{self.when()},{PORT_NAMES[port]},{direction},{text}")
+
+    def wait(self, value: int, mask: int, within: int) -> None:
+        """Poll HPIC until the masked bits read `value`, for at most `within` ticks."""
+        self.rows.append(f"{self.when()},control,wait,0x{value:x},0x{mask:x},{within}")
 
     def write(self, port: int, value: int = 0) -> None:
         self.row(port, "write", value)
@@ -346,6 +370,8 @@ def emit_boot(path: str, image: Image, byteorder: str, device: str, cores: tuple
               release: bool, dspint: bool) -> dict:
     """Write a boot as a replay file, and answer the report a live boot would give."""
     recorder = ReplayRecorder(byteorder)
+    # Strapped to host boot, HPIRST is clear from reset, so the host can set HPIC up at once.
+    recorder.write(HPIC, 0)
     placements = (
         place_segments(image, cores) if device == "c6472"
         else [(segment.address, segment.data) for segment in image.segments]
@@ -372,6 +398,24 @@ def emit_boot(path: str, image: Image, byteorder: str, device: str, cores: tuple
     with open(path, "w") as replay:
         replay.write(recorder.text())
     return boot
+
+
+def emit_mailbox(path: str, exchanges: int, ready_within: int, answer_within: int) -> None:
+    """Write the mailbox as a replay file: wait for the firmware to let the host in (HRDY),
+    then each exchange - request, DSPINT, wait for HINT, acknowledge it, read and check the
+    reply - each row as soon as the one before it completed."""
+    recorder = ReplayRecorder("little", relative=True)
+    recorder.wait(HPIC_HRDY, HPIC_HRDY, ready_within)
+    for index in range(exchanges):
+        payload, command, expected = mailbox_exchange(index)
+        recorder.put_words(PAYLOAD, payload)
+        recorder.put_words(REQUEST, [command, len(payload), index + 1, 0])
+        recorder.raise_dspint()
+        recorder.wait(HPIC_HINT, HPIC_HINT, answer_within)
+        recorder.write(HPIC, HPIC_HINT)  # write one to clear, acknowledging the CPU
+        recorder.check_words(REPLY, [index + 1, expected])
+    with open(path, "w") as replay:
+        replay.write(recorder.text())
 
 
 def emulator_failure(state_path: str, returncode: int, require_exit: bool) -> str | None:
@@ -439,10 +483,11 @@ def main() -> int:
     boot_image, byteorder = (
         load_boot_image(arguments.image, arguments.device) if arguments.boot else (None, "little")
     )
-    if arguments.emit_replay:
+    if arguments.emit_replay and boot_image is None:
         # Offline: no socket and no emulator. The file is the host.
-        if boot_image is None:
-            parser.error("--emit-replay requires --boot")
+        emit_mailbox(arguments.emit_replay, arguments.exchanges, 50_000_000, 5_000_000)
+        return 0
+    if arguments.emit_replay:
         boot = emit_boot(
             arguments.emit_replay, boot_image, byteorder, arguments.device, cores,
             release=not (arguments.no_dspint or arguments.no_release), dspint=arguments.dspint,
@@ -537,13 +582,7 @@ def main() -> int:
             status = 0  # the host's part succeeded; the emulator's own exit is checked below
 
         for index in range(0 if arguments.boot else arguments.exchanges):
-            payload = [(index * 0x01010101 + step * 7 + 1) & 0xFFFFFFFF for step in range(4)]
-            command = COMMAND_SUM if index % 2 == 0 else COMMAND_SWAP
-            expected = (
-                sum(payload) & 0xFFFFFFFF
-                if command == COMMAND_SUM
-                else int.from_bytes(payload[0].to_bytes(4, "little"), "big")
-            )
+            payload, command, expected = mailbox_exchange(index)
             host.put_words(PAYLOAD, payload)
             host.put_words(REQUEST, [command, len(payload), index + 1, 0])
             host.raise_dspint()
