@@ -717,6 +717,9 @@ impl Machine {
     /// Flushes the trace and writes any captured frames. Every front end calls this on the way
     /// out, so a session that ends in the REPL, in gdb or in the browser leaves the same files
     /// behind as a batch run.
+    ///
+    /// Calling it again is safe: it collects nothing new that was already collected, sends the
+    /// live peer nothing it has already been sent, and rewrites the same `--pcap-out` file.
     pub fn finish(&mut self) -> Result<(), String> {
         self.device.cpu_mut().trace_mut().flush();
         self.with_host(HostConnections::finish)

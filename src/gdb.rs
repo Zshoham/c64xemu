@@ -43,8 +43,26 @@ pub fn serve(machine: Machine, listen: &str, max_cycles: u64) -> Result<u8, Stri
         .copied()
         .collect();
     session.arm_breakpoints();
-    session.serve(stream)?;
-    Ok(0)
+    serve_stream(&mut session, stream)
+}
+
+/// Serves one client, then tears the session down however it ended - the client detached,
+/// killed, disconnected, or the socket failed - so the captures a session leaves behind do not
+/// depend on how the client went away. The serve error comes first; a teardown error after it
+/// is printed rather than lost.
+fn serve_stream(session: &mut Session, stream: TcpStream) -> Result<u8, String> {
+    let served = session.serve(stream);
+    let closed = session.close();
+    match (served, closed) {
+        (Err(error), closed) => {
+            if let Err(close) = closed {
+                eprintln!("c64xemu: gdb stub: {close}");
+            }
+            Err(error)
+        }
+        (Ok(()), Err(close)) => Err(close),
+        (Ok(()), Ok(())) => Ok(0),
+    }
 }
 
 pub struct Session {
@@ -316,8 +334,15 @@ impl Session {
         reply
     }
 
+    /// The session is over: flush the trace and write the captures. Safe after `exited` has
+    /// already done it (`Machine::finish`).
+    fn close(&mut self) -> Result<(), String> {
+        self.machine.finish()
+    }
+
     /// The program reached its exit point: report a process exit carrying A4, the EABI return
-    /// register, which is the same code `run` exits with.
+    /// register, which is the same code `run` exits with. The captures are written now, for a
+    /// client that stays connected afterwards; `close` writes them again at the end.
     fn exited(&mut self) -> String {
         let _ = self.machine.finish();
         format!("W{:02x}", self.machine.exit_code())
@@ -389,7 +414,7 @@ impl Session {
         }
     }
 
-    fn serve(mut self, mut stream: TcpStream) -> Result<(), String> {
+    fn serve(&mut self, mut stream: TcpStream) -> Result<(), String> {
         stream
             .set_nodelay(true)
             .map_err(|error| error.to_string())?;
@@ -564,6 +589,69 @@ mod tests {
     use super::*;
     use crate::cpu::Cpu;
     use crate::device::{Device, C6472};
+    use crate::host::{HostConnections, Wiring};
+    use crate::netio::EthernetFiles;
+    use std::net::Shutdown;
+    use std::path::{Path, PathBuf};
+
+    /// A session on a machine with `--pcap-out` at `capture`, and the client end of its socket.
+    fn connected(capture: &Path) -> (Session, TcpStream, TcpStream) {
+        let mut machine = Machine::bare(Cpu::new(0));
+        machine.device.cpu_mut().write_words(0, &[0; 16]);
+        machine.attach_host(
+            HostConnections::open(Wiring {
+                net_poll: 1,
+                net_port: 0,
+                net: EthernetFiles {
+                    pcap_out: Some(capture),
+                    ..EthernetFiles::default()
+                },
+                hpi: None,
+                utopia: None,
+            })
+            .unwrap(),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        (Session::new(machine), client, server)
+    }
+
+    fn capture(name: &str) -> PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("c64xemu-gdb-{}-{name}.pcap", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    /// However the client goes away - it disconnects, or it kills the target - the session's
+    /// captures are written, as they are when the program exits.
+    #[test]
+    fn a_session_writes_its_captures_however_the_client_leaves() {
+        for kill in [false, true] {
+            let path = capture(if kill { "kill" } else { "disconnect" });
+            let (mut session, mut client, server) = connected(&path);
+            if kill {
+                write_packet(&mut client, "k").unwrap();
+            }
+            client.shutdown(Shutdown::Write).unwrap();
+            assert_eq!(serve_stream(&mut session, server), Ok(0));
+            assert!(path.is_file(), "kill {kill}");
+            std::fs::remove_file(&path).unwrap();
+        }
+    }
+
+    /// Finishing twice - at the exit, then at teardown - writes the same capture again.
+    #[test]
+    fn finishing_twice_rewrites_the_same_capture() {
+        let path = capture("twice");
+        let (mut session, _client, _server) = connected(&path);
+        session.machine.finish().unwrap();
+        let first = std::fs::read(&path).unwrap();
+        session.close().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), first);
+        std::fs::remove_file(&path).unwrap();
+    }
 
     #[test]
     fn breakpoint_reply_identifies_the_hit_without_selecting_its_core() {
