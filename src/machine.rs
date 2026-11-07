@@ -756,20 +756,22 @@ impl Machine {
     }
 
     /// Install the full halt rule, or its interactive resume form. Exclusion is per core:
-    /// a core moving off its own address must not disable that address for another core.
+    /// a core moving off its own address must not disable that address for another core. And
+    /// it lasts only until that core has moved off: a `continue` from a breakpoint in a loop
+    /// or an interrupt service routine stops there again on the next visit.
     fn install_halt(&mut self, exclude_current: bool) {
         let stop = self.stop;
         let breakpoints = &self.breakpoints;
         for core in 0..self.device.cores() {
             self.device.with_core(core, |cpu| {
-                let current = cpu.pc();
-                let mut addresses: Vec<u32> = breakpoints
-                    .iter()
-                    .copied()
-                    .filter(|address| !exclude_current || *address != current)
-                    .collect();
-                addresses.extend(stop.filter(|address| !exclude_current || *address != current));
-                cpu.set_stop_on_fetch(addresses);
+                let mut addresses = breakpoints.clone();
+                addresses.extend(stop);
+                if exclude_current {
+                    let current = cpu.pc();
+                    cpu.set_stop_on_fetch_resuming(addresses, current);
+                } else {
+                    cpu.set_stop_on_fetch(addresses);
+                }
             });
         }
     }
@@ -2120,6 +2122,104 @@ mod tests {
         );
         assert_eq!(machine.focus(), 0);
         assert_eq!(machine.pc(), 8);
+    }
+
+    /// A loop at address 0: two NOPs, `B .S1 0` and its five delay slots as `NOP 5`, eight
+    /// cycles an iteration.
+    const LOOP: [u32; 4] = [0, 0, 0x0000_0010, 0x0000_8000];
+
+    /// A `continue` from a breakpoint suspends it only until the core leaves the address: the
+    /// next iteration of a loop stops there again, one iteration later, on both run loops and
+    /// on every core that runs the loop, each re-arming its own address.
+    #[test]
+    fn a_resumed_breakpoint_is_rearmed_once_the_core_leaves_it() {
+        let mut no_op = |_: &Machine| None;
+        for (cores, batched) in [(1, true), (1, false), (6, true), (6, false)] {
+            let mut machine = Machine::bare(Cpu::new(0));
+            if cores == 6 {
+                machine.device =
+                    Device::with_boot_mode(&crate::device::C6472, 0, Endian::Little, 0);
+            }
+            for core in 0..cores {
+                machine
+                    .device
+                    .with_core(core, |cpu| cpu.write_words(0, &LOOP));
+            }
+            // A six-core device runs the loop on cores 0 and 1; the rest loop elsewhere.
+            for core in 2..cores {
+                machine.device.with_core(core, |cpu| {
+                    cpu.write_words(0x100, &[0, 0, 0x0000_0810, 0x0000_8000]);
+                    cpu.set_pc(0x100);
+                });
+            }
+            machine.arm_halt(&[4]);
+            let mut stops = Vec::new();
+            for _ in 0..4 {
+                let mut conditions = vec![StopCondition::Budget(1000)];
+                if !batched {
+                    conditions.push(StopCondition::Check(&mut no_op));
+                }
+                let reason = machine.resume(&mut conditions).unwrap();
+                let StopReason::Breakpoint(hit) = reason else {
+                    panic!("{reason:?}, cores {cores} batched {batched}");
+                };
+                assert_eq!(
+                    hit,
+                    BreakpointHit {
+                        core: 0,
+                        address: 4
+                    }
+                );
+                // Cores 0 and 1 run the loop in step: both left the address on the resume and
+                // both are back on it, each having re-armed its own copy.
+                let looping = cores.min(2);
+                assert!((0..looping).all(|core| machine.device.core(core).halted()));
+                stops.push(machine.device.cycle().max(machine.cycles()));
+            }
+            assert_eq!(stops, [1, 9, 17, 25], "cores {cores} batched {batched}");
+        }
+    }
+
+    /// A breakpoint inside a SPLOOP whose loop branch is pending while the buffer replays: the
+    /// batched path executes those replay cycles without `Cpu::step`, and it must re-arm the
+    /// address there too, so both run paths stop at it again on the same cycle.
+    /// `B .S1 12; SPLOOP 1; ADD .L1 1,A4,A4; SPKERNEL 0,0; NOP 5`, ILC = 100 (SPRUFE8B
+    /// chapter 8).
+    #[test]
+    fn a_resumed_breakpoint_is_rearmed_during_a_buffered_replay() {
+        let mut no_op = |_: &Machine| None;
+        for batched in [false, true] {
+            let mut cpu = Cpu::new(0);
+            cpu.write_control(0x0d, 100);
+            cpu.write_words(
+                0,
+                &[
+                    0x0000_0190,
+                    0x0003_8000,
+                    0x0210_2058,
+                    0x0003_4000,
+                    0x0000_8000,
+                ],
+            );
+            let mut machine = Machine::bare(cpu);
+            machine.arm_halt(&[12]);
+            let reason = machine.run(&mut [StopCondition::Budget(30)]).unwrap();
+            assert!(matches!(reason, StopReason::Breakpoint(_)), "{reason:?}");
+            assert_eq!((machine.pc(), machine.cycles()), (12, 3));
+            let mut conditions = vec![StopCondition::Budget(30)];
+            if !batched {
+                conditions.push(StopCondition::Check(&mut no_op));
+            }
+            assert_eq!(
+                machine.resume(&mut conditions).unwrap(),
+                StopReason::Breakpoint(BreakpointHit {
+                    core: 0,
+                    address: 12
+                }),
+                "batched {batched}"
+            );
+            assert_eq!(machine.cycles(), 6, "batched {batched}");
+        }
     }
 
     #[test]

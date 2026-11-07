@@ -364,6 +364,10 @@ pub struct Cpu {
     /// `ready_to_fetch_at(address)` reliably, including when a branch resolves directly onto
     /// the address, which would otherwise fetch and advance past it in the same cycle.
     stop_on_fetch: Vec<u32>,
+    /// A stop address suspended because the core was sitting on it when a resume began. It
+    /// joins `stop_on_fetch` again at the first cycle that starts with the PC elsewhere, so a
+    /// `continue` from a breakpoint stops there again the next time the program comes back.
+    rearm: Option<u32>,
     /// Whether the loop buffer was active at the end of the previous cycle, so the trace can
     /// report a loop starting and ending from one place rather than from every teardown site.
     sploop_was_active: bool,
@@ -432,6 +436,7 @@ impl Cpu {
             last_issue: Vec::new(),
             issue_view_enabled: false,
             stop_on_fetch: Vec::new(),
+            rearm: None,
             sploop_was_active: false,
             profiling: false,
             trace_a4: std::env::var_os("C64XEMU_TRACE_A4").is_some(),
@@ -646,6 +651,10 @@ impl Cpu {
             }
             let replay_only = clean && !self.idling && self.sploop.replaying_alone();
             if replay_only {
+                // This cycle skips `step`, so it re-arms here: a branch pending across the
+                // replay can bring the core back to the suspended address before any ordinary
+                // step would have armed it again.
+                self.rearm_if_moved();
                 self.execute_sploop_replay(bus);
             } else {
                 self.step(bus);
@@ -708,6 +717,31 @@ impl Cpu {
     /// the whole set, so a caller keeps its own list of breakpoints.
     pub fn set_stop_on_fetch(&mut self, addresses: Vec<u32>) {
         self.stop_on_fetch = addresses;
+        self.rearm = None;
+    }
+
+    /// Arm the address a resume suspended again once the core has moved off it. Every cycle
+    /// crosses this before it executes - `step`, and the batch's direct SPLOOP replay - and both
+    /// run paths test `stops_at` before a cycle, so a core that comes back to the address is
+    /// caught at its next fetch of it.
+    #[inline(always)]
+    fn rearm_if_moved(&mut self) {
+        if let Some(address) = self.rearm {
+            if self.pc != address {
+                self.stop_on_fetch.push(address);
+                self.rearm = None;
+            }
+        }
+    }
+
+    /// Halt at every address in `addresses` except `current`, the one the core is resuming
+    /// from, which is armed again once the core has moved off it. A core that stays on it - in
+    /// IDLE, held, or in a multi-cycle NOP - keeps it suspended until it moves.
+    pub fn set_stop_on_fetch_resuming(&mut self, mut addresses: Vec<u32>, current: u32) {
+        let had = addresses.contains(&current);
+        addresses.retain(|address| *address != current);
+        self.stop_on_fetch = addresses;
+        self.rearm = had.then_some(current);
     }
 
     /// True when the CPU is frozen on a stop address with a clean pipeline. Unlike
@@ -960,6 +994,7 @@ impl Cpu {
         if self.fault.is_some() {
             return;
         }
+        self.rearm_if_moved();
         if self.pending_stalls != 0 {
             self.pending_stalls -= 1;
             self.stats.stall_memory += 1;

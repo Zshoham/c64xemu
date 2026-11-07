@@ -41,9 +41,11 @@ class Stop:
 class DebugSession:
     """One debug session over a transport. Subclasses implement the wire details."""
 
-    def __init__(self, candidate: Path, image: Path):
+    def __init__(self, candidate: Path, image: Path, options: tuple[str, ...] = ()):
         self.candidate = candidate
         self.image = image
+        # Machine options for the session, such as the host it is attached to.
+        self.options = options
 
     def __enter__(self) -> "DebugSession":
         self.start()
@@ -76,7 +78,7 @@ class ReplSession(DebugSession):
 
     def start(self) -> None:
         self.process = subprocess.Popen(
-            [str(self.candidate), "debug", str(self.image)],
+            [str(self.candidate), "debug", *self.options, str(self.image)],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -141,7 +143,7 @@ class GdbSession(DebugSession):
         # The stub ships register values in the target's byte order (ELF e_ident[5]).
         self.endian = "big" if self.image.read_bytes()[5] == 2 else "little"
         self.process = subprocess.Popen(
-            [str(self.candidate), "debug", "--gdb", "127.0.0.1:0", str(self.image)],
+            [str(self.candidate), "debug", "--gdb", "127.0.0.1:0", *self.options, str(self.image)],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             cwd=ROOT,

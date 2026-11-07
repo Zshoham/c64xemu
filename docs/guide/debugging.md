@@ -10,7 +10,11 @@ mean the same thing in each. Option syntax and defaults are in [Command line](co
 On a multicore device, breakpoint reports name the stopped core and address without changing
 the focused core. Register, memory and disassembly views remain on the selected core; use
 `core N`, the dashboard core selector, or GDB's thread selection to inspect the stopped core.
-Reset retains the breakpoint list, and continue/step manages leaving the current halt itself.
+Reset retains the breakpoint list, and continue/step manages leaving the current halt itself:
+each core sitting on a breakpoint when it resumes skips that address only until it has moved off
+it, so a `continue` from a breakpoint in a loop body or an interrupt service routine stops there
+again on the next iteration or interrupt. A core that never leaves the address - in IDLE, held
+in reset, or in a multi-cycle NOP - does not stop on it again until it has.
 
 ## The console REPL
 

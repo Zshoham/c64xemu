@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -8,8 +9,9 @@ from typing import Any
 
 import pytest
 
-from common import CL6X, ROOT, Case, assert_case, case_id, run_tool
+from common import CL6X, ROOT, Case, assert_case, case_id, run_tool, symbol_address
 from target_programs import Program, build_target_program
+from test_debug_session import ReplSession
 
 HPI_FIRMWARE = ROOT / "tests/firmware/hpi_mailbox"
 HPI_HOST = ROOT / "tests/tools/hpi_host.py"
@@ -213,3 +215,24 @@ def test_a_program_that_exits_before_the_replay_ends_fails_the_run(
     assert report["fault"] is None
     assert report["hpi_replay"]["complete"] is False
     assert report["hpi_replay"]["next_line"] == line
+
+
+@pytest.mark.slow
+@pytest.mark.host
+def test_continue_from_a_breakpoint_in_an_isr_stops_there_on_the_next_interrupt(
+    candidate_binary: Path, mailbox_replay: tuple[Path, Path],
+) -> None:
+    """Every mailbox exchange runs `hpi_isr` once. A `continue` from the breakpoint there
+    suspends it only until the core has left it, so the next exchange stops there again. The
+    replay file is the host, so the session needs no companion process."""
+    image, replay = mailbox_replay
+    isr = symbol_address(image, ("hpi_isr", "_hpi_isr"))
+    assert isr is not None, "no hpi_isr symbol in the mailbox image"
+    with ReplSession(candidate_binary, image, ("--hpi-replay", str(replay))) as session:
+        session.break_at(isr)
+        cycles = []
+        for _ in range(3):
+            output = session.command("continue")
+            assert session._pc(output) == isr, output
+            cycles.append(int(re.search(r"cycle=(\d+)", output).group(1)))
+        assert cycles == sorted(set(cycles)), "each stop is a later exchange"
