@@ -508,6 +508,12 @@ impl Machine {
         }
     }
 
+    /// Attach other host connections, for tests of what happens around them.
+    #[cfg(test)]
+    pub(crate) fn attach_host(&mut self, host: HostConnections) {
+        self.host = host;
+    }
+
     /// How many cores the device has, and which one the front ends are looking at.
     pub fn cores(&self) -> usize {
         self.device.cores()

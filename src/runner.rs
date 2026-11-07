@@ -71,11 +71,11 @@ pub fn run(args: RunArgs) -> Result<u8, String> {
     // for a fetch leaving the image in the same hook.
     let mut pc_trail: VecDeque<u32> = VecDeque::new();
     machine.arm_halt(&breakpoints);
-    let reason = if args.pc_trail == 0 && !args.trap_oob {
+    let outcome = if args.pc_trail == 0 && !args.trap_oob {
         // The normal batch path only has a cycle budget. Do not dispatch an inert diagnostic
         // closure on every emulated cycle.
         let mut conditions = [StopCondition::Budget(args.max_cycles)];
-        machine.run(&mut conditions)?
+        machine.run(&mut conditions)
     } else {
         let mut conditions = [
             StopCondition::Budget(args.max_cycles),
@@ -108,8 +108,23 @@ pub fn run(args: RunArgs) -> Result<u8, String> {
                 None
             }),
         ];
-        machine.run(&mut conditions)?
+        machine.run(&mut conditions)
     };
+    report(&mut machine, &args, outcome, &pc_trail)
+}
+
+/// Everything after the run, whatever ended it: the dumps, the fault, the captures `finish`
+/// writes and the state report are all produced even when the run itself failed or `finish`
+/// did, because those are what tell a failed run apart. Only then is the one error returned
+/// chosen, first that applies: the run's own error, a latched fault, `finish`'s error, the
+/// state write's, the stop reason's message, and last the replay file's exit-before-EOF
+/// verdict. Every other error is printed rather than lost.
+fn report(
+    machine: &mut Machine,
+    args: &RunArgs,
+    outcome: Result<StopReason, String>,
+    pc_trail: &VecDeque<u32>,
+) -> Result<u8, String> {
     for (address, length) in &args.dump {
         let bytes = machine.read_memory(*address, *length);
         eprintln!("dump 0x{address:08x}:");
@@ -131,62 +146,94 @@ pub fn run(args: RunArgs) -> Result<u8, String> {
             );
         }
     }
-    let halted = reason == StopReason::Exit;
     let fault = machine.fault().map(str::to_owned);
     if let Some(reason) = &fault {
         eprintln!("fault: {reason}");
         if !pc_trail.is_empty() {
             eprintln!("last {} execute packets:", pc_trail.len());
-            for pc in &pc_trail {
+            for pc in pc_trail {
                 eprintln!("  {}", machine.describe(*pc));
             }
         }
     }
     let exit_code = machine.exit_code();
-    machine.finish()?;
-    let state = machine.state_json(args.machine.profile);
-    let rendered = serde_json::to_vec_pretty(&state).map_err(|error| error.to_string())?;
-    if let Some(path) = &args.state_out {
-        fs::write(path, rendered).map_err(|error| format!("{}: {error}", path.display()))?;
-    } else {
-        println!("{}", String::from_utf8(rendered).unwrap());
-    }
+    // Rendered after `finish`, so the report reflects the flushed TX archive.
+    let finished = machine.finish();
+    let written = write_state(machine, args);
     if args.perf {
         eprintln!("{}", machine.perf_report());
     }
-    if let Some(fault) = fault {
-        return Err(fault);
-    }
-    if !halted {
-        // The state dump is already written, so the message only has to say why it stopped.
-        match reason {
-            StopReason::Breakpoint(hit) => {
-                return Err(format!(
-                    "stopped at breakpoint {} on core {}",
-                    machine.describe(hit.address),
-                    hit.core
-                ));
-            }
-            StopReason::OutOfBounds => {
-                return Err(format!("fetch left the image at PC {:#010x}", machine.pc()));
-            }
-            StopReason::Terminated => {
-                eprintln!("c64xemu: terminated by SIGTERM");
-            }
-            _ => {
-                return Err(format!(
-                    "cycle limit {} reached at PC {:#010x}",
-                    args.max_cycles,
-                    machine.pc()
-                ));
-            }
+    let mut errors = Vec::new();
+    let reason = match outcome {
+        Ok(reason) => Some(reason),
+        Err(error) => {
+            errors.push(error);
+            None
         }
-    } else if let Some(line) = machine.hpi_replay_pending_line() {
+    };
+    errors.extend(fault.clone());
+    errors.extend(finished.err());
+    errors.extend(written.err());
+    // A fault already says why the run stopped; a run error leaves no reason to explain.
+    if let (Some(reason), None) = (reason, &fault) {
+        errors.extend(stop_verdict(machine, args, reason));
+    }
+    let mut errors = errors.into_iter();
+    match errors.next() {
+        Some(first) => {
+            for secondary in errors {
+                eprintln!("c64xemu: {secondary}");
+            }
+            Err(first)
+        }
+        None => Ok(exit_code),
+    }
+}
+
+/// What a stop that was not a fault says about the run: nothing for a clean exit that took the
+/// whole replay file (if any), or a SIGTERM; otherwise why it is a failure. The state dump is
+/// already written, so the message only has to say why it stopped.
+fn stop_verdict(machine: &Machine, args: &RunArgs, reason: StopReason) -> Option<String> {
+    match reason {
         // The program finished, but the host it was given had more to say: a batch run that
         // did not reach the end of its replay file did not test what the file describes.
-        return Err(format!("hpi replay: program exited before line {line}"));
+        StopReason::Exit => machine
+            .hpi_replay_pending_line()
+            .map(|line| format!("hpi replay: program exited before line {line}")),
+        StopReason::Breakpoint(hit) => Some(format!(
+            "stopped at breakpoint {} on core {}",
+            machine.describe(hit.address),
+            hit.core
+        )),
+        StopReason::OutOfBounds => {
+            Some(format!("fetch left the image at PC {:#010x}", machine.pc()))
+        }
+        StopReason::Terminated => {
+            eprintln!("c64xemu: terminated by SIGTERM");
+            None
+        }
+        StopReason::Fault => None,
+        StopReason::Budget
+        | StopReason::Packets
+        | StopReason::Interrupted
+        | StopReason::Watchpoint => Some(format!(
+            "cycle limit {} reached at PC {:#010x}",
+            args.max_cycles,
+            machine.pc()
+        )),
     }
-    Ok(exit_code)
+}
+
+/// The state report, to `--state-out` or stdout.
+fn write_state(machine: &mut Machine, args: &RunArgs) -> Result<(), String> {
+    let state = machine.state_json(args.machine.profile);
+    let rendered = serde_json::to_vec_pretty(&state).map_err(|error| error.to_string())?;
+    if let Some(path) = &args.state_out {
+        fs::write(path, rendered).map_err(|error| format!("{}: {error}", path.display()))
+    } else {
+        println!("{}", String::from_utf8(rendered).unwrap());
+        Ok(())
+    }
 }
 
 /// `ADDR:LEN`: a memory window to print when the run ends.
@@ -214,8 +261,106 @@ fn parse_stack_window(text: &str) -> Result<(u32, u32), String> {
 
 #[cfg(test)]
 mod tests {
+    use super::report;
+    use crate::cpu::Cpu;
+    use crate::host::{HostConnections, Wiring};
+    use crate::machine::{Machine, StopCondition, StopReason};
+    use crate::netio::EthernetFiles;
     use crate::{Cli, Command};
     use clap::Parser;
+    use std::collections::VecDeque;
+    use std::path::{Path, PathBuf};
+
+    /// A scratch directory for one test's state file and captures.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            let path =
+                std::env::temp_dir().join(format!("c64xemu-runner-{}-{name}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A machine whose `finish` fails: its `--pcap-out` names a directory.
+    fn machine_whose_finish_fails(directory: &Path) -> Machine {
+        let mut machine = Machine::bare(Cpu::new(0));
+        machine.attach_host(
+            HostConnections::open(Wiring {
+                net_poll: 1,
+                net_port: 0,
+                net: EthernetFiles {
+                    pcap_out: Some(directory),
+                    ..EthernetFiles::default()
+                },
+                hpi: None,
+                utopia: None,
+            })
+            .unwrap(),
+        );
+        machine
+    }
+
+    fn state_args(scratch: &Scratch) -> (super::RunArgs, PathBuf) {
+        let state = scratch.0.join("state.json");
+        (
+            run_args(&["--state-out", state.to_str().unwrap()]).unwrap(),
+            state,
+        )
+    }
+
+    /// A run that failed still finishes and writes its state, and its error is the one returned.
+    #[test]
+    fn a_run_error_still_writes_the_state_and_wins() {
+        let scratch = Scratch::new("run-error");
+        let (args, state) = state_args(&scratch);
+        let mut machine = machine_whose_finish_fails(&scratch.0);
+        let outcome = Err("unsupported CIO command 0xee".to_string());
+        assert_eq!(
+            report(&mut machine, &args, outcome, &VecDeque::new()),
+            Err("unsupported CIO command 0xee".to_string())
+        );
+        assert!(state.is_file());
+    }
+
+    /// A `finish` failure no longer loses the state report, and a fault outranks it.
+    #[test]
+    fn a_finish_error_still_writes_the_state_and_a_fault_outranks_it() {
+        let scratch = Scratch::new("finish-error");
+        let (args, state) = state_args(&scratch);
+        let mut machine = machine_whose_finish_fails(&scratch.0);
+        machine.device.cpu_mut().write_words(0, &[0; 8]);
+        let reason = machine.run(&mut [StopCondition::Budget(4)]);
+        let error = report(&mut machine, &args, reason, &VecDeque::new()).unwrap_err();
+        assert!(
+            error.starts_with(&scratch.0.display().to_string()),
+            "{error}"
+        );
+        assert!(state.is_file());
+
+        std::fs::remove_file(&state).unwrap();
+        let mut machine = machine_whose_finish_fails(&scratch.0);
+        // An instruction word the device does not have: the model refuses to run it.
+        machine.device.cpu_mut().write_words(0, &[0, 0x5645_4314]);
+        let reason = machine.run(&mut []);
+        assert_eq!(reason, Ok(StopReason::Fault));
+        let fault = machine.fault().unwrap().to_owned();
+        assert_eq!(
+            report(&mut machine, &args, reason, &VecDeque::new()),
+            Err(fault)
+        );
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&state).unwrap()).unwrap();
+        assert!(written["fault"].is_string());
+    }
 
     fn run_args(extra: &[&str]) -> Result<super::RunArgs, clap::Error> {
         let mut argv = vec!["c64xemu", "run", "image.out"];

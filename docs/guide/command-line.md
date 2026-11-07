@@ -405,8 +405,13 @@ prints `c64xemu: MESSAGE` on stderr and exits 1.
 | other `0`–`255` | `run` reached its exit point and the program left this value in A4. |
 | `2` | clap rejected the command line — an unknown option, a missing argument, or a value the parser refused. |
 
-The state report is always written before the failure is reported, so a failed run is still
-described. The messages `run` can fail with:
+Once the image has loaded, `run` always finishes - flushing the trace and writing
+`--pcap-out` - and writes the state report before it reports a failure, even when the run loop
+itself failed or `finish` did, so a failed run is still described. When more than one thing went
+wrong, the error returned is the first of: the run loop's own error, the fault, the `finish`
+error, the state write's error, the stop reason's message below, and the `--hpi-replay`
+exit-before-EOF verdict; every other one is printed as its own `c64xemu: …` line. The messages
+`run` can fail with:
 
 | Message | Cause |
 |---|---|
