@@ -2425,6 +2425,12 @@ impl Fabric {
         }
     }
 
+    /// Whether HPIRST is holding the host off (SPRU969B section 8.3): every host access would
+    /// be refused, a read with no value and a write dropped.
+    pub(crate) fn hpi_host_held_off(&self) -> bool {
+        self.shared.hpi.host_held_off()
+    }
+
     /// An external host's write cycle. A zero-to-one transition on DSPINT is the host-to-CPU
     /// interrupt (SPRS276M Table 7-9, SPRS612G Table 7-10 for the C6472's event number).
     pub fn hpi_host_write(&mut self, port: HostPort, value: u32) {

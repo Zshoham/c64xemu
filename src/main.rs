@@ -27,6 +27,7 @@ mod gdb;
 mod gpio;
 mod host;
 mod hpi;
+mod hpi_replay;
 mod i2c;
 mod i2cboot;
 mod idma;

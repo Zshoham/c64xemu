@@ -16,7 +16,7 @@ use crate::cpu::Cpu;
 use crate::cpu::{CpuSnapshot, StatsCounters};
 use crate::device::{Device, DeviceProfile};
 use crate::elf::{Image, Segment};
-use crate::host::{Endpoint, HostConnections, Wiring};
+use crate::host::{Endpoint, HostConnections, HpiWiring, Wiring};
 use crate::memory::CoherenceHazard;
 use crate::netio::{hex, EthernetFiles};
 use crate::system::{Endian, Fabric};
@@ -70,7 +70,7 @@ pub struct MachineArgs {
     /// Which device to emulate: the single-core c6455, or the six-core c6472
     #[arg(long, default_value = "c6455", value_name = "NAME")]
     pub device: String,
-    /// The BOOTMODE pins: mode 1 boots through --hpi-unix on either device; C6455 mode 5 and
+    /// The BOOTMODE pins: mode 1 boots through --hpi-unix or --hpi-replay on either device; C6455 mode 5 and
     /// C6472 modes 2 and 3 read --i2c-eeprom. C6472 modes 5-8 boot through --utopia-unix, and
     /// modes 9 and 10 over MAC port 0 or 1. Mode 0 starts every core; other C6472 modes release
     /// them by software
@@ -137,6 +137,10 @@ pub struct MachineArgs {
     /// How often, in cycles, the run loop looks for host accesses
     #[arg(long, default_value_t = 1_024, value_parser = non_zero_cycles, value_name = "CYCLES")]
     pub hpi_poll: u64,
+    /// Drive the HPI host side from a timed CSV file instead of a socket: each row is one host
+    /// access at a run-clock tick (`tick,port,direction,value`)
+    #[arg(long, value_name = "FILE", conflicts_with_all = ["hpi_unix", "hpi_peer", "hpi_poll"])]
+    pub hpi_replay: Option<PathBuf>,
     /// Unix datagram socket for the external UTOPIA ATM master (cell-level poll, write and read
     /// requests)
     #[arg(long, value_name = "PATH")]
@@ -390,11 +394,15 @@ impl Machine {
                     socket: args.net_unix.as_deref(),
                     peer: args.net_peer.as_deref(),
                 },
-                hpi: args.hpi_unix.as_deref().map(|socket| Endpoint {
-                    socket,
-                    peer: args.hpi_peer.as_deref(),
-                    poll: args.hpi_poll,
-                }),
+                hpi: match (&args.hpi_unix, &args.hpi_replay) {
+                    (Some(socket), _) => Some(HpiWiring::Socket(Endpoint {
+                        socket,
+                        peer: args.hpi_peer.as_deref(),
+                        poll: args.hpi_poll,
+                    })),
+                    (None, Some(file)) => Some(HpiWiring::File(file)),
+                    (None, None) => None,
+                },
                 utopia: args.utopia_unix.as_deref().map(|socket| Endpoint {
                     socket,
                     peer: None,
@@ -594,6 +602,11 @@ impl Machine {
 
     fn step(&mut self) -> Result<(), String> {
         self.service_host()?;
+        // A failed replay row stops the run at this boundary: the cycle it was due before
+        // never runs, and the loop reports the failure as a fault.
+        if self.host.stopped() {
+            return Ok(());
+        }
         // Every core out of reset runs this cycle, and the shared peripherals advance once.
         self.device.step_cycle();
         self.with_host(HostConnections::after_cycle);
@@ -637,8 +650,14 @@ impl Machine {
     /// What the device is owed before a cycle runs, whichever run loop is running it: the host
     /// connections that are due, then the CIO handshake. Answers whether a core was parked on the
     /// handshake, which the batched loop uses to let the next batch's first cycle past it.
+    ///
+    /// A replay file that failed here stops the run before the CIO handshake too: a CIO error at
+    /// the same boundary would otherwise turn a reported failure into a run error.
     fn service_host(&mut self) -> Result<bool, String> {
         self.with_host(HostConnections::service);
+        if self.host.stopped() {
+            return Ok(false);
+        }
         self.pump_cio()
     }
 
@@ -846,6 +865,10 @@ impl Machine {
             }
 
             let handled_cio = self.service_host()?;
+            if self.host.stopped() {
+                // The top of the loop reports it as the fault it is.
+                continue;
+            }
 
             let mut batch = BATCH_CYCLES;
             if let Some(delay) = self.host.next_due(current) {
@@ -875,12 +898,32 @@ impl Machine {
 
     /// The fault of the core a strict physical-memory violation is reported on, once it has
     /// taken it - carrying any fault that core already had - so a front end stops for it
-    /// whichever core it is looking at; otherwise the focused core's.
+    /// whichever core it is looking at; otherwise the focused core's; otherwise the failure of
+    /// an HPI replay file. A replay failure is no core's fault, but it is one the same way a
+    /// strict violation is: every front end already stops on a fault and prints it.
     pub fn fault(&self) -> Option<&str> {
         self.device
             .strict_violation()
             .and_then(|violation| self.device.core(violation.reported_core).fault())
             .or_else(|| self.device.cpu().fault())
+            .or_else(|| {
+                self.host
+                    .replay()
+                    .and_then(|file| file.failure())
+                    .map(|failure| failure.message.as_str())
+            })
+    }
+
+    /// The line of the HPI replay file's next row, while the file has rows left to run and has
+    /// not failed. A program that exits with one still pending did not get the whole file.
+    pub fn hpi_replay_pending_line(&self) -> Option<usize> {
+        self.host.replay().and_then(|file| file.pending_line())
+    }
+
+    /// The HPI replay file's progress for a state report, when the HPI host is one.
+    pub fn hpi_replay_json(&self) -> Option<Value> {
+        let tick = self.run_clock();
+        self.host.replay().map(|file| file.json(tick))
     }
 
     /// The strict physical-memory violation that stopped the run, for the state report: what was
@@ -1245,6 +1288,9 @@ impl Machine {
         // diagnostic is unchanged.
         if let Some(violation) = self.strict_violation_json() {
             state["strict_violation"] = violation;
+        }
+        if let Some(replay) = self.hpi_replay_json() {
+            state["hpi_replay"] = replay;
         }
         match self.stack_window {
             Some(StackWindow::Core { core, .. }) => {
@@ -2118,11 +2164,11 @@ mod tests {
                 net_poll: 1,
                 net_port: 0,
                 net: EthernetFiles::default(),
-                hpi: Some(Endpoint {
+                hpi: Some(HpiWiring::Socket(Endpoint {
                     socket: &emulator,
                     peer: None,
                     poll: 10,
-                }),
+                })),
                 utopia: None,
             })
             .unwrap();
@@ -2182,6 +2228,147 @@ mod tests {
             TEST_TERMINATION.with(|flag| flag.set(false));
             assert_eq!(reason.unwrap(), StopReason::Terminated, "batched {batched}");
         }
+    }
+
+    /// A machine replaying `text` on its HPI host, running `words` from address zero with the
+    /// HPI's software reset already released.
+    fn replaying(text: &str, words: &[u32]) -> Machine {
+        let mut machine = Machine::bare(Cpu::new(0));
+        machine.device.cpu_mut().write_words(0, words);
+        machine.device.fabric().write32(0, 0x0288_0030, 0);
+        machine.host = HostConnections::replaying(text);
+        machine
+    }
+
+    fn budget(batched: bool, cycles: u64) -> Vec<StopCondition<'static>> {
+        let mut conditions = vec![StopCondition::Budget(cycles)];
+        if !batched {
+            conditions.push(StopCondition::Packets(1 << 40));
+        }
+        conditions
+    }
+
+    /// A row that fails stops the run at its boundary on both loops: the CIO request a core is
+    /// parked on at that boundary is not answered and the cycle the row was due before never
+    /// runs. A CIO error there would otherwise turn the reported failure into a run error.
+    #[test]
+    fn a_failed_row_stops_the_run_before_cio_and_the_next_cycle() {
+        const TRAP: u32 = 0x0080_0200;
+        const BUFFER: u32 = 0x0080_1000;
+        for batched in [false, true] {
+            let mut machine = replaying("0,control,write,0\n3,control,read,0xdead\n", &[]);
+            machine.device.cpu_mut().write_words(TRAP - 12, &[0; 16]);
+            // The core reaches the trap at tick 3, the boundary the second row fails at.
+            machine.device.cpu_mut().set_pc(TRAP - 12);
+            // A CIO request with an opcode the handler rejects, which would be a run error.
+            machine
+                .device
+                .cpu_mut()
+                .host_write_bytes(BUFFER, &[0, 0, 0, 0, 0xee, 0, 0, 0, 0, 0, 0, 0, 0]);
+            machine.cio = Some((TRAP, BUFFER));
+            let reason = machine.run(&mut budget(batched, 100));
+            assert_eq!(reason.unwrap(), StopReason::Fault, "batched {batched}");
+            assert_eq!(machine.cycles(), 3, "batched {batched}");
+            assert_eq!(
+                machine.fault(),
+                Some("hpi replay host.csv line 2 tick 3: control read 0x00000008, expected 0x0000dead")
+            );
+            assert!(machine.cio_output().is_empty());
+            let state = machine.state_json(false);
+            assert_eq!(state["fault"], machine.fault().unwrap());
+            assert_eq!(state["hpi_replay"]["failure"]["line"], 2);
+            assert_eq!(machine.hpi_replay_pending_line(), None);
+        }
+    }
+
+    /// Every access lands on its tick however the run loop batches: a stall-heavy image (the
+    /// read-miss loop of SPRU862B section 3.4.7) gives the same transcript batched and stepped.
+    #[test]
+    fn a_replay_transcript_does_not_depend_on_how_the_run_loop_batches() {
+        const LOADS: [u32; 2] = [0x0220_5765, 0x0324_57e6];
+        let text = "0,address,write,0x00200000\n\
+                    1,control,read,-\n\
+                    +37,address,read,-\n\
+                    1001,data,read,-\n\
+                    +0,control,read,-\n\
+                    1500,data-auto,read,-\n\
+                    +4095,data-auto,read,-\n";
+        let mut transcripts = Vec::new();
+        for batched in [false, true] {
+            let words: Vec<u32> = std::iter::repeat_n(LOADS, 1024).flatten().collect();
+            let mut machine = replaying(text, &words);
+            machine.device.cpu_mut().bus_mut().write32(0x0184_0040, 4);
+            machine
+                .device
+                .cpu_mut()
+                .set_register("A8", 0x0080_8000)
+                .unwrap();
+            machine
+                .device
+                .cpu_mut()
+                .set_register("B9", 0x0080_8008)
+                .unwrap();
+            assert_eq!(
+                machine.run(&mut budget(batched, 6000)).unwrap(),
+                StopReason::Budget
+            );
+            assert!(machine.device.cpu().stats().stall_memory > 0);
+            let state = machine.state_json(false);
+            assert_eq!(state["hpi_replay"]["complete"], true, "{state}");
+            transcripts.push((state["hpi_replay"].clone(), machine.pc(), machine.cycles()));
+        }
+        assert_eq!(transcripts[0], transcripts[1]);
+        let ticks: Vec<u64> = transcripts[0].0["reads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|read| read["tick"].as_u64().unwrap())
+            .collect();
+        assert_eq!(ticks, [1, 38, 1001, 1001, 1500, 5595]);
+    }
+
+    /// A breakpoint due at the same boundary as a row wins; the row runs when the run resumes.
+    #[test]
+    fn a_breakpoint_between_two_rows_holds_the_second_until_resume() {
+        for batched in [false, true] {
+            let mut machine = replaying("0,control,read,-\n4,control,read,-\n", &[0; 32]);
+            machine.arm_halt(&[16]);
+            assert_eq!(
+                machine.run(&mut budget(batched, 100)).unwrap(),
+                StopReason::Breakpoint(BreakpointHit {
+                    core: 0,
+                    address: 16
+                })
+            );
+            assert_eq!(machine.cycles(), 4);
+            assert_eq!(machine.hpi_replay_pending_line(), Some(2));
+            assert_eq!(
+                machine.resume(&mut budget(batched, 2)).unwrap(),
+                StopReason::Budget
+            );
+            assert_eq!(machine.hpi_replay_pending_line(), None);
+            let state = machine.state_json(false);
+            assert_eq!(
+                state["hpi_replay"]["reads"][1]["tick"], 4,
+                "batched {batched}"
+            );
+        }
+    }
+
+    /// A reload rebuilds the device and starts the file again from its first row.
+    #[test]
+    fn a_reload_rewinds_the_replay_file() {
+        let mut machine = replaying("0,control,read,-\n2,control,read,0xdead\n", &[0; 32]);
+        assert_eq!(
+            machine.run(&mut budget(true, 10)).unwrap(),
+            StopReason::Fault
+        );
+        machine.reload().unwrap();
+        assert_eq!(machine.fault(), None);
+        assert_eq!(machine.hpi_replay_pending_line(), Some(1));
+        let state = machine.state_json(false);
+        assert_eq!(state["hpi_replay"]["reads"], json!([]));
+        assert_eq!(state["hpi_replay"]["next_tick"], 0);
     }
 
     #[test]

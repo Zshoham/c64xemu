@@ -181,6 +181,10 @@ pub fn run(args: RunArgs) -> Result<u8, String> {
                 ));
             }
         }
+    } else if let Some(line) = machine.hpi_replay_pending_line() {
+        // The program finished, but the host it was given had more to say: a batch run that
+        // did not reach the end of its replay file did not test what the file describes.
+        return Err(format!("hpi replay: program exited before line {line}"));
     }
     Ok(exit_code)
 }
@@ -219,6 +223,26 @@ mod tests {
         match Cli::try_parse_from(argv)?.command {
             Command::Run(args) => Ok(args),
             _ => unreachable!(),
+        }
+    }
+
+    /// The replay file is the HPI host, so it conflicts with every option of the socket host;
+    /// `--hpi-poll`'s default is not an explicit option and does not.
+    #[test]
+    fn an_hpi_replay_file_excludes_the_socket_host() {
+        let replay = run_args(&["--hpi-replay", "host.csv"]).unwrap();
+        assert_eq!(
+            replay.machine.hpi_replay.as_deref(),
+            Some(std::path::Path::new("host.csv"))
+        );
+        for socket in [
+            ["--hpi-unix", "hpi.sock"],
+            ["--hpi-peer", "peer.sock"],
+            ["--hpi-poll", "1024"],
+        ] {
+            let mut argv = vec!["--hpi-replay", "host.csv"];
+            argv.extend(socket);
+            assert!(run_args(&argv).is_err(), "{socket:?}");
         }
     }
 

@@ -98,7 +98,7 @@ Shared by `run` and `debug`.
 | Option | Default | What it does |
 |---|---|---|
 | `--device NAME` | `c6455` | Selects the device profile by name; `DeviceProfile::named` refuses anything else with `unknown device NAME`. `c6455` is single-core, `c6472` has six cores. See [The six-core device](multicore.md). |
-| `--boot-mode MODE` | `0` | The BOOTMODE pins. Mode 0 installs ELF segments and starts every core. Mode 1 requires `--hpi-unix`: the C6455 host releases core 0 with DSPINT; the C6472 host sets `BOOT_COMPLETE_STAT`. C6455 mode 5 and C6472 modes 2 (EEPROM at 0x50) and 3 (0x51) are the master I2C boot and require `--i2c-eeprom`. C6472 modes 5-8 require `--utopia-unix` (8/16-bit UTOPIA, paired PLL x10/x20), and modes 9/10 boot over MAC 0/1. Other modes run core 0 and leave it to release the rest. See [Booting an image](booting.md). |
+| `--boot-mode MODE` | `0` | The BOOTMODE pins. Mode 0 installs ELF segments and starts every core. Mode 1 requires an HPI host, `--hpi-unix` or `--hpi-replay`: the C6455 host releases core 0 with DSPINT; the C6472 host sets `BOOT_COMPLETE_STAT`. C6455 mode 5 and C6472 modes 2 (EEPROM at 0x50) and 3 (0x51) are the master I2C boot and require `--i2c-eeprom`. C6472 modes 5-8 require `--utopia-unix` (8/16-bit UTOPIA, paired PLL x10/x20), and modes 9/10 boot over MAC 0/1. Other modes run core 0 and leave it to release the rest. See [Booting an image](booting.md). |
 | `--i2c-eeprom FILE` | none | The serial EEPROM image on the I2C bus that the master I2C boot reads its boot parameters and boot table from; refused with any other boot mode. Supplying it makes the load `Wire`: nothing comes from the ELF's segments. A C6472 EEPROM whose parameters hand over to UTOPIA also needs `--utopia-unix`. |
 | `--boot-param-index N` | `0` | Which boot parameter block the I2C boot loads: CFGGP[2:0] on the C6455 (0-7), CFG[3:0] on the C6472 (0-15). The block sits at `0x80 * N`. |
 | `--i2c-pll-x19` | off | Straps CFG[4] high for a C6472 I2C boot, so the boot sets PLL1 to x19 rather than x9 (SPRUEC6G Table 22). Refused elsewhere. |
@@ -117,6 +117,7 @@ Shared by `run` and `debug`.
 | `--hpi-unix PATH` | none | Bind a Unix datagram socket for the HPI host side. |
 | `--hpi-peer PATH` | none | The Unix datagram socket HPI replies are sent to. Host requests carry an HCNTL code as [SPRU969B](../reference/spru969b.pdf) Table 4 numbers it. |
 | `--hpi-poll CYCLES` | `1024` | How often the run loop looks for host accesses. |
+| `--hpi-replay FILE` | none | Drive the HPI host side from a timed CSV file instead of a socket: one host access per row, at the run-clock tick the row names. Parsed when the machine is built, so a malformed file is a load error (`FILE line N: ...`); a row that fails at run time (held off, read mismatch, wait timeout, missed tick, strict refusal) is a fault. Conflicts with `--hpi-unix`, `--hpi-peer` and an explicit `--hpi-poll`. See [Replaying the host from a file](networking-and-host-io.md#replaying-the-host-from-a-file). |
 | `--utopia-unix PATH` | none | Bind the external ATM master's Unix datagram socket: addressed polls, cell writes and cell reads, with replies to the sender; see [The UTOPIA ATM master](networking-and-host-io.md#the-utopia-atm-master). Required for C6472 boot modes 5-8. |
 | `--utopia-poll CYCLES` | `1024` | How often the run loop services ATM master requests; at least one cycle. |
 | `--utopia-phy N` | `0` | C6472 UTOPIA boot's CFG[4:0] and UTOPIA SLID, 0-31. Address 31 is the unreachable null PHY. Refused outside `--device c6472 --boot-mode 5`-`8`. |
@@ -241,7 +242,7 @@ stdout or stderr according to the file descriptor the request named, and also ac
 | Field | Meaning |
 |---|---|
 | `halted` | The snapshot's `at_stop`, not the CPU's halt flag: some core that is not held in reset is parked ready to fetch the exit point. This is what "the program finished" means, and `run` treats anything else as a failure. |
-| `fault` | The focused core's fault message, or `null`. |
+| `fault` | The focused core's fault message, or `null`. A strict physical-memory violation or a failed `--hpi-replay` row is reported here too. |
 | `pc` | The focused core's program counter, decimal. |
 | `cycles` | The focused core's cycle counter. |
 | `loop_active` | The SPLOOP buffer is live, which `TSR.SPLX` mirrors. |
@@ -257,6 +258,7 @@ stdout or stderr according to the file descriptor the request named, and also ac
 | `i2c_boot` | Present only when the ROM's I2C boot ran: `parameter_blocks`, `config_blocks`, `table_blocks`, `table_bytes`, `checksum_failures`, `entry`, `error`. `entry` stays null when a C6472 parameter block handed the boot over to UTOPIA. |
 | `utopia_boot` | Present for C6472 UTOPIA boot, cold or handed over from an I2C boot: `cells_accepted`, `cells_discarded`, `table_bytes` (32 per accepted cell, including final padding), `entry`, `error`. |
 | `hpi_boot` | Present when strapped to HPI boot: `entries` holds each core's release entry, null until released; `entry` is core 0's entry. The C6455 entry is fixed at `0x00800000`; C6472 entries come from `DSP_BOOT_ADDRn`. |
+| `hpi_replay` | Present with `--hpi-replay`: `file`, the run-clock `tick` now, the number of rows (`lines`), the line and due tick of the next row (`next_line`, `next_tick`, null when there is none), `complete`, the unchecked `reads` as `{line, tick, port, value}`, and the `failure` as `{line, tick, message}` or null. A batch run whose program exits before the file is complete fails with `hpi replay: program exited before line N` after writing the report. |
 | `profile` | Present with `--profile`: the 32 hottest execute-packet addresses as `{pc, where, packets}`, `where` being the covering symbol as `name+0x1c`. |
 | `stack_observation` | Present with `--stack-window`: what the observer saw on the core focused when the run started. See [Stack observation](#stack-observation). |
 | `stack_observations` | Present with `--stack-window-all`, in place of `stack_observation`: the same object for every core, in ascending `core` order. |
@@ -412,7 +414,8 @@ described. The messages `run` can fail with:
 | `stopped at breakpoint 0x… NAME` | A `--break` address was reached. |
 | `cycle limit N reached at PC 0x…` | `--max-cycles` was exhausted. |
 | `fetch left the image at PC 0x…` | `--trap-oob` fired; the stderr lines above it name the trail. |
-| the fault text | The CPU refused to execute something, or `C64XEMU_STRICT_PHYSICAL_MEMORY=1` refused an access (the text starts `strict physical-memory:`). Preceded on stderr by `fault: …` and, with `--pc-trail`, the trail. |
+| the fault text | The CPU refused to execute something, `C64XEMU_STRICT_PHYSICAL_MEMORY=1` refused an access (the text starts `strict physical-memory:`), or an `--hpi-replay` row failed (the text starts `hpi replay FILE line N tick T:`). Preceded on stderr by `fault: …` and, with `--pc-trail`, the trail. |
+| `hpi replay: program exited before line N` | The program reached its exit point with `--hpi-replay` rows still to run. |
 
 ```console
 $ c64xemu run tests/firmware/bios_kernel/build/bios_kernel.out --max-cycles 1000 >/dev/null

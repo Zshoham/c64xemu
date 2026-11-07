@@ -273,9 +273,11 @@ impl Session {
                 "address": format!("0x{:08x}", hit.address),
             })
         });
+        let hpi_replay = self.machine.hpi_replay_json();
         json!({
             "pc": format!("0x{pc:08x}"),
             "pc_where": self.machine.symbol_at(pc),
+            "hpi_replay": hpi_replay,
             "cycle": cycle,
             "fault": fault,
             "cio_output": cio_output,

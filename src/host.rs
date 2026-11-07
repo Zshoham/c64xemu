@@ -1,5 +1,5 @@
-//! The host-side connections attached to the fabric: the Ethernet backend, the HPI host and the
-//! UTOPIA's ATM master.
+//! The host-side connections attached to the fabric: the Ethernet backend, the HPI host - a live
+//! socket or a replayed file - and the UTOPIA's ATM master.
 //!
 //! Each is something outside the device that the emulated clock has to be reconciled with. The
 //! machine says what the run clock reads and lends the fabric; this module answers what is due
@@ -11,6 +11,7 @@
 //! it belongs to the core and device, not to a connection attached to the fabric.
 
 use crate::hpi::HostPort;
+use crate::hpi_replay::HostFile;
 use crate::netio::{Ethernet, EthernetFiles, HostLink};
 use crate::system::Fabric;
 use crate::utopia::{CELL_BYTES, MAX_CELL_BYTES, NULL_PHY};
@@ -26,6 +27,13 @@ pub(crate) struct Endpoint<'a> {
     pub poll: u64,
 }
 
+/// Where the HPI host's accesses come from: a host process on a socket, or a timed file
+/// (`--hpi-replay`).
+pub(crate) enum HpiWiring<'a> {
+    Socket(Endpoint<'a>),
+    File(&'a Path),
+}
+
 /// What a machine's command line attaches to the device.
 pub(crate) struct Wiring<'a> {
     /// How often the Ethernet backend looks at its socket, in run-clock cycles.
@@ -33,7 +41,7 @@ pub(crate) struct Wiring<'a> {
     /// The MAC the wire is attached to.
     pub net_port: usize,
     pub net: EthernetFiles<'a>,
-    pub hpi: Option<Endpoint<'a>>,
+    pub hpi: Option<HpiWiring<'a>>,
     pub utopia: Option<Endpoint<'a>>,
 }
 
@@ -45,15 +53,22 @@ pub(crate) struct HostConnections {
 }
 
 impl HostConnections {
-    /// Binds the sockets and reads the pcap input the wiring names.
+    /// Binds the sockets, reads the pcap input and parses the HPI replay file the wiring names.
+    /// A replay file is only validated here: none of its accesses run until the run loop
+    /// reaches their ticks.
     pub(crate) fn open(wiring: Wiring) -> Result<Self, String> {
         Ok(Self {
             ethernet: Ethernet::open(wiring.net_poll, wiring.net_port, wiring.net)?,
             hpi: wiring
                 .hpi
-                .map(|endpoint| HostLink::bind(endpoint.socket, endpoint.peer, endpoint.poll))
-                .transpose()?
-                .map(|link| HpiHost { link }),
+                .map(|hpi| match hpi {
+                    HpiWiring::Socket(endpoint) => {
+                        HostLink::bind(endpoint.socket, endpoint.peer, endpoint.poll)
+                            .map(|link| HpiHost::Socket(HpiSocket { link }))
+                    }
+                    HpiWiring::File(path) => HostFile::load(path).map(HpiHost::File),
+                })
+                .transpose()?,
             utopia: wiring
                 .utopia
                 .map(|endpoint| HostLink::bind(endpoint.socket, None, endpoint.poll))
@@ -72,12 +87,28 @@ impl HostConnections {
         }
     }
 
-    /// A device has just been (re)built: every connection is polled on its first cycle, and the
-    /// pcap input is delivered to the new MACs. Host backlog and the TX archive are retained.
+    /// An HPI replay file and nothing else attached, for tests that drive it through a machine.
+    #[cfg(test)]
+    pub(crate) fn replaying(text: &str) -> Self {
+        Self {
+            ethernet: Ethernet::offline(),
+            hpi: Some(HpiHost::File(
+                HostFile::parse(Path::new("host.csv"), text).unwrap(),
+            )),
+            utopia: None,
+        }
+    }
+
+    /// A device has just been (re)built: every connection is polled on its first cycle, the
+    /// pcap input is delivered to the new MACs, and an HPI replay file starts again from its
+    /// first row. Host backlog and the TX archive are retained.
     pub(crate) fn install(&mut self, fabric: &mut Fabric, cycle: u64) {
         self.ethernet.reset_poll();
         for link in self.links_mut() {
             link.reset_poll();
+        }
+        if let Some(HpiHost::File(file)) = self.hpi.as_mut() {
+            file.rewind();
         }
         self.ethernet.preload(fabric, cycle);
     }
@@ -91,14 +122,34 @@ impl HostConnections {
 
     /// Serves whatever is due at `cycle` against the fabric: frames in and out of the Ethernet
     /// backend, then the HPI host's accesses, then the ATM master's requests. A connection that
-    /// is not yet due is not looked at.
+    /// is not yet due is not looked at. Once an HPI replay file has failed nothing after it is
+    /// served: the run stops at this boundary (`stopped`).
     pub(crate) fn service(&mut self, fabric: &mut Fabric, cycle: u64) {
         self.ethernet.service(fabric, cycle);
-        if let Some(host) = self.hpi.as_mut() {
-            host.service(fabric, cycle);
+        match self.hpi.as_mut() {
+            Some(HpiHost::Socket(host)) => host.service(fabric, cycle),
+            Some(HpiHost::File(file)) => file.service(fabric, cycle),
+            None => {}
+        }
+        if self.stopped() {
+            return;
         }
         if let Some(master) = self.utopia.as_mut() {
             master.service(fabric, cycle);
+        }
+    }
+
+    /// Whether the HPI replay file has failed, which ends the run before anything else - the
+    /// CIO handshake, the next cycle - happens at this boundary.
+    pub(crate) fn stopped(&self) -> bool {
+        self.replay().is_some_and(HostFile::failed)
+    }
+
+    /// The HPI replay file, when the HPI host is one.
+    pub(crate) fn replay(&self) -> Option<&HostFile> {
+        match self.hpi.as_ref() {
+            Some(HpiHost::File(file)) => Some(file),
+            _ => None,
         }
     }
 
@@ -108,7 +159,10 @@ impl HostConnections {
     pub(crate) fn next_due(&self, cycle: u64) -> Option<u64> {
         [
             self.ethernet.poll_delay(cycle),
-            self.hpi.as_ref().map(|host| host.link.poll_delay(cycle)),
+            self.hpi.as_ref().and_then(|host| match host {
+                HpiHost::Socket(host) => Some(host.link.poll_delay(cycle)),
+                HpiHost::File(file) => file.next_due(cycle),
+            }),
             self.utopia
                 .as_ref()
                 .map(|master| master.link.poll_delay(cycle)),
@@ -120,7 +174,10 @@ impl HostConnections {
 
     fn links_mut(&mut self) -> impl Iterator<Item = &mut HostLink> {
         [
-            self.hpi.as_mut().map(|host| &mut host.link),
+            self.hpi.as_mut().and_then(|host| match host {
+                HpiHost::Socket(host) => Some(&mut host.link),
+                HpiHost::File(_) => None,
+            }),
             self.utopia.as_mut().map(|master| &mut master.link),
         ]
         .into_iter()
@@ -164,7 +221,14 @@ impl HostConnections {
     }
 }
 
-/// The external host on the HPI pins. Each datagram is one access: a direction byte (`r` or
+/// The external host on the HPI pins: a host process on a socket, or a replayed file. Both
+/// reach the device through the same `Fabric::hpi_host_read` and `hpi_host_write`.
+enum HpiHost {
+    Socket(HpiSocket),
+    File(HostFile),
+}
+
+/// The HPI host as a process on a datagram socket. Each datagram is one access: a direction byte (`r` or
 /// `w`), the HCNTL encoding of the port it addresses, two bytes of padding and a little-endian
 /// value. A read is answered with the value, or with an empty datagram if the port cannot be
 /// read; a write is not answered. Datagrams shorter than eight bytes, and ports the HCNTL
@@ -172,11 +236,11 @@ impl HostConnections {
 ///
 /// The host port is the device's, not any core's: it attaches to the fabric like the Ethernet
 /// backend and the ATM master.
-struct HpiHost {
+struct HpiSocket {
     link: HostLink,
 }
 
-impl HpiHost {
+impl HpiSocket {
     const REQUEST_BYTES: usize = 8;
 
     fn service(&mut self, fabric: &mut Fabric, cycle: u64) {
@@ -330,7 +394,7 @@ mod tests {
             net_poll: 1,
             net_port: 0,
             net: EthernetFiles::default(),
-            hpi: hpi.map(endpoint),
+            hpi: hpi.map(endpoint).map(HpiWiring::Socket),
             utopia: utopia.map(endpoint),
         })
         .unwrap()
@@ -551,11 +615,11 @@ mod tests {
                 socket: Some(&sockets.path("net")),
                 ..EthernetFiles::default()
             },
-            hpi: Some(Endpoint {
+            hpi: Some(HpiWiring::Socket(Endpoint {
                 socket: &hpi,
                 peer: None,
                 poll: 100,
-            }),
+            })),
             utopia: None,
         })
         .unwrap();

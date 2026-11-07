@@ -63,7 +63,7 @@ pub enum HpiBoot {
 }
 
 /// The access types the host selects on HCNTL[1:0] (SPRU969B Table 4).
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HostPort {
     /// HCNTL = 00b: the control register.
     Control,
@@ -127,6 +127,13 @@ impl Hpi {
     /// section 2.4).
     pub(crate) fn take_boot_release(&mut self) -> bool {
         std::mem::take(&mut self.boot_pending)
+    }
+
+    /// Whether the software reset is holding the host off, so a host access would not happen.
+    /// A held-off write is dropped without a trace (`host_write`); a host that has to know -
+    /// the replay file, which fails on one - asks first.
+    pub(crate) fn host_held_off(&self) -> bool {
+        self.hpirst
     }
 
     /// Whether the device is strapped to an HPI boot the host has not finished with DSPINT.

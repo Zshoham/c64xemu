@@ -109,6 +109,24 @@ On the C6455 every DSPINT also raises EDMA3 event DSP_EVT (channel 0), including
 ending boot (SPRS276M section 7.4.1). Firmware must clear ER bit 0 before enabling channel 0
 if it does not want that pending boot event to initiate a transfer.
 
+The host does not have to be a process. `--hpi-replay FILE` boots from a
+[timed file of host accesses](networking-and-host-io.md#replaying-the-host-from-a-file), which
+makes an HPI boot an ordinary batch run. The smallest C6455 boot loads one NOP at the L2 entry,
+checks it, and releases the core with DSPINT:
+
+```csv
+tick,port,direction,value
+0,control,write,0
+0,address,write,0x00200000
+0,data-auto,write,0x00000000
+0,address,write,0x00200000
+0,data,read,0x00000000
+1,control,write,0x00000002
+```
+
+The second HPIA write is the fence that flushes the posted write (SPRU969B section 6.3): a file
+that leaves words in the write FIFO leaves them unwritten.
+
 `tests/tools/hpi_host.py --boot --image IMAGE` is a host for the C6455 boot. It writes each
 `PT_LOAD` segment, padded with zeros to its memory size, and reads it back to verify it.
 It flushes the final partial FIFO burst by rewriting HPIA, then raises DSPINT.
@@ -139,6 +157,24 @@ Forbidden reads return zero and writes are ignored, without holding off the host
 host-inaccessible configuration windows the manuals do not specify a read value or response
 timing: this is deterministic emulator policy, not behavior firmware should rely on in hardware.
 The host filter does not change CPU or IDMA access.
+
+The same boot from a file, for core 0: `0x04200000` is core 0's L2 global alias
+`0x10800000 >> 2`, `0x00aac081` is `DSP_BOOT_ADDR0` (`0x02ab0204 >> 2`), `0x2000` is the entry
+`0x00800000 >> 10`, and `0x00aac001` is `BOOT_COMPLETE_STAT` (SPRUEC6G section 4.3.2).
+
+```csv
+tick,port,direction,value
+0,control,write,0
+0,address,write,0x04200000
+0,data-auto,write,0x00000000
+0,address,write,0x04200000
+0,data,read,0x00000000
+0,address,write,0x00aac081
+0,data,write,0x00002000
+0,data,read,0x00002000
+1,address,write,0x00aac001
+1,data,write,0x00000001
+```
 
 `tests/tools/hpi_host.py --device c6472 --boot --image IMAGE --cores 0,3 --report`
 loads and verifies the image for cores 0 and 3, programs their entries, then releases them
