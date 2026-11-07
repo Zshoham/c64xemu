@@ -28,7 +28,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, LazyLock};
 
 /// The flag `signal-hook` sets on SIGTERM, shared with the batch runner so it stops at the
@@ -44,8 +44,21 @@ pub(crate) fn termination_flag() -> Arc<AtomicBool> {
 }
 
 /// Whether SIGTERM has asked the run to stop.
+#[cfg(not(test))]
 pub(crate) fn termination_requested() -> bool {
-    TERMINATION_REQUESTED.load(Ordering::Relaxed)
+    TERMINATION_REQUESTED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+// Unit tests run in parallel threads of one process, so a test asking for termination through
+// the process-wide flag would stop every other test's run too. Each test thread gets its own.
+#[cfg(test)]
+thread_local! {
+    static TEST_TERMINATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn termination_requested() -> bool {
+    TEST_TERMINATION.with(std::cell::Cell::get)
 }
 
 /// The machine and its host connections: how memory is loaded, what the device is wired to,
@@ -763,6 +776,12 @@ impl Machine {
             }
         }
         loop {
+            // The batched loop asks this at every batch boundary; the stepped one must too, or a
+            // run that never meets another stop - a breakpoint never hit, a watch never true -
+            // ignores SIGTERM for good.
+            if termination_requested() {
+                return Ok(StopReason::Terminated);
+            }
             if self.fault().is_some() {
                 return Ok(StopReason::Fault);
             }
@@ -2145,6 +2164,23 @@ mod tests {
             assert_eq!(machine.device.cycle(), 20, "batched {batched}");
             assert_eq!(machine.cycles(), 0, "the held core retired nothing");
             assert_eq!(machine.device.core(0).cycles(), 20);
+        }
+    }
+
+    /// SIGTERM stops both run loops, including a stepped run no other condition would end.
+    #[test]
+    fn both_run_loops_honour_a_termination_request() {
+        for batched in [false, true] {
+            let mut machine = Machine::bare(Cpu::new(0));
+            machine.device.cpu_mut().write_words(0, &[0; 64]);
+            TEST_TERMINATION.with(|flag| flag.set(true));
+            let mut conditions = vec![StopCondition::Budget(0)];
+            if !batched {
+                conditions.push(StopCondition::Packets(0));
+            }
+            let reason = machine.run(&mut conditions);
+            TEST_TERMINATION.with(|flag| flag.set(false));
+            assert_eq!(reason.unwrap(), StopReason::Terminated, "batched {batched}");
         }
     }
 
