@@ -619,13 +619,16 @@ impl Cpu {
         cio: Option<u32>,
         ignore_cio_once: bool,
     ) -> u64 {
-        let start = self.cycle;
+        // The budget is counted in the run clock, `cycles()`, which includes frozen stall
+        // cycles: a batch bounded by retired cycles alone ran past its caller's deadline by
+        // every stall it met, so a batched run and a stepped one stopped at different cycles.
+        let start = self.cycles();
         let mut first = true;
         // A strict physical-memory violation ends the batch at the cycle boundary after it, as
         // a fault does. Whether the diagnostic is on is asked once per batch, so with it off the
         // per-cycle test is a register.
         let strict = bus.strict_on();
-        while self.cycle.wrapping_sub(start) < cycles
+        while self.cycles().wrapping_sub(start) < cycles
             && self.fault.is_none()
             && !(strict && bus.strict_stopped())
         {
@@ -652,7 +655,7 @@ impl Cpu {
         if bus.strict_stopped() {
             self.take_own_strict_violation(bus);
         }
-        self.cycle.wrapping_sub(start)
+        self.cycles().wrapping_sub(start)
     }
 
     /// Whether the halt list names this address. A batch run's list is the program's exit
@@ -5773,6 +5776,43 @@ mod tests {
         assert_eq!(cpu.stats().stall_memory, 1600);
         // 512 load packets issue one cycle each, and every stall cycle is an L1D stall.
         assert_eq!(cycles, 512 + 1600);
+    }
+
+    /// A batch is bounded by the run clock, stall cycles included, so a batched run stops on
+    /// the cycle a stepped one does even when the deadline falls inside a read-miss stall. The
+    /// dotprod loop of the test above stalls on most of its cycles (SPRU862B section 3.4.7).
+    /// Counting retired cycles alone overshot every such deadline by the stalls it met.
+    #[test]
+    fn a_batch_budget_counts_stall_cycles() {
+        let start = || {
+            let mut cpu = Cpu::new(0);
+            cpu.bus_mut().write32(0x0184_0040, 4);
+            let words: Vec<u32> = std::iter::repeat_n(MANUAL_LOAD_PACKET, 512)
+                .flatten()
+                .collect();
+            cpu.write_words(0, &words);
+            cpu.set_register("A8", 0x0080_0000).unwrap();
+            cpu.set_register("B9", 0x0080_0008).unwrap();
+            cpu
+        };
+        for budget in [5, 123, 1001] {
+            let mut batched = start();
+            assert_eq!(batched.run_cycles(budget, None, false), budget);
+            let mut stepped = start();
+            while stepped.cycles() < budget {
+                stepped.step_cycle();
+            }
+            assert!(
+                batched.stats().stall_memory > 0,
+                "the deadline is met mid-stall"
+            );
+            assert_eq!(batched.cycles(), budget);
+            assert_eq!(
+                (batched.pc(), batched.stats().stall_memory),
+                (stepped.pc(), stepped.stats().stall_memory),
+                "budget {budget}"
+            );
+        }
     }
 
     #[test]
