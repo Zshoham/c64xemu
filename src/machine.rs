@@ -598,8 +598,13 @@ impl Machine {
     /// The clock a run budget and host polling measure against. A boot that holds core 0 spends
     /// device cycles waiting for the host, bus or wire while the core retires nothing. Keep
     /// that clock after release too, so a budget never switches between two counters.
+    ///
+    /// A multicore device counts device cycles too. Its run loops always advance whole device
+    /// cycles (`Device::run_cycles`), and a running core's counter equals the device's, but a
+    /// focused core held in reset or clock-gated counts nothing: measured by it, a budget never
+    /// ran out and a host was never due again.
     fn run_clock(&self) -> u64 {
-        if self.device.boot().holds_core_zero() {
+        if self.device.boot().holds_core_zero() || self.device.cores() > 1 {
             self.device.cycle()
         } else {
             self.device.cpu().cycles()
@@ -2115,6 +2120,31 @@ mod tests {
             let mut reply = [0; 16];
             assert_eq!(host.recv(&mut reply).unwrap(), 4, "batched {batched}");
             std::fs::remove_dir_all(&directory).unwrap();
+        }
+    }
+
+    /// On a C6472 the run clock is the device's, whichever core is focused: a focused core held
+    /// in reset retires nothing, and measured by its counter a budget never ran out.
+    #[test]
+    fn a_held_focused_core_does_not_stop_the_multicore_run_clock() {
+        for batched in [false, true] {
+            let mut machine = Machine::bare(Cpu::new(0));
+            machine.device = Device::new(&crate::device::C6472, 0, Endian::Little);
+            for core in 0..machine.device.cores() {
+                machine
+                    .device
+                    .with_core(core, |cpu| cpu.write_words(0, &[0; 64]));
+            }
+            machine.device.fabric().set_held_in_reset(1, true);
+            machine.set_focus(1);
+            let mut conditions = vec![StopCondition::Budget(20)];
+            if !batched {
+                conditions.push(StopCondition::Packets(1000));
+            }
+            assert_eq!(machine.run(&mut conditions).unwrap(), StopReason::Budget);
+            assert_eq!(machine.device.cycle(), 20, "batched {batched}");
+            assert_eq!(machine.cycles(), 0, "the held core retired nothing");
+            assert_eq!(machine.device.core(0).cycles(), 20);
         }
     }
 

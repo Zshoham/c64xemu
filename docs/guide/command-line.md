@@ -147,7 +147,7 @@ c64xemu run [OPTIONS] <IMAGE>
 
 | Option | Default | What it does |
 |---|---|---|
-| `--max-cycles CYCLES` | `10000000` | Cycle budget for the whole run; `0` runs without a limit. Measured against the device cycle while a ROM boot is running and against the focused core's cycle counter afterwards (`run_clock`), because a held core retires nothing and could not pace a budget. Exhausting it is an error, not a clean finish. |
+| `--max-cycles CYCLES` | `10000000` | Cycle budget for the whole run; `0` runs without a limit. Measured against the device cycle on a C6472 and on any boot that holds core 0 (a ROM or HPI boot, before and after release), and against the core's own cycle counter, stalls included, on a C6455 that boots nothing (`run_clock`): a held or clock-gated core retires nothing and could not pace a budget. Exhausting it is an error, not a clean finish. |
 | `--state-out FILE` | stdout | Write the state report here instead of printing it. Dumps, the perf report and diagnostics stay on stderr either way. |
 | `--dump ADDR:LEN` | none | Print a memory window on stderr when the run ends. Repeatable; windows print in the order given, before the state report. |
 | `--stack-window START:END` | none | Passively observe the focused core's B15 and its committed stores against a non-empty, word-aligned stack window. Adds `stack_observation` to the state report; see [Stack observation](#stack-observation). |
