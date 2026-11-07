@@ -405,7 +405,9 @@ impl Fabric {
             return;
         }
         self.note_sl2_transfer(address, bytes.len(), false);
-        self.shared.backing.note_memory_write(address, bytes.len());
+        self.shared
+            .backing
+            .note_memory_write(Requester::Dma, address, bytes.len());
         self.shared
             .backing
             .write_bytes(Requester::Dma, address, bytes);

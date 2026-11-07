@@ -812,6 +812,17 @@ impl Backing {
         self.endian == Endian::Big
     }
 
+    /// The name a word's write stamp is kept under: a core's local L2, L1P or L1D address is
+    /// translated to its global alias, so a write through either name moves the same stamp and
+    /// breaks the same LL/SL/CMTL reservation. Everything else - and everything on a device
+    /// without aliases - is its own name.
+    pub(crate) fn reservation_address(&self, requester: Requester, address: u32) -> u32 {
+        match requester {
+            Requester::Core(core) => self.map.global_of_local(core, address).unwrap_or(address),
+            _ => address,
+        }
+    }
+
     pub(crate) fn memory_version(&self, address: u32) -> u64 {
         self.memory_versions
             .get(&(address & !3))
@@ -1081,12 +1092,13 @@ impl Backing {
         }
     }
 
-    /// Load the shared L2 ROM, which is the only way its contents ever change: the boot
-    /// controller starts core 0 inside it (SPRS612G Table 2-4).
-    pub(crate) fn note_memory_write(&mut self, address: u32, length: usize) {
+    /// Move the stamp of every tracked word a write of `length` bytes at `address` touches,
+    /// keyed by `reservation_address`. With no word tracked, it returns before translating.
+    pub(crate) fn note_memory_write(&mut self, requester: Requester, address: u32, length: usize) {
         if length == 0 || self.memory_versions.is_empty() {
             return;
         }
+        let address = self.reservation_address(requester, address);
         let first = address & !3;
         let last = address.wrapping_add((length - 1).min(u32::MAX as usize) as u32) & !3;
         let mut word = first;
@@ -1961,7 +1973,8 @@ impl BoundHierarchy<'_> {
             }
             return;
         }
-        self.backing.note_memory_write(address, N);
+        self.backing
+            .note_memory_write(self.hierarchy.requester(), address, N);
         if self.hierarchy.l1d.enabled()
             && self.hierarchy.l1_cacheable(address)
             && self.hierarchy.l1d.write_bytes(address, bytes)
@@ -1993,7 +2006,8 @@ impl BoundHierarchy<'_> {
         self.hierarchy.l1d.read_filled_byte(address).unwrap()
     }
     fn write_data_byte(&mut self, address: u32, value: u8) {
-        self.backing.note_memory_write(address, 1);
+        self.backing
+            .note_memory_write(self.hierarchy.requester(), address, 1);
         if self.hierarchy.l1d.enabled()
             && self.hierarchy.l1_cacheable(address)
             && self.hierarchy.l1d.write_byte(address, value)

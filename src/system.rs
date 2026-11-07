@@ -2859,6 +2859,10 @@ impl Fabric {
             return self.memory(core).read_u32(address);
         }
         let value = self.read32(core, address);
+        let address = self
+            .shared
+            .backing
+            .reservation_address(Requester::Core(core), address);
         let version = self.shared.backing.track_memory_version(address);
         self.mm[core].link.load(address, version);
         value
@@ -2876,6 +2880,10 @@ impl Fabric {
             smc.store_link(core, offset, value);
             return;
         }
+        let address = self
+            .shared
+            .backing
+            .reservation_address(Requester::Core(core), address);
         let version = self.shared.backing.memory_version(address);
         self.mm[core].link.store(address, value, version);
     }
@@ -2893,6 +2901,10 @@ impl Fabric {
             self.shared.sl2_request(core, offset, true);
             return self.shared.smc.as_mut()?.commit_link(core, offset);
         }
+        let address = self
+            .shared
+            .backing
+            .reservation_address(Requester::Core(core), address);
         let version = self.shared.backing.memory_version(address);
         self.mm[core].link.commit(address, version)
     }
@@ -2925,7 +2937,9 @@ impl Fabric {
     /// Load memory the way an image loader or a boot table does: straight into the storage,
     /// behind every cache.
     pub(crate) fn load_bytes(&mut self, core: usize, address: u32, bytes: &[u8]) {
-        self.shared.backing.note_memory_write(address, bytes.len());
+        self.shared
+            .backing
+            .note_memory_write(Requester::Core(core), address, bytes.len());
         self.shared
             .backing
             .write_bytes(Requester::Core(core), address, bytes);
@@ -4903,6 +4917,31 @@ mod tests {
             fabric.tick_once();
         }
         panic!("IDMA on core {core} did not finish");
+    }
+
+    /// SPRU871K LL/SL/CMTL: an intervening IDMA write breaks the link.
+    #[test]
+    fn idma_write_breaks_a_local_link() {
+        for (profile, core) in [(&crate::device::C6455, 0), (&crate::device::C6472, 3)] {
+            let mut fabric = Fabric::new(profile);
+            fabric.write32(core, 0x0080_2000, 0xaa);
+            fabric.core(core).load_link(0x0080_1000);
+            idma_copy(&mut fabric, core, 0x0080_2000, 0x0080_1000, 4);
+            fabric.core(core).store_link(0x0080_1000, 5);
+            assert_eq!(fabric.core(core).commit_link(0x0080_1000), None);
+            assert_eq!(fabric.read32(core, 0x0080_1000), 0xaa);
+        }
+    }
+
+    /// SPRU871K LL/SL/CMTL: a system master's alias reaches the linked storage.
+    #[test]
+    fn a_master_alias_write_breaks_a_local_link() {
+        let mut fabric = Fabric::new(&crate::device::C6472);
+        fabric.core(3).load_link(0x0080_1000);
+        fabric.write(Privilege::ID0_SUPERVISOR, 0x1380_1000, &[0xaa, 0, 0, 0]);
+        fabric.core(3).store_link(0x0080_1000, 5);
+        assert_eq!(fabric.core(3).commit_link(0x0080_1000), None);
+        assert_eq!(fabric.read32(3, 0x0080_1000), 0xaa);
     }
 
     /// The IDMA "provides data move services only within the megamodule (L1P, L1D, L2, and

@@ -29,8 +29,11 @@ subtraction and one bounds check — because that is where code, stacks and most
 `Backing` also stamps a version on each written word (`note_memory_write`), which each core's
 `LinkReservation` (held by its megamodule, asked through `Fabric::load_link`, `store_link` and
 `commit_link`) compares to detect an intervening store. The stamps are the device's because any
-master's write moves them; the reservation is the core's because a core has exactly one. Linked
-atomics on SL2 do not come here: the shared-memory controller's monitors judge them (below).
+master's write moves them; the reservation is the core's because a core has exactly one. On the
+C6472 a stamp is kept under the word's global alias (`Backing::reservation_address`), so a write
+through either name - the core's own store or its IDMA's to the local window, or a master's to
+the 1n00 0000h alias - breaks the same reservation. Linked atomics on SL2 do not come here: the
+shared-memory controller's monitors judge them (below).
 
 ## The address map
 
